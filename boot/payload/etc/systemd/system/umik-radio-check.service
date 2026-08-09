@@ -1,0 +1,31 @@
+[Unit]
+Description=Assert no Wi-Fi/Bluetooth hardware is live
+Before=umik-record.service
+# Ordered after the data mount so the activity log lands on the exFAT
+# partition, not on the root directory hidden underneath it.
+After=local-fs.target data.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/umik-radio-check
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NO PrivateNetwork here: combined with this unit's mount namespace it gets
+# /sys remounted for a private network namespace containing only lo, so the
+# wireless-interface check would pass even with a live wlan0. The interlock
+# must see the HOST's /sys/class/net to mean anything.
+# CAP_DAC_OVERRIDE only: /data is exFAT owned by the recorder uid with 0700
+# masks, and a capability-less root cannot write the activity log there.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+SystemCallArchitectures=native
+# Sole write access: the persistent activity log on /data.
+ReadWritePaths=/data
+
+[Install]
+WantedBy=multi-user.target

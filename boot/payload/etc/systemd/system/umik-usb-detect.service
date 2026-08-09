@@ -1,0 +1,23 @@
+[Unit]
+Description=Mount an attached USB drive for portable recordings
+Before=umik-record.service
+# data.mount named explicitly: the stick mounts at /data/usb, which must not
+# race the nofail exFAT mount of /data itself.
+After=local-fs.target data.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/umik-usb-detect
+# Always "succeeds": no stick just means the recorder uses the SD card.
+SuccessExitStatus=0
+
+# NO sandbox option that creates a mount namespace may appear here
+# (ProtectHome, ProtectSystem, PrivateTmp, PrivateNetwork, ...): this
+# service exists to mount a filesystem into the HOST namespace. Inside a
+# private namespace the mount "succeeds", evaporates when the oneshot
+# exits, and the stick is silently never used.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

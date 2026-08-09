@@ -1,0 +1,20 @@
+[Unit]
+Description=Dump recording-stack diagnostics to the data partition
+# Not After=multi-user.target: ordering a unit after the very target that
+# wants it invites a dependency cycle. The script's own settle delay (90s)
+# is what guarantees the stack has reached steady state before the dump.
+After=umik-record.service data.mount
+
+[Service]
+# Type=oneshot start jobs have no default start timeout (only oneshot is
+# exempt from DefaultTimeoutStartSec), so the 90s settle sleep is safe.
+Type=oneshot
+ExecStart=/usr/local/bin/umik-diag
+# Needs full root: reads the journal and unit states, writes to /data
+# regardless of exFAT ownership masks. Still no network.
+PrivateNetwork=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

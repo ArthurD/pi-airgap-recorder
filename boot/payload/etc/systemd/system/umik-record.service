@@ -1,0 +1,85 @@
+[Unit]
+Description=UMIK-1 continuous segmented recorder
+Documentation=file:/usr/local/share/doc/umik-autorecord/README.md
+# Hard interlock: no recording unless the box is provably radio-silent.
+Requires=umik-radio-check.service
+After=umik-radio-check.service local-fs.target sound.target
+Wants=sound.target
+# A USB drive, if present, is mounted first so recordings land on it.
+# Wants (not Requires): a missing or broken stick must never block recording.
+Wants=umik-usb-detect.service
+After=umik-usb-detect.service
+# Order after the exFAT data mount when it exists (nofail mounts are not
+# waited on by local-fs.target, so name it explicitly).
+After=data.mount
+# /data is a plain directory on the root filesystem, created by firstrun.
+ConditionPathExists=/data
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/umik-record
+# arecord --use-strftime names segments in local time; everything else on
+# this box is UTC ("Z" suffixes in session.json and umik.log), so pin the
+# service to UTC or the filenames drift an offset from the metadata.
+Environment=TZ=UTC
+Restart=always
+RestartSec=2
+# 78 = deliberate "card is full" stop from umik-record; do not thrash-restart.
+RestartPreventExitStatus=78
+User=recorder
+Group=recorder
+SupplementaryGroups=audio
+# umik-record traps SIGTERM and converts it to a SIGINT for arecord, which
+# closes the in-flight WAV cleanly. Give it room to finish and sync.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+# Audio capture must not be starved by background I/O.
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+
+# --- sandboxing -------------------------------------------------------------
+# The recorder has no legitimate need for a network, and this box has no
+# network at all. PrivateNetwork makes that structural rather than aspirational.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+ReadWritePaths=/data
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# NOTE: ProcSubset=pid must NOT be used here - it hides /proc/asound, which
+# is exactly where the recorder looks for the mic.
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+
+# CAP_SYS_NICE only, for the negative nice value above.
+CapabilityBoundingSet=CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_NICE
+
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Only ALSA character devices are reachable.
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+
+[Install]
+WantedBy=multi-user.target

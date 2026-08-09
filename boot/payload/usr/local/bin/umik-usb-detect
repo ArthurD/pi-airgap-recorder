@@ -1,0 +1,100 @@
+#!/bin/sh
+# umik-usb-detect - if a USB drive is attached at boot, mount it at /data/usb
+# so recordings land somewhere you can pull, copy on any computer, and put
+# back. No drive, or an unusable one -> exit 0 and the recorder falls back to
+# the SD card. This service must NEVER block recording; every failure path is
+# a logged fallback, not an error.
+#
+# Runs as root (mounting needs it) as a oneshot before umik-record.service.
+
+set -u
+
+MOUNT_POINT=/data/usb
+WAIT_SECS=${UMIK_USB_WAIT:-6}
+
+log() { echo "umik-usb-detect: $*" >&2; }
+
+# Mirror decisions into the persistent activity log on the card (journald is
+# volatile). Runs as root, so writable in every storage configuration.
+applog() {
+    log "$*"
+    mkdir -p /data/logs 2>/dev/null || return 0
+    printf '%s up=%3ss umik-usb-detect: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> /data/logs/umik.log 2>/dev/null || true
+}
+
+# The root filesystem might itself live on a USB device (SSD boot); never
+# treat the boot disk as removable media.
+ROOT_DISK=""
+case "$(findmnt -no SOURCE / 2>/dev/null)" in
+    /dev/sd*) ROOT_DISK=$(basename "$(findmnt -no SOURCE /)" | sed 's/[0-9]*$//') ;;
+esac
+
+# --- wait briefly for a USB disk to enumerate ------------------------------
+DEV=""
+elapsed=0
+while [ -z "$DEV" ]; do
+    for b in /sys/block/sd?; do
+        [ -e "$b" ] || continue
+        name=$(basename "$b")
+        [ "$name" = "$ROOT_DISK" ] && continue
+        case "$(readlink -f "$b")" in *usb*) ;; *) continue ;; esac
+        # Prefer the first partition; fall back to a partitionless stick.
+        if [ -b "/dev/${name}1" ]; then DEV="/dev/${name}1"; else DEV="/dev/${name}"; fi
+        break
+    done
+    [ -n "$DEV" ] && break
+    if [ "$elapsed" -ge "$WAIT_SECS" ]; then
+        applog "no USB drive after ${WAIT_SECS}s - recording to the SD card"
+        exit 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+udevadm settle 2>/dev/null || true
+FSTYPE=$(blkid -o value -s TYPE "$DEV" 2>/dev/null || true)
+if [ -z "$FSTYPE" ]; then
+    log "$DEV has no recognisable filesystem - recording to the SD card"
+    exit 0
+fi
+
+# --- mount it, owned by the recorder user ----------------------------------
+UID_R=$(id -u recorder)
+GID_R=$(id -g recorder)
+COMMON=rw,noatime,nodev,nosuid,noexec
+mkdir -p "$MOUNT_POINT"
+
+case "$FSTYPE" in
+    vfat)
+        # flush = aggressively push data out; sticks get yanked.
+        mount -t vfat -o "${COMMON},flush,uid=${UID_R},gid=${GID_R},fmask=0077,dmask=0077" \
+              "$DEV" "$MOUNT_POINT" ;;
+    exfat)
+        mount -t exfat -o "${COMMON},uid=${UID_R},gid=${GID_R},fmask=0077,dmask=0077" \
+              "$DEV" "$MOUNT_POINT" ;;
+    ext4|ext3|ext2|f2fs)
+        mount -t "$FSTYPE" -o "${COMMON},commit=1" "$DEV" "$MOUNT_POINT" 2>/dev/null \
+            || mount -t "$FSTYPE" -o "$COMMON" "$DEV" "$MOUNT_POINT" ;;
+    *)
+        log "unsupported filesystem '$FSTYPE' on $DEV (use exFAT, FAT32 or ext4)"
+        log "recording to the SD card"
+        exit 0 ;;
+esac
+
+if ! mountpoint -q "$MOUNT_POINT"; then
+    log "mounting $DEV ($FSTYPE) failed - recording to the SD card"
+    exit 0
+fi
+
+# On the POSIX filesystems the uid= options don't exist; fix ownership.
+case "$FSTYPE" in
+    ext4|ext3|ext2|f2fs)
+        mkdir -p "$MOUNT_POINT/recordings" "$MOUNT_POINT/logs"
+        chown recorder:recorder "$MOUNT_POINT/recordings" "$MOUNT_POINT/logs" ;;
+esac
+
+applog "USB drive $DEV ($FSTYPE, $(df -Ph "$MOUNT_POINT" | awk 'NR==2{print $4}') free) mounted - recordings go to ${MOUNT_POINT}/recordings"
+exit 0

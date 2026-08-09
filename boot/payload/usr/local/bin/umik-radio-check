@@ -1,0 +1,58 @@
+#!/bin/sh
+# umik-radio-check - hard interlock asserting the machine has no live radio.
+#
+# umik-record.service Requires= this unit, so if any of these assertions
+# fail the recorder does not start. "No Bluetooth, no Wi-Fi" is enforced,
+# not merely configured.
+
+set -u
+
+fail=0
+note() { echo "umik-radio-check: $*" >&2; }
+bad()  { note "FAIL: $*"; fail=1; }
+
+# 1. No wireless network interfaces of any kind.
+for i in /sys/class/net/*/wireless /sys/class/net/wlan*; do
+    [ -e "$i" ] && bad "wireless interface present: $i"
+done
+
+# 2. No Bluetooth HCI devices.
+for i in /sys/class/bluetooth/*; do
+    [ -e "$i" ] && bad "bluetooth device present: $i"
+done
+[ -d /sys/class/bluetooth ] && [ -n "$(ls -A /sys/class/bluetooth 2>/dev/null)" ] \
+    && bad "/sys/class/bluetooth is non-empty"
+
+# 3. No radio kernel modules loaded.
+for m in brcmfmac brcmutil cfg80211 mac80211 bluetooth btbcm btusb btsdio hci_uart bnep rfcomm; do
+    if [ -d "/sys/module/$m" ]; then bad "kernel module loaded: $m"; fi
+done
+
+# 4. No rfkill switches (implies no registered radio at all).
+if [ -d /sys/class/rfkill ] && [ -n "$(ls -A /sys/class/rfkill 2>/dev/null)" ]; then
+    bad "rfkill switches registered: $(ls -A /sys/class/rfkill | tr '\n' ' ')"
+fi
+
+# 5. Broadcom Wi-Fi/BT firmware blobs must be gone from disk.
+for f in /lib/firmware/brcm/brcmfmac43455-sdio.bin /lib/firmware/brcm/BCM4345C0.hcd; do
+    [ -e "$f" ] && bad "radio firmware still present: $f"
+done
+
+# Mirror the verdict into the persistent activity log (journald is volatile).
+applog() {
+    mkdir -p /data/logs 2>/dev/null || return 0
+    printf '%s up=%3ss umik-radio-check: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> /data/logs/umik.log 2>/dev/null || true
+}
+
+if [ "$fail" -ne 0 ]; then
+    note "RADIO CHECK FAILED - refusing to record"
+    applog "FAILED - a radio is live; recorder blocked (see journal on console)"
+    exit 1
+fi
+
+note "OK: no wireless interfaces, no bluetooth devices, no radio modules, no radio firmware"
+applog "OK - no wireless ifaces, no bluetooth, no radio modules, no radio firmware"
+exit 0

@@ -1,0 +1,5 @@
+# Downloaded/derived OS images and verification artifacts (regenerate with build/00-fetch-verify.sh)
+cache/
+
+# Local Claude Code settings
+.claude/settings.local.json

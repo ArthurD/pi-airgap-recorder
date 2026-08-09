@@ -1,0 +1,278 @@
+#!/bin/sh
+# umik-record - continuous segmented capture from a miniDSP UMIK-1.
+#
+# Design notes:
+#   * The UMIK-1's USB product string embeds its per-unit calibration gain
+#     (e.g. "Umik-1  Gain:18dB"), so the ALSA card *name* differs between
+#     units. We therefore resolve the card by USB VID:PID, never by name.
+#   * Recording is segmented so that an unannounced power cut can damage at
+#     most the in-flight segment. Every completed segment is closed and
+#     synced by arecord on rotation.
+#   * The Pi 4B has no RTC. Without a network there is no reliable wall
+#     clock, so sessions are ordered by a persistent counter on the data
+#     partition. Wall time is recorded but explicitly marked untrusted.
+
+set -eu
+
+# The UMIK-1 exists in at least two hardware revisions - an older mini-USB one
+# and a newer USB-C one - and they do not necessarily share a product ID. So we
+# match on the miniDSP *vendor* ID and take any audio device it presents.
+# Set UMIK_PID to narrow it if you ever attach more than one miniDSP device.
+UMIK_VID=2752
+UMIK_PID=${UMIK_PID:-}
+
+# Storage: a USB drive mounted at /data/usb by umik-usb-detect wins, so
+# recordings can be pulled, copied anywhere, and the stick put back. No
+# stick -> the SD card. UMIK_DATA_DIR overrides both.
+DATA_DIR=${UMIK_DATA_DIR:-}
+if [ -z "$DATA_DIR" ]; then
+    if mountpoint -q /data/usb 2>/dev/null; then
+        DATA_DIR=/data/usb/recordings
+        STORAGE=usb
+    else
+        DATA_DIR=/data/recordings
+        STORAGE=sd
+    fi
+else
+    STORAGE=custom
+fi
+
+# --- persistent activity log ------------------------------------------------
+# journald is volatile (RAM) on this box, so mirror the interesting events to
+# a plain text file on the SAME medium as the recordings - whatever you pull
+# and read on a Mac carries its own log. Rotates at ~5MB, keeps one previous.
+
+LOGDIR="$(dirname "$DATA_DIR")/logs"
+LOGFILE="${LOGDIR}/umik.log"
+BOOTID=$(cut -c1-8 /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+
+# log() MUST be defined before applog's first call: under set -e an undefined
+# function is a fatal 127, killing the service before it logs anything.
+log() { echo "umik-record: $*" >&2; }
+
+applog() {
+    log "$*"
+    mkdir -p "$LOGDIR" 2>/dev/null || return 0
+    [ -w "$LOGDIR" ] || return 0
+    if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE")" -gt 5242880 ]; then
+        mv -f "$LOGFILE" "${LOGFILE}.1" 2>/dev/null
+    fi
+    printf '%s boot=%s up=%3ss %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$BOOTID" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> "$LOGFILE" 2>/dev/null || true
+}
+
+applog "=== service start: storage=${STORAGE} data=${DATA_DIR} ==="
+RATE=${UMIK_RATE:-48000}
+CHANNELS=${UMIK_CHANNELS:-1}
+SEGMENT=${UMIK_SEGMENT_SECONDS:-600}
+WAIT_SECS=${UMIK_WAIT_SECONDS:-60}
+
+# --- locate the UMIK-1 -----------------------------------------------------
+
+# Does a "vvvv:pppp" usbid belong to the mic we want?
+id_matches() {
+    if [ -n "$UMIK_PID" ]; then
+        [ "$1" = "${UMIK_VID}:${UMIK_PID}" ]
+    else
+        case "$1" in "${UMIK_VID}:"*) return 0 ;; *) return 1 ;; esac
+    fi
+}
+
+# Echoes "<card-index> <usbid>".
+find_card() {
+    for u in /proc/asound/card*/usbid; do
+        [ -r "$u" ] || continue
+        _id=$(cat "$u")
+        id_matches "$_id" || continue
+        c=${u%/usbid}
+        echo "${c##*/card} ${_id}"
+        return 0
+    done
+    return 1
+}
+
+find_product() {
+    for d in /sys/bus/usb/devices/*/; do
+        [ -r "${d}idVendor" ] && [ -r "${d}idProduct" ] || continue
+        id_matches "$(cat "${d}idVendor"):$(cat "${d}idProduct")" || continue
+        if [ -r "${d}product" ]; then cat "${d}product"; return 0; fi
+    done
+    return 1
+}
+
+# udev may not have settled when we start; wait rather than fail the unit.
+elapsed=0
+while ! FOUND=$(find_card); do
+    if [ "$elapsed" -ge "$WAIT_SECS" ]; then
+        applog "FATAL: no miniDSP device (vendor ${UMIK_VID}) after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port?"
+        for u in /proc/asound/card*/usbid; do
+            [ -r "$u" ] && applog "  saw sound device: $(cat "$u")"
+        done
+        log "(the UMIK cable is USB-C at the mic, USB-A at the Pi; the Pi's USB-C is power-only)"
+        exit 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+CARD=${FOUND% *}
+USBID=${FOUND#* }
+
+# The product string comes from the USB device itself - untrusted input. It
+# is only ever data here (heredocs substitute values without re-evaluating
+# them), but strip JSON-breaking and control characters before storing it.
+PRODUCT=$(find_product 2>/dev/null | tr -cd 'A-Za-z0-9 ._:()+-' | cut -c1-64)
+[ -n "$PRODUCT" ] || PRODUCT="unknown"
+# Pull the calibration gain out of the product string if it is there.
+GAIN=$(printf '%s' "$PRODUCT" | sed -n 's/.*[Gg]ain:*[[:space:]]*\([0-9.]*\)[[:space:]]*dB.*/\1/p')
+[ -n "$GAIN" ] || GAIN="unknown"
+
+applog "found ${USBID} on ALSA card ${CARD} (\"${PRODUCT}\", gain ${GAIN} dB)"
+
+# --- pick a working sample format -----------------------------------------
+
+# hw: devices do no conversion, so every parameter must match the hardware
+# exactly - and UMIK-1s commonly enumerate as a 2-channel device even though
+# the mic is mono. Probe channel counts as well as formats, and keep the last
+# arecord error: "Channels count non available" vs "Permission denied" name
+# completely different bugs, and without this the journal is blind.
+DEV="hw:${CARD},0"
+FORMAT=""
+PROBE_ERR=""
+for c in $CHANNELS 2 1; do
+    for f in ${UMIK_FORMAT:-S24_3LE S32_LE S16_LE}; do
+        if PROBE_ERR=$(arecord -D "$DEV" -f "$f" -r "$RATE" -c "$c" \
+                       -d 1 -t raw 2>&1 >/dev/null </dev/null); then
+            FORMAT="$f"
+            CHANNELS="$c"
+            break 2
+        fi
+    done
+done
+if [ -z "$FORMAT" ]; then
+    applog "FATAL: no working format at ${RATE} Hz (tried ${UMIK_FORMAT:-S24_3LE S32_LE S16_LE} x ${CHANNELS}/2/1 ch)"
+    applog "arecord said: $(printf '%s' "$PROBE_ERR" | tr '\n' '|' | cut -c1-300)"
+    exit 1
+fi
+applog "capture format ${FORMAT} @ ${RATE} Hz, ${CHANNELS} ch, ${SEGMENT}s segments"
+
+# --- free space guard -------------------------------------------------------
+# A 128GB card holds ~10 days of 48k/24-bit mono. When it fills, stop
+# cleanly instead of letting arecord fail and systemd thrash-restart us.
+# Exit code 78 tells the unit (RestartPreventExitStatus=78) not to restart.
+
+MIN_FREE_MB=${UMIK_MIN_FREE_MB:-512}
+free_mb() { df -Pm "$1" | awk 'NR==2 {print $4}'; }
+
+mkdir -p "$DATA_DIR"
+if [ "$(free_mb "$DATA_DIR")" -lt "$MIN_FREE_MB" ]; then
+    applog "FATAL: less than ${MIN_FREE_MB}MB free - storage is full; stopping cleanly"
+    log "move old sessions off ${DATA_DIR} and power-cycle to resume"
+    exit 78
+fi
+
+# --- session directory ------------------------------------------------------
+
+SEQ_FILE="${DATA_DIR}/.session-counter"
+SEQ=$(cat "$SEQ_FILE" 2>/dev/null || echo 0)
+case "$SEQ" in ''|*[!0-9]*) SEQ=0 ;; esac
+
+# No RTC and no NTP on this box: systemd only bumps the clock forward to its
+# own build epoch, so "looks recent" proves nothing. Trust the clock only if
+# it is also ahead of the previous session (counter-file mtime) - time that
+# went backwards across boots is definitely wrong.
+NOW=$(date -u +%s)
+TRUSTED=true
+[ "$NOW" -gt 1750000000 ] || TRUSTED=false
+if [ -f "$SEQ_FILE" ] && [ "$NOW" -le "$(date -u -r "$SEQ_FILE" +%s)" ]; then
+    TRUSTED=false
+fi
+
+SEQ=$((SEQ + 1))
+# Write-then-rename: a power cut mid-write must not zero the counter.
+printf '%s\n' "$SEQ" > "${SEQ_FILE}.tmp"
+mv -f "${SEQ_FILE}.tmp" "$SEQ_FILE"
+sync
+
+WALL=$(date -u +%Y%m%dT%H%M%SZ)
+
+SESSION=$(printf '%06d' "$SEQ")
+SESSION_DIR="${DATA_DIR}/${SESSION}_${WALL}"
+mkdir -p "$SESSION_DIR"
+
+cat > "${SESSION_DIR}/session.json" <<EOF
+{
+  "session": "${SESSION}",
+  "started_utc": "${WALL}",
+  "clock_trusted": ${TRUSTED},
+  "storage": "${STORAGE}",
+  "device": {
+    "usb_id": "${USBID}",
+    "product": "${PRODUCT}",
+    "calibration_gain_db": "${GAIN}",
+    "alsa_card": ${CARD}
+  },
+  "format": {
+    "encoding": "${FORMAT}",
+    "sample_rate": ${RATE},
+    "channels": ${CHANNELS}
+  },
+  "segment_seconds": ${SEGMENT}
+}
+EOF
+sync
+
+[ "$TRUSTED" = true ] || \
+    log "WARNING: no RTC and no network - wall clock is NOT trustworthy;"
+[ "$TRUSTED" = true ] || \
+    log "         rely on the session counter (${SESSION}) for ordering"
+
+applog "session ${SESSION} started -> ${SESSION_DIR} (clock_trusted=${TRUSTED}, $(free_mb "$DATA_DIR")MB free)"
+
+# --- capture ----------------------------------------------------------------
+# arecord closes the current file cleanly on SIGINT, so translate the
+# systemd SIGTERM into SIGINT and wait for it to finish before syncing.
+
+# Full date in the segment name: with %H%M%S alone the names would repeat
+# after 24 hours and arecord would overwrite day-old segments in place.
+arecord -D "$DEV" \
+        -f "$FORMAT" -r "$RATE" -c "$CHANNELS" \
+        --use-strftime --max-file-time "$SEGMENT" \
+        "${SESSION_DIR}/seg-%Y%m%d-%H%M%S.wav" &
+APID=$!
+
+# --- heartbeat: prove we are actually writing -------------------------------
+# Every UMIK_LOG_INTERVAL (default 60s), log the segment being written and
+# its growing size. A healthy box produces a visibly advancing byte count;
+# a stuck one stops the heartbeat - either way the log tells you.
+MON_INTERVAL=${UMIK_LOG_INTERVAL:-60}
+(
+    while sleep "$MON_INTERVAL"; do
+        kill -0 "$APID" 2>/dev/null || break
+        seg=$(ls -t "$SESSION_DIR"/seg-*.wav 2>/dev/null | head -1)
+        [ -n "$seg" ] || { applog "WARNING: no segment file yet"; continue; }
+        segbytes=$(wc -c < "$seg" 2>/dev/null) || segbytes=0
+        segkb=$(( ${segbytes:-0} / 1024 ))
+        nseg=$(ls "$SESSION_DIR"/seg-*.wav 2>/dev/null | wc -l | tr -d ' ')
+        totmb=$(du -sm "$SESSION_DIR" 2>/dev/null | cut -f1)
+        applog "writing ${seg##*/} (${segkb}KB) - segment ${nseg}, session ${totmb}MB, $(free_mb "$DATA_DIR")MB free"
+    done
+) &
+MPID=$!
+
+shutdown() {
+    applog "stopping - closing current segment"
+    kill "$MPID" 2>/dev/null || true
+    kill -INT "$APID" 2>/dev/null || true
+    wait "$APID" 2>/dev/null || true
+    sync
+    applog "session ${SESSION} stopped cleanly ($(du -sm "$SESSION_DIR" 2>/dev/null | cut -f1)MB total)"
+    exit 0
+}
+trap shutdown TERM INT
+
+wait "$APID" || true
+kill "$MPID" 2>/dev/null || true
+applog "WARNING: arecord exited on its own (mic unplugged?) - systemd will restart"
+exit 1

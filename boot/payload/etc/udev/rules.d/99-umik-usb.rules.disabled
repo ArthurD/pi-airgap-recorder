@@ -1,0 +1,30 @@
+# Default-deny USB: nothing but the UMIK-1 is allowed to enumerate.
+#
+# SHIPPED DISABLED ON PURPOSE. Enabling this also blocks USB keyboards AND
+# USB storage sticks - which defeats umik-usb-detect's portable-recordings
+# feature - leaving the UART serial console as your only way in. Enable it
+# only if you record to the SD card and have serial access:
+#
+#     sudo mv /etc/udev/rules.d/99-umik-usb.rules.disabled \
+#             /etc/udev/rules.d/99-umik-usb.rules && sudo reboot
+#
+# Hubs are exempted first, otherwise the root hub gets deauthorised and the
+# entire USB tree - including the mic - disappears.
+
+ACTION!="add", GOTO="umik_usb_end"
+SUBSYSTEM!="usb", GOTO="umik_usb_end"
+ENV{DEVTYPE}!="usb_device", GOTO="umik_usb_end"
+
+# Exempt hubs (class 09), including the internal root hubs.
+ATTR{bDeviceClass}=="09", GOTO="umik_usb_end"
+
+# Allow any miniDSP device. Matching the vendor rather than a specific product
+# ID is deliberate: the UMIK-1 exists in mini-USB and USB-C hardware revisions
+# which do not necessarily enumerate with the same product ID, and locking this
+# rule to one of them would silently refuse the other.
+ATTR{idVendor}=="2752", GOTO="umik_usb_end"
+
+# Everything else is refused.
+ATTR{authorized}="0"
+
+LABEL="umik_usb_end"
