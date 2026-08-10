@@ -112,6 +112,14 @@ enable_uart=1
 # Trim boot time - every second here is a second of missed recording.
 disable_splash=1
 boot_delay=0
+
+# Pi 5 only (section ignored on a Pi 4): without a 5V/5A USB-PD supply the
+# firmware caps total USB current at 600mA - not enough for mic + stick +
+# GPS. Battery banks essentially never negotiate 5A, so force the full
+# 1.6A USB budget; the recording stack draws well under it.
+[pi5]
+usb_max_current_enable=1
+[all]
 # <<< umik-autorecord <<<
 EOF
 
