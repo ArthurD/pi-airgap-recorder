@@ -125,10 +125,8 @@ stock behaviour if stopped):
 | red | **solid** | **clock synced from GPS this boot** (fix or time-only) |
 | red | slow blink | no trusted time — no GPS module, or no usable signal |
 
-So the at-a-distance happy states are: green blipping + red solid (recording
-with real timestamps), or green blipping + red slow-blinking (recording,
-untrusted clock — the pre-GPS normal). The red LED answers "did the GPS
-actually sync?" in the field, without pulling the card.
+Happy state at a distance: **green blipping, red solid**. Green blipping +
+red slow-blinking = recording fine, but timestamps are not trusted.
 
 ---
 
@@ -397,23 +395,25 @@ heartbeat. Rotates at 5 MB, keeping one previous file.
 
 ---
 
-## Open items
+## Status (2026-08-10)
 
+**Field-verified** across two runs (2026-08): capture and format probe,
+segmentation, stick-vs-card fallback, heartbeat, logs, diag, sealed ingest —
+every sampled segment bit-clean.
+
+**Built, awaiting field verification:** GPS time sync (incl. no-position-fix
+fallback), Mac time-seed floor, LED status display, `umik download` /
+`umik inject`, second unit (`umik2`).
+
+Open items:
+
+- [ ] GPS retest: first attempt the GT-U7 never enumerated on USB — suspect
+      a charge-only micro-USB cable; retry with a known data cable.
+- [ ] DS3231 RTC support (modules on hand shortly): GPS-disciplines-RTC;
+      RTC-carried time counts as trusted. Covers Pi 5's built-in RTC too.
 - [ ] GPG signature verification (needs a trusted keyring on the Mac).
-- [x] GPS module as the time source: `umik-gps-time.service` sets the clock
-      from NMEA (GT-U7) at boot, before the first session directory is
-      named — stays air-gapped. Not yet field-tested.
-- [ ] RTC module for trustworthy timestamps (only needed now if the
-      deployment site has no sky view for the GPS).
+- [ ] Optional field-power trim (powersave governor, Ethernet kill):
+      ~15–20% more battery runtime.
 - [ ] Optional UPS/supercap HAT for a truly graceful close.
-- [ ] Root-cause the one observed crash-loop boot (`c1f05d17`, first field
-      run): umik-record restarted every 2 s for a whole boot, dying silently
-      between the "found" and "capture format" log lines. Mitigations are in
-      (EXIT-trap logging, per-combo probe errors, restart backoff, 4-deep
-      diag history) — check `logs/umik.log.1` on the card for the missing
-      FATAL lines next collection.
-
-First field run (2026-06, 10 SD + 8 USB sessions) otherwise verified the
-design end-to-end: format probe, segmentation, stick-vs-card fallback,
-heartbeat, logs and diag all behaved as intended, and every sampled segment
-was bit-clean audio.
+- [ ] Root-cause the one crash-loop boot (`c1f05d17`, first field run);
+      mitigations are in — check `logs/umik.log.1` next collection.
