@@ -24,6 +24,15 @@ ATTR{bDeviceClass}=="09", GOTO="umik_usb_end"
 # rule to one of them would silently refuse the other.
 ATTR{idVendor}=="2752", GOTO="umik_usb_end"
 
+# Allow the optional GPS time-source module (umik-gps-time). GT-U7 boards
+# enumerate either as u-blox native USB or behind a common serial bridge:
+# u-blox (1546), WCH CH340 (1a86), Silicon Labs CP210x (10c4), Prolific
+# PL2303 (067b).
+ATTR{idVendor}=="1546", GOTO="umik_usb_end"
+ATTR{idVendor}=="1a86", GOTO="umik_usb_end"
+ATTR{idVendor}=="10c4", GOTO="umik_usb_end"
+ATTR{idVendor}=="067b", GOTO="umik_usb_end"
+
 # Everything else is refused.
 ATTR{authorized}="0"
 

@@ -14,10 +14,12 @@ Power on → recording. Pull the plug → recording stops. Nothing else.
 
 The Pi 4B has **four USB-A ports** (2× USB 3.0, 2× USB 2.0) plus one USB-C.
 The USB-C port is *power input only* — it has no host data role, so the mic
-cannot go there. No hub is needed. Prefer a **black USB 2.0** port over a blue
-3.0 one: the UMIK-1 is a USB Audio Class device at full speed, and the VL805
-xHCI controller behind the 3.0 ports is a known source of intermittent
-dropouts with UAC hardware.
+cannot go there. No hub is needed. Note that on the Pi 4B **all four USB-A
+ports sit behind the same VL805 xHCI controller** — the black 2.0 ports are
+not a separate controller, so port choice matters less than folklore says.
+Field captures through a black port verified bit-clean; if USB audio
+corruption ever appears, the fixes are a bootloader/VL805 firmware update
+(`rpi-eeprom`) or a cheap high-speed USB 2.0 hub in front of the mic.
 
 > **If your UMIK-1 has a USB-C socket, you still need no adapter.** miniDSP
 > moved the UMIK-1 from mini-USB to USB-C on later units, but the cable in the
@@ -34,6 +36,7 @@ dropouts with UAC hardware.
 |---|---|
 | Board | Raspberry Pi 4B |
 | Mic | miniDSP UMIK-1, either revision (USB vendor `2752`) |
+| GPS (optional) | GT-U7 (u-blox NEO-6 clone) via USB — or any NMEA-over-USB receiver |
 | Card | 128 GB (≈10 days of audio); anything ≥8 GB boots |
 | Base OS | Raspberry Pi OS Lite arm64, Trixie (2026-06-18) |
 
@@ -47,14 +50,44 @@ recorder stops cleanly and says so in the journal, instead of letting
 `arecord` crash-loop against a full disk. Move old sessions off and
 power-cycle to resume.
 
-### The one thing worth adding: an RTC
+### Timestamps: plug in a GPS module (optional)
 
 The Pi 4B has **no real-time clock**, and with no network there is nothing to
-sync against, so wall-clock timestamps are not trustworthy. The recorder
-handles this honestly: sessions are ordered by a **persistent counter**, and
-`session.json` carries `clock_trusted: false` whenever the clock is implausible
-(including when it has gone backwards since the previous session). A ~$5
-DS3231 I²C RTC module fixes timestamps permanently, if you ever care.
+sync against, so wall-clock timestamps are not normally trustworthy. The
+recorder handles this honestly: sessions are ordered by a **persistent
+counter**, and `session.json` carries `clock_trusted: false` whenever the
+clock is implausible (including when it has gone backwards since the previous
+session).
+
+**A cheap USB GPS receiver fixes this.** Plug a **GT-U7** (u-blox NEO-6
+clone, ~$10; its micro-USB into any free USB-A port) — or any module that
+speaks NMEA over USB — and leave it attached. At every boot,
+`umik-gps-time.service` runs *before* the recorder:
+
+1. It waits up to 6 s for a USB serial device, then identifies the GPS by
+   behaviour (whatever emits NMEA), not by vendor ID — clone boards use
+   assorted serial bridges.
+2. It waits up to **3 minutes** (tunable) for a satellite fix. Time is taken
+   only from an RMC sentence with a **valid checksum and fix-acquired
+   status** — the dummy time modules emit before a fix is ignored.
+3. It steps the system clock, so the session directory and every segment
+   filename carry real UTC (to within a couple of seconds), and
+   `session.json` gets `clock_trusted: true`, `time_source: "gps"` and a
+   `gps` block with the fix: coordinates, satellite count, altitude, and how
+   far the clock had to move.
+
+No module, no NMEA, or no fix in time → each is a logged no-op and recording
+starts exactly as before, untrusted clock and all. The module can never block
+recording. **The air-gap holds**: a GPS receiver only listens — it transmits
+nothing — so the radio-silence posture is unchanged (`umik-radio-check` is
+unaffected).
+
+Give the antenna a sky view: cold-start fix is ~30 s outdoors, minutes near a
+window, possibly never deep indoors — in which case the 3-minute budget
+expires and recording simply starts with the old behaviour. Note that the fix
+coordinates land in `session.json` and `umik.log`; redact them if you publish
+those files. A DS3231 I²C RTC remains an alternative if the deployment site
+has no sky view at all.
 
 ---
 
@@ -96,7 +129,7 @@ Pi **never touches a network at any point**, not even to provision.
 ```
 build/     runs on the Mac      fetch → verify → decompress → flash → inject
 boot/      lands on the card    firstrun.sh + payload/
-tools/     host-side utilities  repair-wav.sh
+tools/     host-side utilities  repair-wav.sh · umik-ingest.sh · umik-viewer.py
 ```
 
 ### Trust chain
@@ -188,6 +221,12 @@ FAT partition precisely so a headless failure is still diagnosable.
 The console password prompted for by `03-inject.sh` is the **only** way into
 the running box. Lose it and you reflash.
 
+**Updating an already-provisioned card** (new script versions, tunables):
+put the card in the Mac and re-run `./build/03-inject.sh --reuse-credentials`.
+It re-copies the payload and re-arms firstrun, which re-runs idempotently on
+the next boot and reinstalls everything; the console account, recordings and
+session counters are untouched.
+
 ---
 
 ## Recordings
@@ -195,7 +234,7 @@ the running box. Lose it and you reflash.
 ```
 /data/recordings/
   000001_20260728T161500Z/
-    session.json               device, calibration gain, format, clock trust
+    session.json               device, calibration gain, format, clock trust, GPS fix
     seg-20260728-161500.wav    10-minute segments
     seg-20260728-162500.wav
 ```
@@ -225,6 +264,29 @@ Repair a power-cut tail segment with:
 ```sh
 ./tools/repair-wav.sh path/to/seg-*.wav
 ```
+
+### "It sounds like white noise" — no, it's just quiet
+
+The UMIK-1 is a **measurement** microphone with low sensitivity (roughly
+−12 dBFS at 94 dB SPL). A quiet room records around **−70 dBFS RMS**: played
+back at normal volume that is near-silence, and cranked up it sounds like
+hiss — which is the mic's noise floor, not a broken recording. Speech or
+music near the mic lands at healthy −30 to −18 dBFS. Field data verified:
+full 24-bit resolution in use, channels perfectly correlated, real
+room-ambience spectrum. To *listen* to ambience, apply ~+40 dB makeup gain —
+`tools/umik-viewer.py` (spectrogram browser with a gain control) does this
+for you.
+
+### Browsing recordings: the spectrogram viewer
+
+```sh
+python3 tools/umik-viewer.py "/path/to/collected/data"   # then open the URL it prints
+```
+
+A local, offline web UI (needs only python3 + numpy): pick a collection →
+session → segment, see an Audacity-style spectrogram, click to move the
+playhead, play with adjustable makeup gain, arrow keys to thumb through
+segments. Nothing leaves the machine; it binds to 127.0.0.1 only.
 
 ### Chain of custody: sealing recordings for publication
 
@@ -269,6 +331,8 @@ Via `systemctl edit umik-record` (`Environment=` lines):
 | `UMIK_PID` | unset (any miniDSP device) |
 | `UMIK_USB_WAIT` | `6` (seconds to wait for a USB drive; via `systemctl edit umik-usb-detect`) |
 | `UMIK_LOG_INTERVAL` | `60` (seconds between heartbeat log lines) |
+| `UMIK_GPS_WAIT` | `6` (seconds to wait for a USB GPS to enumerate; via `systemctl edit umik-gps-time`) |
+| `UMIK_GPS_FIX_TIMEOUT` | `180` (seconds to wait for a GPS fix before recording starts anyway; raise the unit's `TimeoutStartSec` alongside it) |
 
 ### Activity log
 
@@ -276,8 +340,10 @@ journald is volatile (RAM) on this box, so every service also appends the
 interesting events to a plain-text **`logs/umik.log`** on the same medium as
 the recordings — the stick when recording to the stick, the card's exFAT
 partition otherwise. Open it on the Mac like any text file. It records each
-boot's radio-check verdict, USB-drive detection, mic discovery, session
-start/stop, and a heartbeat line every minute showing the current segment's
+boot's radio-check verdict, USB-drive detection, GPS detection and clock
+sync (the log's timestamps visibly jump when the clock is stepped — the jump
+*is* the adjustment, documented), mic discovery, session start/stop, and a
+heartbeat line every minute showing the current segment's
 growing size and free space — a stalled recorder is visible as a stopped
 heartbeat. Rotates at 5 MB, keeping one previous file.
 
@@ -285,7 +351,21 @@ heartbeat. Rotates at 5 MB, keeping one previous file.
 
 ## Open items
 
-- [ ] Not yet booted on real hardware. The log lands on the FAT partition.
 - [ ] GPG signature verification (needs a trusted keyring on the Mac).
-- [ ] RTC module for trustworthy timestamps.
+- [x] GPS module as the time source: `umik-gps-time.service` sets the clock
+      from NMEA (GT-U7) at boot, before the first session directory is
+      named — stays air-gapped. Not yet field-tested.
+- [ ] RTC module for trustworthy timestamps (only needed now if the
+      deployment site has no sky view for the GPS).
 - [ ] Optional UPS/supercap HAT for a truly graceful close.
+- [ ] Root-cause the one observed crash-loop boot (`c1f05d17`, first field
+      run): umik-record restarted every 2 s for a whole boot, dying silently
+      between the "found" and "capture format" log lines. Mitigations are in
+      (EXIT-trap logging, per-combo probe errors, restart backoff, 4-deep
+      diag history) — check `logs/umik.log.1` on the card for the missing
+      FATAL lines next collection.
+
+First field run (2026-06, 10 SD + 8 USB sessions) otherwise verified the
+design end-to-end: format probe, segmentation, stick-vs-card fallback,
+heartbeat, logs and diag all behaved as intended, and every sampled segment
+was bit-clean audio.

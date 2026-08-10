@@ -1,0 +1,61 @@
+[Unit]
+Description=Set the system clock from an optional USB GPS module
+# Runs to completion before the recorder so the very first session directory
+# is named with GPS-correct time. Pulled in via Wants= from umik-record: a
+# missing module, or no fix in time, must never block recording - the script
+# logs the situation and exits 0 on every path.
+Before=umik-record.service
+# data.mount named explicitly: the activity log lives under /data, whose
+# nofail exFAT mount is not waited on by local-fs.target.
+After=local-fs.target data.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/umik-gps-time
+# Budget: UMIK_GPS_WAIT (6s) + NMEA probing + UMIK_GPS_FIX_TIMEOUT (180s)
+# plus slack. Raise this too if you raise those via `systemctl edit`.
+TimeoutStartSec=300
+
+# --- sandboxing -------------------------------------------------------------
+# Runs as root (stepping the clock, raw tty access) but confined: only tty
+# serial character devices, only /data and /run writable, and the only
+# retained capability is CAP_SYS_TIME. No ProtectClock here, obviously -
+# this unit exists to set the clock (umik-record keeps ProtectClock=yes).
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_TIME
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/data /run
+# fake-hwclock persists the GPS time for later GPS-less boots ("-" = ignore
+# if the package is absent).
+ReadWritePaths=-/etc/fake-hwclock.data
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# @clock on top of @system-service: settimeofday/clock_settime live there.
+SystemCallFilter=@system-service @clock
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Only serial tty character devices (ttyACM = native USB GPS, ttyUSB =
+# CH340/CP210x-bridged GPS) are reachable.
+DevicePolicy=closed
+DeviceAllow=char-ttyACM rw
+DeviceAllow=char-ttyUSB rw
+
+[Install]
+WantedBy=multi-user.target

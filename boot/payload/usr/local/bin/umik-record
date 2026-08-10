@@ -54,14 +54,21 @@ applog() {
     log "$*"
     mkdir -p "$LOGDIR" 2>/dev/null || return 0
     [ -w "$LOGDIR" ] || return 0
+    # "|| true" matters: under set -e a failed rotation mv would otherwise
+    # kill the whole recorder from inside its own logging function.
     if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE")" -gt 5242880 ]; then
-        mv -f "$LOGFILE" "${LOGFILE}.1" 2>/dev/null
+        mv -f "$LOGFILE" "${LOGFILE}.1" 2>/dev/null || true
     fi
     printf '%s boot=%s up=%3ss %s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$BOOTID" \
         "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
         >> "$LOGFILE" 2>/dev/null || true
 }
+
+# A restart-loop with no FATAL line was observed in the field once: the shell
+# died between two applog calls and left no trace. Whatever the cause, an
+# abnormal exit must always leave a line in the activity log.
+trap 'rc=$?; [ "$rc" -eq 0 ] || applog "ABNORMAL EXIT status=${rc}"' EXIT
 
 applog "=== service start: storage=${STORAGE} data=${DATA_DIR} ==="
 RATE=${UMIK_RATE:-48000}
@@ -138,8 +145,10 @@ applog "found ${USBID} on ALSA card ${CARD} (\"${PRODUCT}\", gain ${GAIN} dB)"
 # arecord error: "Channels count non available" vs "Permission denied" name
 # completely different bugs, and without this the journal is blind.
 DEV="hw:${CARD},0"
+applog "probing ${DEV}: formats ${UMIK_FORMAT:-S24_3LE S32_LE S16_LE} x ${CHANNELS}/2/1 ch at ${RATE} Hz"
 FORMAT=""
 PROBE_ERR=""
+PROBE_ERRS=""
 for c in $CHANNELS 2 1; do
     for f in ${UMIK_FORMAT:-S24_3LE S32_LE S16_LE}; do
         if PROBE_ERR=$(arecord -D "$DEV" -f "$f" -r "$RATE" -c "$c" \
@@ -148,11 +157,18 @@ for c in $CHANNELS 2 1; do
             CHANNELS="$c"
             break 2
         fi
+        # Keep every combo's error, not just the last: which combos failed
+        # with WHICH error is the whole diagnosis (busy vs no-such-device
+        # vs bad format are entirely different problems).
+        PROBE_ERRS="${PROBE_ERRS}[${f}/${c}ch] $(printf '%s' "$PROBE_ERR" | tr '\n' ' ' | cut -c1-120)  "
     done
 done
 if [ -z "$FORMAT" ]; then
     applog "FATAL: no working format at ${RATE} Hz (tried ${UMIK_FORMAT:-S24_3LE S32_LE S16_LE} x ${CHANNELS}/2/1 ch)"
-    applog "arecord said: $(printf '%s' "$PROBE_ERR" | tr '\n' '|' | cut -c1-300)"
+    applog "probe errors: $(printf '%s' "$PROBE_ERRS" | cut -c1-700)"
+    case "$PROBE_ERRS" in *usy*)
+        applog "hint: 'busy' means something else holds the mic (leftover arecord? two recorder instances?)" ;;
+    esac
     exit 1
 fi
 applog "capture format ${FORMAT} @ ${RATE} Hz, ${CHANNELS} ch, ${SEGMENT}s segments"
@@ -189,6 +205,18 @@ if [ -f "$SEQ_FILE" ] && [ "$NOW" -le "$(date -u -r "$SEQ_FILE" +%s)" ]; then
     TRUSTED=false
 fi
 
+# umik-gps-time.service runs before us; if a USB GPS module got a fix this
+# boot it has already stepped the clock and left the fix details in
+# /run/umik-gps.json. /run is tmpfs, so the file cannot be a stale survivor
+# of an earlier boot: "synced": true means THIS boot's clock is GPS time,
+# which overrides the heuristics above (GPS time may legitimately sit behind
+# a previously-fast clock's counter mtime).
+GPS_JSON=$(cat /run/umik-gps.json 2>/dev/null || true)
+TIME_SOURCE=none
+case "$GPS_JSON" in
+    *'"synced": true'*) TRUSTED=true; TIME_SOURCE=gps ;;
+esac
+
 SEQ=$((SEQ + 1))
 # Write-then-rename: a power cut mid-write must not zero the counter.
 printf '%s\n' "$SEQ" > "${SEQ_FILE}.tmp"
@@ -206,6 +234,8 @@ cat > "${SESSION_DIR}/session.json" <<EOF
   "session": "${SESSION}",
   "started_utc": "${WALL}",
   "clock_trusted": ${TRUSTED},
+  "time_source": "${TIME_SOURCE}",
+  "gps": ${GPS_JSON:-null},
   "storage": "${STORAGE}",
   "device": {
     "usb_id": "${USBID}",
@@ -228,7 +258,7 @@ sync
 [ "$TRUSTED" = true ] || \
     log "         rely on the session counter (${SESSION}) for ordering"
 
-applog "session ${SESSION} started -> ${SESSION_DIR} (clock_trusted=${TRUSTED}, $(free_mb "$DATA_DIR")MB free)"
+applog "session ${SESSION} started -> ${SESSION_DIR} (clock_trusted=${TRUSTED}, time_source=${TIME_SOURCE}, $(free_mb "$DATA_DIR")MB free)"
 
 # --- capture ----------------------------------------------------------------
 # arecord closes the current file cleanly on SIGINT, so translate the

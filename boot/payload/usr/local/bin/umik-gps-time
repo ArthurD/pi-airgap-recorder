@@ -1,0 +1,260 @@
+#!/bin/sh
+# umik-gps-time - set the system clock from an optional USB GPS module.
+#
+# Design notes:
+#   * The Pi 4B has no RTC and this box has no network, so wall time is
+#     normally untrusted (see umik-record). A cheap USB GPS receiver (target
+#     hardware: GT-U7, a u-blox NEO-6 clone; any NMEA-over-USB module works)
+#     fixes that without breaking the air-gap: a GPS receiver only LISTENS -
+#     nothing is transmitted, so radio silence holds.
+#   * No gpsd. The image must provision without ever touching a network, so
+#     everything here is stock tools: stty + cat + awk.
+#   * The GT-U7 enumerates either as u-blox native USB (cdc_acm ->
+#     /dev/ttyACM*) or behind a CH340/CP210x bridge (-> /dev/ttyUSB*)
+#     depending on board revision. We therefore detect by BEHAVIOUR - any
+#     serial device that emits NMEA is a GPS - never by vendor ID.
+#   * This unit runs to completion before umik-record, so when a module is
+#     attached the very first session directory is named with real time.
+#     No module, or no fix in time, is a logged no-op: an optional feature
+#     must never block recording. Every path exits 0.
+#   * The clock is set only from an RMC sentence with a valid checksum,
+#     status 'A' (fix acquired) and a plausible date. GPS modules emit RMC
+#     with dummy or RTC-guess time long before they have a fix; those carry
+#     status 'V' and are ignored.
+#   * Everything umik-record needs lands in /run/umik-gps.json. /run is
+#     tmpfs, so a stale file from a previous boot cannot claim the clock is
+#     synced.
+
+set -u
+
+WAIT_SECS=${UMIK_GPS_WAIT:-6}
+FIX_SECS=${UMIK_GPS_FIX_TIMEOUT:-180}
+STATE=/run/umik-gps.json
+
+log() { echo "umik-gps-time: $*" >&2; }
+
+# Mirror decisions into the persistent activity log (journald is volatile).
+# Runs as root, so writable in every storage configuration. NOTE: once the
+# clock is stepped, the timestamps in umik.log visibly jump - that jump is
+# deliberate evidence of the adjustment, not a logging bug.
+applog() {
+    log "$*"
+    mkdir -p /data/logs 2>/dev/null || return 0
+    printf '%s up=%3ss umik-gps-time: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> /data/logs/umik.log 2>/dev/null || true
+}
+
+# --- state file -------------------------------------------------------------
+# Written on every exit path; umik-record embeds it verbatim in session.json,
+# so even a failed sync documents WHY the clock is untrusted.
+
+GPS_DEV=""
+GPS_UTC_J=null
+GPS_LAT=null
+GPS_LON=null
+GPS_SATS=null
+GPS_ALT=null
+DELTA=null
+elapsed=0
+
+write_state() {  # $1 = true|false, $2 = human-readable note
+    cat > "${STATE}.tmp" <<EOF
+{
+    "synced": $1,
+    "note": "$2",
+    "device": "${GPS_DEV:-none}",
+    "utc": ${GPS_UTC_J},
+    "latitude": ${GPS_LAT},
+    "longitude": ${GPS_LON},
+    "satellites": ${GPS_SATS},
+    "altitude_m": ${GPS_ALT},
+    "fix_wait_seconds": ${elapsed},
+    "clock_adjustment_seconds": ${DELTA}
+}
+EOF
+    chmod 0644 "${STATE}.tmp" 2>/dev/null
+    mv -f "${STATE}.tmp" "$STATE" 2>/dev/null || true
+}
+
+CAP=$(mktemp) || exit 0
+CATPID=""
+trap 'kill "$CATPID" 2>/dev/null; rm -f "$CAP"' EXIT
+
+# --- NMEA parsing -----------------------------------------------------------
+# Prints ONE pipe-separated line for the newest trustworthy RMC in the
+# capture ("YYYY-MM-DD HH:MM:SS|lat|lon|sats|alt"), or nothing. Satellite
+# count and altitude come from the newest fixed GGA when present.
+
+parse_capture() {
+    awk '
+    BEGIN { for (i = 1; i <= 127; i++) ord[sprintf("%c", i)] = i }
+    # mawk has no bitwise operators, so XOR one bit at a time.
+    function xor8(a, b,   r, bit, aa, bb) {
+        r = 0
+        for (bit = 1; bit <= 128; bit *= 2) {
+            aa = int(a / bit) % 2
+            bb = int(b / bit) % 2
+            if (aa != bb) r += bit
+        }
+        return r
+    }
+    # NMEA checksum: XOR of every byte between "$" and "*" must equal the
+    # two hex digits after the "*". Serial lines corrupt bytes silently -
+    # and we are about to set the SYSTEM CLOCK from this data - so nothing
+    # in a sentence is trusted until this passes.
+    function cksum_ok(line,   star, body, want, got, i) {
+        star = index(line, "*")
+        if (star < 2 || length(line) < star + 2) return 0
+        body = substr(line, 2, star - 2)
+        want = toupper(substr(line, star + 1, 2))
+        if (want !~ /^[0-9A-F][0-9A-F]$/) return 0
+        got = 0
+        for (i = 1; i <= length(body); i++)
+            got = xor8(got, ord[substr(body, i, 1)])
+        return sprintf("%02X", got) == want
+    }
+    { sub(/\r$/, "") }
+    # $GxRMC,hhmmss.ss,A,llll.ll,N,yyyyy.ll,E,spd,cog,ddmmyy,...
+    /^\$G.RMC,/ {
+        if (!cksum_ok($0)) next
+        n = split($0, f, ",")
+        if (n < 10 || f[3] != "A") next
+        t = f[2]; d = f[10]
+        if (t !~ /^[0-9][0-9][0-9][0-9][0-9][0-9]/) next
+        if (d !~ /^[0-9][0-9][0-9][0-9][0-9][0-9]$/) next
+        hh = substr(t, 1, 2) + 0; mi = substr(t, 3, 2) + 0; ss = substr(t, 5, 2) + 0
+        dd = substr(d, 1, 2) + 0; mo = substr(d, 3, 2) + 0; yy = substr(d, 5, 2) + 0
+        if (hh > 23 || mi > 59 || ss > 60) next
+        if (dd < 1 || dd > 31 || mo < 1 || mo > 12) next
+        # A receiver with a real fix knows the real date; a year before this
+        # software existed can only be corruption or a cold-start dummy.
+        if (yy < 25) next
+        utc = sprintf("20%02d-%02d-%02d %02d:%02d:%02d", yy, mo, dd, hh, mi, ss)
+        lat = ""; lon = ""
+        if (f[4] != "" && f[6] != "") {
+            lat = int(f[4] / 100) + ((f[4] + 0) % 100) / 60
+            if (f[5] == "S") lat = -lat
+            lon = int(f[6] / 100) + ((f[6] + 0) % 100) / 60
+            if (f[7] == "W") lon = -lon
+        }
+        have = 1
+    }
+    # $GxGGA,time,lat,N,lon,E,quality,numsats,hdop,alt,...
+    /^\$G.GGA,/ {
+        if (!cksum_ok($0)) next
+        n = split($0, f, ",")
+        if (n >= 10 && f[7] + 0 > 0) { sats = f[8] + 0; alt = f[10] }
+    }
+    END {
+        if (!have) exit 0
+        if (lat != "") printf "%s|%.6f|%.6f|%s|%s\n", utc, lat, lon, sats, alt
+        else           printf "%s|||%s|%s\n", utc, sats, alt
+    }' "$CAP" 2>/dev/null
+}
+
+# --- wait for a USB serial device to enumerate ------------------------------
+
+DEVICES=""
+while :; do
+    DEVICES=$(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null)
+    [ -n "$DEVICES" ] && break
+    if [ "$elapsed" -ge "$WAIT_SECS" ]; then
+        log "no USB serial device after ${WAIT_SECS}s - no GPS module; clock left as-is"
+        write_state false "no GPS module detected"
+        exit 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+# --- identify which device actually talks NMEA ------------------------------
+
+for dev in $DEVICES; do
+    [ -c "$dev" ] || continue
+    # NEO-6 family default is 9600 8N1; on native USB (ttyACM) the baud is
+    # meaningless and stty is harmless. clocal: never block on modem lines.
+    stty -F "$dev" 9600 raw -echo -echoe -echok clocal 2>/dev/null || true
+    : > "$CAP"
+    cat "$dev" > "$CAP" 2>/dev/null &
+    CATPID=$!
+    sleep 4
+    kill "$CATPID" 2>/dev/null
+    wait "$CATPID" 2>/dev/null
+    CATPID=""
+    if grep -q '^\$G' "$CAP" 2>/dev/null; then
+        GPS_DEV=$dev
+        break
+    fi
+    log "$dev is a serial device but not NMEA - ignoring"
+done
+
+if [ -z "$GPS_DEV" ]; then
+    applog "serial device present ($(echo "$DEVICES" | tr '\n' ' ')) but no NMEA - no GPS; clock left as-is"
+    write_state false "serial device present but none emitted NMEA"
+    exit 0
+fi
+
+# --- wait for a fix and set the clock ---------------------------------------
+# Cold-start time-to-first-fix for the NEO-6 family is ~30s under open sky
+# but can be minutes with a poor view. Poll the growing capture once a
+# second so the clock is stepped within ~2s of the fix arriving; the last
+# session ordering error is therefore a couple of seconds, which is GPS-
+# grade enough for naming recordings.
+
+applog "GPS module on ${GPS_DEV} - waiting up to ${FIX_SECS}s for a fix to set the clock"
+
+: > "$CAP"
+cat "$GPS_DEV" > "$CAP" 2>/dev/null &
+CATPID=$!
+
+elapsed=0
+PARSED=""
+while [ "$elapsed" -lt "$FIX_SECS" ]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if ! kill -0 "$CATPID" 2>/dev/null; then
+        applog "WARNING: GPS device went away while waiting for a fix"
+        break
+    fi
+    PARSED=$(parse_capture)
+    [ -n "$PARSED" ] && break
+    if [ $((elapsed % 30)) -eq 0 ]; then
+        sv=$(grep 'GSV,' "$CAP" 2>/dev/null | tail -1 | cut -d, -f4)
+        applog "no GPS fix yet (${elapsed}s elapsed, satellites in view: ${sv:-?})"
+    fi
+done
+
+if [ -z "$PARSED" ]; then
+    applog "no GPS fix within ${FIX_SECS}s - clock stays untrusted; recording starts anyway"
+    write_state false "GPS present but no fix within ${FIX_SECS}s"
+    exit 0
+fi
+
+IFS='|' read -r UTC LAT LON SATS ALT <<EOF
+$PARSED
+EOF
+
+BEFORE=$(date -u +%s)
+if ! date -u -s "$UTC" >/dev/null 2>&1; then
+    applog "WARNING: setting the clock to '${UTC}' failed - clock stays untrusted"
+    write_state false "date -s failed"
+    exit 0
+fi
+DELTA=$(( $(date -u +%s) - BEFORE ))
+
+GPS_UTC_J="\"$(printf '%s' "$UTC" | tr ' ' T)Z\""
+[ -n "$LAT" ]  && GPS_LAT=$LAT
+[ -n "$LON" ]  && GPS_LON=$LON
+[ -n "$SATS" ] && GPS_SATS=$SATS
+[ -n "$ALT" ]  && GPS_ALT=$ALT
+
+# Persist the good time for future GPS-less boots: fake-hwclock restores it
+# early next boot - still untrusted then, but close to reality instead of
+# stuck at some historical epoch.
+command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
+
+applog "clock SET from GPS: ${UTC}Z (moved ${DELTA}s, fix took ${elapsed}s, position ${GPS_LAT},${GPS_LON}, ${GPS_SATS} sats)"
+write_state true "clock set from GPS fix"
+exit 0

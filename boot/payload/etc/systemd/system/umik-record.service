@@ -9,6 +9,11 @@ Wants=sound.target
 # Wants (not Requires): a missing or broken stick must never block recording.
 Wants=umik-usb-detect.service
 After=umik-usb-detect.service
+# Optional GPS time sync runs first so the clock - and therefore the session
+# directory name - is real time when a module is attached. Wants (not
+# Requires): a missing module or a failed fix must never block recording.
+Wants=umik-gps-time.service
+After=umik-gps-time.service
 # Order after the exFAT data mount when it exists (nofail mounts are not
 # waited on by local-fs.target, so name it explicitly).
 After=data.mount
@@ -24,6 +29,11 @@ ExecStart=/usr/local/bin/umik-record
 Environment=TZ=UTC
 Restart=always
 RestartSec=2
+# Back off on repeated failure: 2s doubling to 60s. One observed field boot
+# restart-thrashed every 2s for its entire uptime; backoff keeps a bad boot
+# from grinding (and spamming the activity log) at full speed forever.
+RestartSteps=8
+RestartMaxDelaySec=60
 # 78 = deliberate "card is full" stop from umik-record; do not thrash-restart.
 RestartPreventExitStatus=78
 User=recorder
