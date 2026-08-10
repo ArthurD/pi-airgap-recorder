@@ -21,6 +21,20 @@ Field captures through a black port verified bit-clean; if USB audio
 corruption ever appears, the fixes are a bootloader/VL805 firmware update
 (`rpi-eeprom`) or a cheap high-speed USB 2.0 hub in front of the mic.
 
+### Port map
+
+| Port | Device |
+|---|---|
+| black USB 2.0 | **UMIK-1** (field-verified spot; isochronous audio likes 2.0) |
+| black USB 2.0 | **GT-U7 GPS** (optional; slow serial, 2.0 is plenty) |
+| blue USB 3.0, either | **USB stick** |
+| USB-C | power in — nothing else works there |
+
+No hub. The stick goes in a blue port on the *far side* from the GPS on
+purpose: USB 3.0 devices radiate broadband noise right around the GPS
+frequency (1.575 GHz). If a box struggles to get a fix, use the GPS cable
+to move the module a hand-span away from the Pi, ideally near a window.
+
 > **If your UMIK-1 has a USB-C socket, you still need no adapter.** miniDSP
 > moved the UMIK-1 from mini-USB to USB-C on later units, but the cable in the
 > box is **USB-C to USB-A**: USB-C at the mic end, USB-A at the host end. It
