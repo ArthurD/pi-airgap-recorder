@@ -55,9 +55,10 @@ power-cycle to resume.
 The Pi 4B has **no real-time clock**, and with no network there is nothing to
 sync against, so wall-clock timestamps are not normally trustworthy. The
 recorder handles this honestly: sessions are ordered by a **persistent
-counter**, and `session.json` carries `clock_trusted: false` whenever the
-clock is implausible (including when it has gone backwards since the previous
-session).
+counter**, and `session.json` carries `clock_trusted: true` **only when the
+clock was set from GPS that boot** — plausibility heuristics were tried and
+field-defeated (the image's own build epoch looks recent, and every boot
+restarts at it), so trust is GPS or nothing.
 
 **A cheap USB GPS receiver fixes this.** Plug a **GT-U7** (u-blox NEO-6
 clone, ~$10; its micro-USB into any free USB-A port) — or any module that

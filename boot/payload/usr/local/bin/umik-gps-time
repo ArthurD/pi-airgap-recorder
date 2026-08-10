@@ -199,7 +199,12 @@ while :; do
     DEVICES=$(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null)
     [ -n "$DEVICES" ] && break
     if [ "$elapsed" -ge "$WAIT_SECS" ]; then
-        log "no USB serial device after ${WAIT_SECS}s - no GPS module; clock left as-is"
+        # applog, not log: this verdict must reach the pullable activity
+        # log. A field run produced a "why no GPS?" mystery because this
+        # path only spoke to the volatile journal. Note the usual cause:
+        # a module that draws power but never enumerates is a charge-only
+        # micro-USB cable (no data wires).
+        applog "no USB serial device after ${WAIT_SECS}s - no GPS module on the bus (dead/charge-only cable?); clock left as-is"
         write_state false "no GPS module detected"
         exit 0
     fi

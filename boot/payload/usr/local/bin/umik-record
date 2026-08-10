@@ -194,23 +194,19 @@ SEQ_FILE="${DATA_DIR}/.session-counter"
 SEQ=$(cat "$SEQ_FILE" 2>/dev/null || echo 0)
 case "$SEQ" in ''|*[!0-9]*) SEQ=0 ;; esac
 
-# No RTC and no NTP on this box: systemd only bumps the clock forward to its
-# own build epoch, so "looks recent" proves nothing. Trust the clock only if
-# it is also ahead of the previous session (counter-file mtime) - time that
-# went backwards across boots is definitely wrong.
-NOW=$(date -u +%s)
-TRUSTED=true
-[ "$NOW" -gt 1750000000 ] || TRUSTED=false
-if [ -f "$SEQ_FILE" ] && [ "$NOW" -le "$(date -u -r "$SEQ_FILE" +%s)" ]; then
-    TRUSTED=false
-fi
+# No RTC and no NTP on this box, so the wall clock is trustworthy ONLY when
+# umik-gps-time set it from GPS this boot. Plausibility heuristics ("looks
+# recent, and ahead of the previous session") were tried and field-defeated:
+# the image's own build epoch is recent enough to pass any fixed threshold,
+# and since every boot restarts at that same epoch, the counter-mtime
+# tiebreak degenerated into a coin flip - one session shipped
+# clock_trusted=true off a fake clock. GPS or nothing.
+TRUSTED=false
 
-# umik-gps-time.service runs before us; if a USB GPS module got a fix this
-# boot it has already stepped the clock and left the fix details in
+# umik-gps-time.service runs before us; if a USB GPS module got usable time
+# this boot it has already stepped the clock and left the details in
 # /run/umik-gps.json. /run is tmpfs, so the file cannot be a stale survivor
-# of an earlier boot: "synced": true means THIS boot's clock is GPS time,
-# which overrides the heuristics above (GPS time may legitimately sit behind
-# a previously-fast clock's counter mtime).
+# of an earlier boot: "synced": true means THIS boot's clock is GPS time.
 GPS_JSON=$(cat /run/umik-gps.json 2>/dev/null || true)
 TIME_SOURCE=none
 case "$GPS_JSON" in
