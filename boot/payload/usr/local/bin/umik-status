@@ -1,0 +1,137 @@
+#!/bin/sh
+# umik-status - drive the Pi's two onboard LEDs as a live status display.
+#
+# On a headless, air-gapped box these LEDs are the only realtime feedback
+# channel. The vocabulary is deliberately tiny - readable from across a
+# room without a decoder card:
+#
+#   GREEN (ACT)  "is it recording?"
+#     off        box still booting (recorder not started yet)
+#     solid      recorder running but not writing yet (mic probe, session
+#                setup; suspicious if it stays solid for minutes)
+#     slow blip  recording - and the segment file is actually GROWING
+#                (checked on disk; a wedged recorder does not get this)
+#     fast blink trouble: recorder/radio-check failed, or the recorder
+#                stopped after having run (storage full lands here)
+#
+#   RED (PWR)  "do I have real time?"   (power indication is repurposed;
+#     off        not determined yet (GPS sync still running)
+#     solid      clock synced from GPS this boot (fix or time-only)
+#     slow blink no trusted time - no GPS module, or no usable signal
+#
+# Blinking is done by the kernel's "timer" LED trigger, so this loop only
+# writes to sysfs when a STATE CHANGES - it never busy-blinks, and a
+# re-write of the same pattern (which would visibly reset the blink phase)
+# is suppressed. If this service dies the recorder is unaffected; LEDs
+# just freeze in their last pattern until systemd restarts us.
+
+set -u
+
+INTERVAL=${UMIK_STATUS_INTERVAL:-5}
+
+# LED sysfs names differ across kernels: ACT/PWR on current Raspberry Pi OS,
+# led0/led1 on older ones.
+GREEN=""
+for d in /sys/class/leds/ACT /sys/class/leds/led0; do
+    [ -d "$d" ] && { GREEN=$d; break; }
+done
+RED=""
+for d in /sys/class/leds/PWR /sys/class/leds/led1; do
+    [ -d "$d" ] && { RED=$d; break; }
+done
+if [ -z "$GREEN" ] && [ -z "$RED" ]; then
+    echo "umik-status: no controllable LEDs found under /sys/class/leds - exiting" >&2
+    # Exit success: a Pi variant without these LEDs should not thrash-restart.
+    exit 0
+fi
+
+applog() {
+    echo "umik-status: $*" >&2
+    mkdir -p /data/logs 2>/dev/null || return 0
+    printf '%s up=%3ss umik-status: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> /data/logs/umik.log 2>/dev/null || true
+}
+
+# led_apply <led-dir> <pattern>; patterns: off, on, blip, blink, fast
+led_apply() {
+    [ -d "$1" ] || return 0
+    case "$2" in
+        off)   echo none  > "$1/trigger" 2>/dev/null
+               echo 0     > "$1/brightness" 2>/dev/null ;;
+        on)    echo none  > "$1/trigger" 2>/dev/null
+               echo 1     > "$1/brightness" 2>/dev/null ;;
+        blip)  echo timer > "$1/trigger" 2>/dev/null
+               echo 150   > "$1/delay_on" 2>/dev/null
+               echo 1850  > "$1/delay_off" 2>/dev/null ;;
+        blink) echo timer > "$1/trigger" 2>/dev/null
+               echo 800   > "$1/delay_on" 2>/dev/null
+               echo 1200  > "$1/delay_off" 2>/dev/null ;;
+        fast)  echo timer > "$1/trigger" 2>/dev/null
+               echo 120   > "$1/delay_on" 2>/dev/null
+               echo 120   > "$1/delay_off" 2>/dev/null ;;
+    esac
+}
+
+# On stop, hand the LEDs back to their stock kernel behaviour.
+restore() {
+    [ -d "$GREEN" ] && echo mmc0 > "$GREEN/trigger" 2>/dev/null
+    if [ -d "$RED" ]; then
+        echo default-on > "$RED/trigger" 2>/dev/null
+        echo 1 > "$RED/brightness" 2>/dev/null
+    fi
+    exit 0
+}
+trap restore TERM INT
+
+CUR_GREEN=""
+CUR_RED=""
+SEEN_ACTIVE=0
+
+while :; do
+    # ---- green: recording state -------------------------------------------
+    if systemctl is-failed --quiet umik-record 2>/dev/null \
+       || systemctl is-failed --quiet umik-radio-check 2>/dev/null; then
+        WANT_GREEN=fast
+    elif systemctl is-active --quiet umik-record 2>/dev/null; then
+        SEEN_ACTIVE=1
+        # "Actually writing" means a segment file touched within the last
+        # minute - arecord writes continuously, so the in-flight segment's
+        # mtime is always fresh on a healthy box.
+        if [ -n "$(find /data/usb/recordings /data/recordings \
+                   -maxdepth 2 -name 'seg-*.wav' -mmin -1 -print 2>/dev/null \
+                   | head -1)" ]; then
+            WANT_GREEN=blip
+        else
+            WANT_GREEN=on
+        fi
+    elif [ "$SEEN_ACTIVE" -eq 1 ]; then
+        # It ran and now it does not: a deliberate storage-full stop or a
+        # death systemd chose not to restart. Either way: come service me.
+        WANT_GREEN=fast
+    else
+        WANT_GREEN=off
+    fi
+
+    # ---- red: clock trust --------------------------------------------------
+    GPS=$(cat /run/umik-gps.json 2>/dev/null)
+    case "$GPS" in
+        *'"synced": true'*)  WANT_RED=on ;;
+        *'"synced": false'*) WANT_RED=blink ;;
+        *)                   WANT_RED=off ;;
+    esac
+
+    if [ "$WANT_GREEN" != "$CUR_GREEN" ]; then
+        led_apply "$GREEN" "$WANT_GREEN"
+        applog "green LED -> ${WANT_GREEN} (recording state)"
+        CUR_GREEN=$WANT_GREEN
+    fi
+    if [ "$WANT_RED" != "$CUR_RED" ]; then
+        led_apply "$RED" "$WANT_RED"
+        applog "red LED -> ${WANT_RED} (clock trust)"
+        CUR_RED=$WANT_RED
+    fi
+
+    sleep "$INTERVAL"
+done

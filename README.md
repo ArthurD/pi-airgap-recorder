@@ -98,6 +98,27 @@ Note that fix coordinates land in `session.json` and `umik.log`; redact them
 if you publish those files. A DS3231 I²C RTC remains an alternative if the
 deployment site never sees the sky and sits unpowered for weeks.
 
+### Reading the box at a glance: the LEDs
+
+With no screen and no network, the Pi's two onboard LEDs are the only live
+feedback. `umik-status.service` repurposes both (and hands them back to
+stock behaviour if stopped):
+
+| LED | Pattern | Meaning |
+|---|---|---|
+| green (ACT) | off | still booting — recorder not started yet |
+| green | solid | recorder running but not writing yet (mic probe); suspicious if it stays solid for minutes |
+| green | **short blip every 2 s** | **recording** — verified on disk: the segment file is actually growing |
+| green | fast blink | trouble: recorder or radio-check failed, recorder died, or storage full |
+| red (PWR) | off | clock trust not determined yet (GPS sync still running) |
+| red | **solid** | **clock synced from GPS this boot** (fix or time-only) |
+| red | slow blink | no trusted time — no GPS module, or no usable signal |
+
+So the at-a-distance happy states are: green blipping + red solid (recording
+with real timestamps), or green blipping + red slow-blinking (recording,
+untrusted clock — the pre-GPS normal). The red LED answers "did the GPS
+actually sync?" in the field, without pulling the card.
+
 ---
 
 ## Does "stop gracefully on power removal" work?

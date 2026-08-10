@@ -111,11 +111,13 @@ install -m 0755 "${PAYLOAD}/usr/local/bin/umik-record"      /usr/local/bin/umik-
 install -m 0755 "${PAYLOAD}/usr/local/bin/umik-radio-check" /usr/local/bin/umik-radio-check
 install -m 0755 "${PAYLOAD}/usr/local/bin/umik-usb-detect"  /usr/local/bin/umik-usb-detect
 install -m 0755 "${PAYLOAD}/usr/local/bin/umik-gps-time"    /usr/local/bin/umik-gps-time
+install -m 0755 "${PAYLOAD}/usr/local/bin/umik-status"      /usr/local/bin/umik-status
 install -m 0755 "${PAYLOAD}/usr/local/bin/umik-diag"        /usr/local/bin/umik-diag
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-record.service"      /etc/systemd/system/
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-radio-check.service" /etc/systemd/system/
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-usb-detect.service"  /etc/systemd/system/
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-gps-time.service"    /etc/systemd/system/
+install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-status.service"      /etc/systemd/system/
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-diag.service"        /etc/systemd/system/
 install -m 0644 "${PAYLOAD}/etc/modprobe.d/umik-no-radio.conf"  /etc/modprobe.d/
 install -m 0644 "${PAYLOAD}/etc/sysctl.d/99-umik-hardening.conf" /etc/sysctl.d/
@@ -216,6 +218,7 @@ systemctl daemon-reload
 systemctl enable umik-radio-check.service
 systemctl enable umik-usb-detect.service
 systemctl enable umik-gps-time.service
+systemctl enable umik-status.service
 systemctl enable umik-record.service
 systemctl enable umik-diag.service
 

@@ -1,0 +1,48 @@
+[Unit]
+Description=Drive the onboard LEDs as a recording/clock status display
+# An independent observer: deliberately NOT ordered against the recorder -
+# it starts early ("green off" honestly means "recorder not up yet") and a
+# failure here can never touch recording.
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/umik-status
+Restart=always
+RestartSec=5
+
+# --- sandboxing -------------------------------------------------------------
+# Root, because /sys/class/leds is root-writable, but with every capability
+# dropped: writing sysfs files and reading segment mtimes needs none. NOTE:
+# ProtectKernelTunables must NOT be set - it remounts /sys read-only, which
+# is exactly where the LEDs live.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/data
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+DevicePolicy=closed
+
+[Install]
+WantedBy=multi-user.target
