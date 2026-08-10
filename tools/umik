@@ -69,13 +69,17 @@ case "${1:-}" in
         exec "$TOOLS_DIR/umik-ingest.sh" --verify "$@"
         ;;
     link)
-        dest=/usr/local/bin/umik
-        if ln -sf "$TOOLS_DIR/umik" "$dest" 2>/dev/null; then
-            echo "installed: $dest -> $TOOLS_DIR/umik"
-        else
-            echo "need admin rights; run:  sudo ln -sf '$TOOLS_DIR/umik' $dest"
-            exit 1
-        fi
+        # First user-writable directory already on PATH wins; sudo only as
+        # a last resort.
+        for dir in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+            case ":$PATH:" in *":$dir:"*) ;; *) continue ;; esac
+            [ -d "$dir" ] && [ -w "$dir" ] || continue
+            ln -sf "$TOOLS_DIR/umik" "$dir/umik"
+            echo "installed: $dir/umik -> $TOOLS_DIR/umik"
+            exit 0
+        done
+        echo "no user-writable PATH dir found; run:  sudo ln -sf '$TOOLS_DIR/umik' /usr/local/bin/umik"
+        exit 1
         ;;
     ""|help|-h|--help)
         usage
