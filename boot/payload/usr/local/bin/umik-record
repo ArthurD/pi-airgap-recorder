@@ -214,7 +214,14 @@ fi
 GPS_JSON=$(cat /run/umik-gps.json 2>/dev/null || true)
 TIME_SOURCE=none
 case "$GPS_JSON" in
-    *'"synced": true'*) TRUSTED=true; TIME_SOURCE=gps ;;
+    *'"synced": true'*)
+        TRUSTED=true
+        # "gps" = time from a position fix; "gps-time-only" = time accepted
+        # without one (indoors: single-satellite decode or the module's
+        # battery-backed RTC) - equally usable, just honest about the path.
+        TIME_SOURCE=gps
+        case "$GPS_JSON" in *'"fix": true'*) ;; *) TIME_SOURCE=gps-time-only ;; esac
+        ;;
 esac
 
 SEQ=$((SEQ + 1))

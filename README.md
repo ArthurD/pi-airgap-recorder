@@ -67,14 +67,20 @@ speaks NMEA over USB — and leave it attached. At every boot,
 1. It waits up to 6 s for a USB serial device, then identifies the GPS by
    behaviour (whatever emits NMEA), not by vendor ID — clone boards use
    assorted serial bridges.
-2. It waits up to **3 minutes** (tunable) for a satellite fix. Time is taken
-   only from an RMC sentence with a **valid checksum and fix-acquired
-   status** — the dummy time modules emit before a fix is ignored.
-3. It steps the system clock, so the session directory and every segment
+2. It waits up to **3 minutes** (tunable) for a satellite fix, taking time
+   only from an NMEA sentence with a **valid checksum** and a plausible
+   date — the dummy time modules emit from cold start is rejected.
+3. **A position fix is preferred but not required for time.** If the window
+   expires without a fix — typical indoors — but the module has been
+   reporting coherent, plausible UTC the whole time (decoded from a single
+   visible satellite, or from the GT-U7's battery-backed clock seeded by an
+   earlier fix), that time is accepted anyway, marked
+   `time_source: "gps-time-only"`.
+4. It steps the system clock, so the session directory and every segment
    filename carry real UTC (to within a couple of seconds), and
-   `session.json` gets `clock_trusted: true`, `time_source: "gps"` and a
-   `gps` block with the fix: coordinates, satellite count, altitude, and how
-   far the clock had to move.
+   `session.json` gets `clock_trusted: true`, the `time_source`, and a
+   `gps` block — with coordinates, satellite count and altitude when there
+   was a real fix.
 
 No module, no NMEA, or no fix in time → each is a logged no-op and recording
 starts exactly as before, untrusted clock and all. The module can never block
@@ -82,12 +88,15 @@ recording. **The air-gap holds**: a GPS receiver only listens — it transmits
 nothing — so the radio-silence posture is unchanged (`umik-radio-check` is
 unaffected).
 
-Give the antenna a sky view: cold-start fix is ~30 s outdoors, minutes near a
-window, possibly never deep indoors — in which case the 3-minute budget
-expires and recording simply starts with the old behaviour. Note that the fix
-coordinates land in `session.json` and `umik.log`; redact them if you publish
-those files. A DS3231 I²C RTC remains an alternative if the deployment site
-has no sky view at all.
+**Seed the module once outdoors.** A brand-new GT-U7 has never had a fix, so
+indoors it may know nothing: power the box (or just the module) for a few
+minutes under open sky once. After that its battery-backed clock keeps
+approximate UTC for days to weeks between power-ups, and indoor boots get
+time via the no-fix fallback even with zero usable satellites. Cold-start
+fix is ~30 s outdoors, minutes near a window, possibly never deep indoors.
+Note that fix coordinates land in `session.json` and `umik.log`; redact them
+if you publish those files. A DS3231 I²C RTC remains an alternative if the
+deployment site never sees the sky and sits unpowered for weeks.
 
 ---
 

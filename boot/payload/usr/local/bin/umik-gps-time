@@ -17,10 +17,17 @@
 #     attached the very first session directory is named with real time.
 #     No module, or no fix in time, is a logged no-op: an optional feature
 #     must never block recording. Every path exits 0.
-#   * The clock is set only from an RMC sentence with a valid checksum,
-#     status 'A' (fix acquired) and a plausible date. GPS modules emit RMC
-#     with dummy or RTC-guess time long before they have a fix; those carry
-#     status 'V' and are ignored.
+#   * The clock PREFERS an RMC sentence with a valid checksum, status 'A'
+#     (fix acquired) and a plausible date. But a position fix is not
+#     actually required for time: indoors the module often knows good UTC
+#     anyway - decoded from a single visible satellite, or from its
+#     battery-backed RTC seeded by an earlier fix - while still reporting
+#     status 'V' because it cannot compute a position. So when the fix
+#     window expires, status-V time is accepted as a fallback, but only if
+#     it has a plausible date AND has ticked coherently against our own
+#     clock for the whole wait. A cold-start dummy fails both tests: its
+#     default date is decades old, and a clock that is not really counting
+#     UTC cannot track wall time for minutes.
 #   * Everything umik-record needs lands in /run/umik-gps.json. /run is
 #     tmpfs, so a stale file from a previous boot cannot claim the clock is
 #     synced.
@@ -51,6 +58,7 @@ applog() {
 # so even a failed sync documents WHY the clock is untrusted.
 
 GPS_DEV=""
+GPS_FIX=false
 GPS_UTC_J=null
 GPS_LAT=null
 GPS_LON=null
@@ -63,6 +71,7 @@ write_state() {  # $1 = true|false, $2 = human-readable note
     cat > "${STATE}.tmp" <<EOF
 {
     "synced": $1,
+    "fix": ${GPS_FIX},
     "note": "$2",
     "device": "${GPS_DEV:-none}",
     "utc": ${GPS_UTC_J},
@@ -83,9 +92,16 @@ CATPID=""
 trap 'kill "$CATPID" 2>/dev/null; rm -f "$CAP"' EXIT
 
 # --- NMEA parsing -----------------------------------------------------------
-# Prints ONE pipe-separated line for the newest trustworthy RMC in the
-# capture ("YYYY-MM-DD HH:MM:SS|lat|lon|sats|alt"), or nothing. Satellite
-# count and altitude come from the newest fixed GGA when present.
+# Prints ONE tagged, pipe-separated line, or nothing:
+#   FIX|YYYY-MM-DD HH:MM:SS|lat|lon|sats|alt   newest status-A RMC (satellite
+#                                              count/altitude from newest
+#                                              fixed GGA when present)
+#   TICK|YYYY-MM-DD HH:MM:SS|count|span        no fix, but the module reports
+#                                              a plausible time: newest
+#                                              status-V RMC, how many such
+#                                              sentences were seen, and the
+#                                              seconds their timestamps span
+# A FIX always wins over a TICK.
 
 parse_capture() {
     awk '
@@ -120,7 +136,8 @@ parse_capture() {
     /^\$G.RMC,/ {
         if (!cksum_ok($0)) next
         n = split($0, f, ",")
-        if (n < 10 || f[3] != "A") next
+        if (n < 10) next
+        if (f[3] != "A" && f[3] != "V") next
         t = f[2]; d = f[10]
         if (t !~ /^[0-9][0-9][0-9][0-9][0-9][0-9]/) next
         if (d !~ /^[0-9][0-9][0-9][0-9][0-9][0-9]$/) next
@@ -128,18 +145,32 @@ parse_capture() {
         dd = substr(d, 1, 2) + 0; mo = substr(d, 3, 2) + 0; yy = substr(d, 5, 2) + 0
         if (hh > 23 || mi > 59 || ss > 60) next
         if (dd < 1 || dd > 31 || mo < 1 || mo > 12) next
-        # A receiver with a real fix knows the real date; a year before this
-        # software existed can only be corruption or a cold-start dummy.
-        if (yy < 25) next
-        utc = sprintf("20%02d-%02d-%02d %02d:%02d:%02d", yy, mo, dd, hh, mi, ss)
-        lat = ""; lon = ""
-        if (f[4] != "" && f[6] != "") {
-            lat = int(f[4] / 100) + ((f[4] + 0) % 100) / 60
-            if (f[5] == "S") lat = -lat
-            lon = int(f[6] / 100) + ((f[6] + 0) % 100) / 60
-            if (f[7] == "W") lon = -lon
+        # A receiver that really knows UTC knows the real date, so accept
+        # only a plausible window: not before this software existed, and
+        # not decades ahead. Both bounds matter - the classic NEO-6
+        # cold-start dummy date is 1980 (the GPS epoch), which a two-digit
+        # year would otherwise smuggle through as 2080. Bump the upper
+        # bound if this box is somehow still recording in 2045.
+        if (yy < 26 || yy > 45) next
+        utcs = sprintf("20%02d-%02d-%02d %02d:%02d:%02d", yy, mo, dd, hh, mi, ss)
+        if (f[3] == "A") {
+            utc = utcs
+            lat = ""; lon = ""
+            if (f[4] != "" && f[6] != "") {
+                lat = int(f[4] / 100) + ((f[4] + 0) % 100) / 60
+                if (f[5] == "S") lat = -lat
+                lon = int(f[6] / 100) + ((f[6] + 0) % 100) / 60
+                if (f[7] == "W") lon = -lon
+            }
+            have = 1
+        } else {
+            # No position fix, but the module is reporting a time it
+            # believes. Record how coherently it ticks; the shell decides
+            # whether that earns a time-only sync.
+            sec = hh * 3600 + mi * 60 + ss
+            if (vn == 0) vfirst = sec
+            vn++; vlast = sec; vutc = utcs
         }
-        have = 1
     }
     # $GxGGA,time,lat,N,lon,E,quality,numsats,hdop,alt,...
     /^\$G.GGA,/ {
@@ -148,9 +179,16 @@ parse_capture() {
         if (n >= 10 && f[7] + 0 > 0) { sats = f[8] + 0; alt = f[10] }
     }
     END {
-        if (!have) exit 0
-        if (lat != "") printf "%s|%.6f|%.6f|%s|%s\n", utc, lat, lon, sats, alt
-        else           printf "%s|||%s|%s\n", utc, sats, alt
+        if (have) {
+            if (lat != "") printf "FIX|%s|%.6f|%.6f|%s|%s\n", utc, lat, lon, sats, alt
+            else           printf "FIX|%s|||%s|%s\n", utc, sats, alt
+            exit 0
+        }
+        if (vn > 0) {
+            span = vlast - vfirst
+            if (span < 0) span += 86400
+            printf "TICK|%s|%d|%d\n", vutc, vn, span
+        }
     }' "$CAP" 2>/dev/null
 }
 
@@ -210,7 +248,7 @@ cat "$GPS_DEV" > "$CAP" 2>/dev/null &
 CATPID=$!
 
 elapsed=0
-PARSED=""
+OUT=""
 while [ "$elapsed" -lt "$FIX_SECS" ]; do
     sleep 1
     elapsed=$((elapsed + 1))
@@ -218,23 +256,53 @@ while [ "$elapsed" -lt "$FIX_SECS" ]; do
         applog "WARNING: GPS device went away while waiting for a fix"
         break
     fi
-    PARSED=$(parse_capture)
-    [ -n "$PARSED" ] && break
+    # Break only on a real fix; a TICK (time without fix) is worth waiting
+    # out the whole window for, in case a fix still arrives with position.
+    OUT=$(parse_capture)
+    case "$OUT" in FIX\|*) break ;; esac
     if [ $((elapsed % 30)) -eq 0 ]; then
         sv=$(grep 'GSV,' "$CAP" 2>/dev/null | tail -1 | cut -d, -f4)
-        applog "no GPS fix yet (${elapsed}s elapsed, satellites in view: ${sv:-?})"
+        case "$OUT" in
+            TICK\|*) applog "no GPS fix yet (${elapsed}s elapsed, satellites in view: ${sv:-?}) - but module reports plausible time; will accept it if no fix arrives" ;;
+            *)       applog "no GPS fix yet (${elapsed}s elapsed, satellites in view: ${sv:-?})" ;;
+        esac
     fi
 done
 
-if [ -z "$PARSED" ]; then
-    applog "no GPS fix within ${FIX_SECS}s - clock stays untrusted; recording starts anyway"
-    write_state false "GPS present but no fix within ${FIX_SECS}s"
-    exit 0
-fi
-
-IFS='|' read -r UTC LAT LON SATS ALT <<EOF
-$PARSED
+LAT=""; LON=""; SATS=""; ALT=""
+case "$OUT" in
+FIX\|*)
+    GPS_FIX=true
+    IFS='|' read -r _tag UTC LAT LON SATS ALT <<EOF
+$OUT
 EOF
+    ;;
+TICK\|*)
+    IFS='|' read -r _tag UTC VN SPAN <<EOF
+$OUT
+EOF
+    # Time-only fallback: no position fix (indoors), but the module has been
+    # reporting UTC it believes - decoded from a single satellite, or its
+    # battery-backed RTC seeded by an earlier fix. Accept it only if it has
+    # ticked coherently for the whole wait: enough sentences, spanning
+    # roughly the wall-clock window we watched (a clock that is not really
+    # counting UTC cannot track our own elapsed time for minutes).
+    DRIFT=$((elapsed - SPAN))
+    [ "$DRIFT" -lt 0 ] && DRIFT=$((0 - DRIFT))
+    if [ "$VN" -ge 30 ] && [ "$DRIFT" -le 15 ]; then
+        applog "no position fix, but time is plausible and coherent (${VN} sentences over ${SPAN}s) - accepting time-only sync"
+    else
+        applog "no GPS fix within ${FIX_SECS}s and reported time not coherent (${VN} sentences, span ${SPAN}s vs ${elapsed}s waited) - clock stays untrusted"
+        write_state false "GPS present but no fix and no coherent time within ${FIX_SECS}s"
+        exit 0
+    fi
+    ;;
+*)
+    applog "no GPS fix within ${FIX_SECS}s - clock stays untrusted; recording starts anyway"
+    write_state false "GPS present but no usable time within ${FIX_SECS}s"
+    exit 0
+    ;;
+esac
 
 BEFORE=$(date -u +%s)
 if ! date -u -s "$UTC" >/dev/null 2>&1; then
@@ -255,6 +323,11 @@ GPS_UTC_J="\"$(printf '%s' "$UTC" | tr ' ' T)Z\""
 # stuck at some historical epoch.
 command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
 
-applog "clock SET from GPS: ${UTC}Z (moved ${DELTA}s, fix took ${elapsed}s, position ${GPS_LAT},${GPS_LON}, ${GPS_SATS} sats)"
-write_state true "clock set from GPS fix"
+if [ "$GPS_FIX" = true ]; then
+    applog "clock SET from GPS fix: ${UTC}Z (moved ${DELTA}s, fix took ${elapsed}s, position ${GPS_LAT},${GPS_LON}, ${GPS_SATS} sats)"
+    write_state true "clock set from GPS fix"
+else
+    applog "clock SET from GPS time (no position fix): ${UTC}Z (moved ${DELTA}s, waited ${elapsed}s)"
+    write_state true "clock set from GPS time without position fix (single satellite or battery-backed RTC)"
+fi
 exit 0
