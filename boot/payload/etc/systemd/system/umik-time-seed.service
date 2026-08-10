@@ -13,10 +13,11 @@ RemainAfterExit=yes
 ExecStart=/usr/local/bin/umik-time-seed
 
 # --- sandboxing -------------------------------------------------------------
-# Same confinement as umik-gps-time, minus the tty access: only the clock
-# capability, only /data and /run writable.
+# Same confinement as umik-gps-time, minus the tty access. CAP_DAC_OVERRIDE
+# is needed to read seed files and write umik.log under 0700 recorder-owned
+# /data directories; without it root is locked out like anyone else.
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_SYS_TIME
+CapabilityBoundingSet=CAP_SYS_TIME CAP_DAC_OVERRIDE
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

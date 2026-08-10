@@ -12,12 +12,14 @@ Restart=always
 RestartSec=5
 
 # --- sandboxing -------------------------------------------------------------
-# Root, because /sys/class/leds is root-writable, but with every capability
-# dropped: writing sysfs files and reading segment mtimes needs none. NOTE:
-# ProtectKernelTunables must NOT be set - it remounts /sys read-only, which
-# is exactly where the LEDs live.
+# Root for /sys/class/leds. CAP_DAC_OVERRIDE is REQUIRED, not optional:
+# the recordings live in 0700 recorder-owned directories (exFAT dmask/ext4
+# chmod), and root without that capability cannot traverse them - field
+# symptom was green stuck on "solid" forever because the segment-growth
+# check could never see the files. NOTE: ProtectKernelTunables must NOT be
+# set - it remounts /sys read-only, which is exactly where the LEDs live.
 NoNewPrivileges=yes
-CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

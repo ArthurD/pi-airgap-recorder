@@ -19,11 +19,14 @@ TimeoutStartSec=300
 
 # --- sandboxing -------------------------------------------------------------
 # Runs as root (stepping the clock, raw tty access) but confined: only tty
-# serial character devices, only /data and /run writable, and the only
-# retained capability is CAP_SYS_TIME. No ProtectClock here, obviously -
-# this unit exists to set the clock (umik-record keeps ProtectClock=yes).
+# serial character devices, only /data and /run writable. CAP_SYS_TIME for
+# the clock; CAP_DAC_OVERRIDE because /data/logs is a 0700 recorder-owned
+# directory (exFAT dmask/ext4 chmod) that root cannot write into without
+# it - the GPS verdict was silently missing from umik.log in the field.
+# No ProtectClock here, obviously - this unit exists to set the clock
+# (umik-record keeps ProtectClock=yes).
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_SYS_TIME
+CapabilityBoundingSet=CAP_SYS_TIME CAP_DAC_OVERRIDE
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
