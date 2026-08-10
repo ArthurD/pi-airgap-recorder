@@ -224,6 +224,16 @@ ingest() {
         [ "$any" -gt 0 ] && note "sealed $any card log file(s) -> logs/$ts/"
     fi
 
+    # Leave a fresh time-seed on the medium: at next boot the Pi steps its
+    # clock forward to this (a floor only - GPS still overrides; the seed is
+    # never marked trusted). Written last so an ingest failure above still
+    # aborts before touching the card.
+    if date -u +%s > "$SRC/umik-time-seed" 2>/dev/null; then
+        note "time-seed refreshed on '$vol'"
+    else
+        note "could not write time-seed on '$vol' (read-only medium?)"
+    fi
+
     note "ingest done: $new sealed, $repaired repaired derivative(s), $skipped already sealed, $warned warning(s)"
     if [ "$new" -gt 0 ] || [ "$warned" -gt 0 ]; then
         notify "$new file(s) sealed, $warned warning(s) - archive: $ARCHIVE"

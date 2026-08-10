@@ -1,0 +1,48 @@
+[Unit]
+Description=Step the clock forward from a Mac-written time-seed file
+# Ordering: after the USB stick mounts (a seed may live there), before the
+# GPS sync (which replaces approximate time with real time when it can) and
+# before the recorder (which names the session directory from the clock).
+# Never Requires= anything: a missing seed is a quick no-op.
+After=local-fs.target data.mount umik-usb-detect.service
+Before=umik-gps-time.service umik-record.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/umik-time-seed
+
+# --- sandboxing -------------------------------------------------------------
+# Same confinement as umik-gps-time, minus the tty access: only the clock
+# capability, only /data and /run writable.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_TIME
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/data /run
+ReadWritePaths=-/etc/fake-hwclock.data
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0022
+
+SystemCallFilter=@system-service @clock
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+DevicePolicy=closed
+
+[Install]
+WantedBy=multi-user.target

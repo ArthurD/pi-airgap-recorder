@@ -1,0 +1,99 @@
+#!/bin/sh
+# umik-time-seed - step the clock FORWARD from a time-seed left by the Mac.
+#
+# Design notes:
+#   * The Mac's clock is NTP-disciplined; the Pi has no RTC. So the Mac-side
+#     tools (03-inject.sh at provisioning, umik-ingest.sh at every
+#     collection) drop "the time right now" into a `umik-time-seed` file
+#     (epoch seconds, one line) on whatever medium they touch. At boot, the
+#     newest seed that is AHEAD of the current clock steps it forward.
+#   * This is a FLOOR, not truth: real time is at least the seed (the file
+#     was demonstrably written before now) but how much later is unknown -
+#     minutes if the box was deployed right after prepping, days if it sat
+#     on a shelf. Session names get real dates, but the clock is never
+#     marked trusted from this. umik-gps-time runs after us and replaces
+#     approximate time with real time whenever it can.
+#   * Never steps backward. A stale seed must not regress a clock that
+#     fake-hwclock or anything else already advanced further.
+
+set -u
+
+STATE=/run/umik-time-seed.json
+
+# The boot partition seed comes from inject; the /data ones from collection.
+SEED_FILES="/boot/firmware/umik-time-seed /data/umik-time-seed /data/usb/umik-time-seed"
+
+log() { echo "umik-time-seed: $*" >&2; }
+
+applog() {
+    log "$*"
+    mkdir -p /data/logs 2>/dev/null || return 0
+    printf '%s up=%3ss umik-time-seed: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> /data/logs/umik.log 2>/dev/null || true
+}
+
+write_state() {  # $1 = true|false, $2 = seed epoch or null, $3 = note
+    cat > "${STATE}.tmp" <<EOF
+{
+    "applied": $1,
+    "seed_epoch": $2,
+    "seed_utc": ${SEED_UTC_J:-null},
+    "source": "${BEST_SRC:-none}",
+    "stepped_seconds": ${STEP:-null},
+    "note": "$3"
+}
+EOF
+    chmod 0644 "${STATE}.tmp" 2>/dev/null
+    mv -f "${STATE}.tmp" "$STATE" 2>/dev/null || true
+}
+
+# --- pick the newest plausible seed -----------------------------------------
+
+BEST=0
+BEST_SRC=""
+SEED_UTC_J=null
+STEP=null
+for f in $SEED_FILES; do
+    [ -r "$f" ] || continue
+    v=$(tr -cd '0-9' < "$f" | cut -c1-10)
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    # Sanity window (2026..2045): a corrupt seed must not fling the clock
+    # decades away. Same reasoning as the GPS date-plausibility check.
+    if [ "$v" -lt 1767225600 ] || [ "$v" -gt 2378000000 ]; then
+        applog "ignoring implausible seed in $f"
+        continue
+    fi
+    if [ "$v" -gt "$BEST" ]; then BEST=$v; BEST_SRC=$f; fi
+done
+
+if [ "$BEST" -eq 0 ]; then
+    log "no time-seed file found - clock left as-is"
+    write_state false null "no seed file present"
+    exit 0
+fi
+
+SEED_UTC=$(date -u -d "@$BEST" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)
+SEED_UTC_J="\"${SEED_UTC}\""
+NOW=$(date -u +%s)
+
+if [ "$BEST" -le "$NOW" ]; then
+    log "seed ${SEED_UTC} (${BEST_SRC}) is not ahead of the clock - leaving it"
+    write_state false "$BEST" "seed behind current clock; not applied"
+    exit 0
+fi
+
+if ! date -u -s "@$BEST" >/dev/null 2>&1; then
+    applog "WARNING: failed to step clock to seed ${SEED_UTC}"
+    write_state false "$BEST" "date -s failed"
+    exit 0
+fi
+STEP=$((BEST - NOW))
+
+# Persist so a later boot without media still starts from at least this.
+command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
+
+applog "clock stepped forward ${STEP}s to seed ${SEED_UTC} from ${BEST_SRC} (floor only - NOT trusted time)"
+write_state true "$BEST" "clock stepped forward to seed (floor, not trusted)"
+exit 0

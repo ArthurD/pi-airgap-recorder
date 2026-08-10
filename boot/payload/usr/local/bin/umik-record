@@ -220,6 +220,15 @@ case "$GPS_JSON" in
         ;;
 esac
 
+# Below GPS in the hierarchy: a Mac-written time-seed applied at boot
+# (umik-time-seed.service). It makes the clock approximately right - real
+# time is AT LEAST the seed - so session names carry real dates, but it is
+# a floor, not a sync: TRUSTED stays false.
+SEED_JSON=$(cat /run/umik-time-seed.json 2>/dev/null || true)
+if [ "$TIME_SOURCE" = none ]; then
+    case "$SEED_JSON" in *'"applied": true'*) TIME_SOURCE=seeded ;; esac
+fi
+
 SEQ=$((SEQ + 1))
 # Write-then-rename: a power cut mid-write must not zero the counter.
 printf '%s\n' "$SEQ" > "${SEQ_FILE}.tmp"
@@ -239,6 +248,7 @@ cat > "${SESSION_DIR}/session.json" <<EOF
   "clock_trusted": ${TRUSTED},
   "time_source": "${TIME_SOURCE}",
   "gps": ${GPS_JSON:-null},
+  "time_seed": ${SEED_JSON:-null},
   "storage": "${STORAGE}",
   "device": {
     "usb_id": "${USBID}",

@@ -69,6 +69,12 @@ cp -R boot/payload/. "${BOOT}/umik/"
 cp boot/firstrun.sh "${BOOT}/firstrun.sh"
 chmod 0755 "${BOOT}/firstrun.sh" 2>/dev/null || true
 
+# Time-seed: the Pi steps its clock forward to this at boot (a floor, not
+# trusted time - GPS overrides it). Refreshed on every inject and by
+# umik-ingest.sh at every collection.
+date -u +%s > "${BOOT}/umik-time-seed"
+say "time-seed written ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))"
+
 printf '%s\n' "$HOSTNAME" > "${BOOT}/umik/hostname"
 if [ "$REUSE" -eq 0 ]; then
     printf '%s\n' "$CUSER"    > "${BOOT}/umik/console-user"

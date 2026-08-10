@@ -24,7 +24,7 @@ F="$D/diag-latest.log"
     echo; echo "--- failed units ---"
     systemctl --failed --no-pager -l 2>&1
 
-    for u in umik-radio-check umik-usb-detect umik-gps-time umik-status umik-record; do
+    for u in umik-radio-check umik-usb-detect umik-time-seed umik-gps-time umik-status umik-record; do
         echo; echo "--- status: $u ---"
         systemctl status "$u" --no-pager -l 2>&1
     done
@@ -36,6 +36,9 @@ F="$D/diag-latest.log"
 
     echo; echo "--- gps time sync (/run/umik-gps.json) ---"
     cat /run/umik-gps.json 2>/dev/null || echo "(no state file - service did not run)"
+
+    echo; echo "--- time seed (/run/umik-time-seed.json) ---"
+    cat /run/umik-time-seed.json 2>/dev/null || echo "(no state file - service did not run)"
 
     echo; echo "--- sound cards (/proc/asound/cards) ---"
     cat /proc/asound/cards 2>/dev/null || echo "(none)"

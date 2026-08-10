@@ -89,6 +89,16 @@ recording. **The air-gap holds**: a GPS receiver only listens — it transmits
 nothing — so the radio-silence posture is unchanged (`umik-radio-check` is
 unaffected).
 
+**Even with no GPS at all, the clock now gets a floor.** `03-inject.sh` and
+every `umik-ingest.sh` collection leave a `umik-time-seed` file (the Mac's
+NTP-disciplined clock, as epoch seconds) on whatever medium they touch; at
+boot `umik-time-seed.service` steps the Pi's clock **forward** to the newest
+plausible seed, before the session directory is named. Real time is *at
+least* the seed — the file was written before the boot — so session names
+carry real dates, accurate to "when the media last touched the Mac."
+`session.json` says `time_source: "seeded"` and `clock_trusted` stays
+`false`: it is a floor, not a sync, and GPS overrides it whenever it can.
+
 **Seed the module once outdoors.** A brand-new GT-U7 has never had a fix, so
 indoors it may know nothing: power the box (or just the module) for a few
 minutes under open sky once. After that its battery-backed clock keeps
