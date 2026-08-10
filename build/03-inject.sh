@@ -35,6 +35,14 @@ say "boot partition: $BOOT"
 
 # --- console credentials ---------------------------------------------------
 if [ "$REUSE" -eq 1 ]; then
+    # A freshly flashed card has no account to reuse: proceeding would
+    # provision a box with NO way to log in, ever. firstrun leaves its log
+    # on this partition, so its absence identifies a never-provisioned card.
+    # (This happened once: `umik inject` on a fresh card = unloggable box.)
+    [ -f "${BOOT}/umik-firstrun.log" ] || die \
+"this card has never been provisioned (no umik-firstrun.log) - reuse mode
+would create a box with NO console account. Run without --reuse-credentials:
+    ./build/03-inject.sh"
     say "reuse mode: keeping the card's existing console account and password"
     HOSTNAME=umik
     CUSER=""
