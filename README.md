@@ -291,9 +291,16 @@ recording — every failure path falls back to the SD card and says so in the
 journal. `session.json` records which storage each session used, and each
 location keeps its own session counter.
 
-Collection loop: **pull power → pull stick → copy on your Mac (exFAT reads
-natively) → stick back in → power on.** Pulling power first means the stick
-is never yanked mid-write; a power cut costs the usual 1–2 s worst case.
+Collection loop: **pull power → pull stick → stick in the Mac → `umik
+download` → eject, stick back, power on.** Pulling power first means the
+stick is never yanked mid-write; a power cut costs the usual 1–2 s worst
+case. `umik download` (install once with `./tools/umik link`) runs the
+sealed ingest over every mounted UMIK medium, then clears each recording
+off the medium **only after its archived copy re-verifies by hash** — media
+go back empty, `~/UMIK-Archive` is the truth, and anything unverified stays
+put loudly. `umik inject` is the matching one-word re-provision
+(payload + fresh time-seed, credentials kept); run it before ejecting the
+SD card whenever the payload changed.
 
 Without a stick, recordings land on the card's **exFAT `UMIKDATA` partition**
 (when created by step 04), which mounts straight onto a Mac: power off, card

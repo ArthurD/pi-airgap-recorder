@@ -1,0 +1,89 @@
+#!/bin/bash
+# umik - one-word driver for the things you do at the Mac.
+#
+#   umik download   for every mounted UMIK medium (USB stick or card):
+#                   seal all new recordings + logs into ~/UMIK-Archive,
+#                   verify the seals, then CLEAR the verified recordings
+#                   off the medium. Media go back empty; the archive is
+#                   the truth. Anything that fails verification is kept
+#                   in place and said so, loudly.
+#   umik inject     re-provision the card in one step (payload refresh +
+#                   fresh time-seed). Needs the card's boot partition
+#                   mounted. Passes through to 03-inject.sh
+#                   --reuse-credentials, so console credentials are kept.
+#   umik verify     re-verify the archive manifest (add --deep to re-hash
+#                   every archived byte).
+#   umik link       install this command as /usr/local/bin/umik.
+#
+# The collection loop, going forward:
+#   pull power -> pull stick -> stick in Mac -> umik download -> eject,
+#   stick back, power on. (SD card fallback still works: mount the card
+#   and the same `umik download` picks it up; run `umik inject` before
+#   ejecting whenever the payload changed.)
+
+set -euo pipefail
+
+SELF="$0"
+[ -L "$SELF" ] && SELF=$(readlink "$SELF")
+TOOLS_DIR=$(cd "$(dirname "$SELF")" && pwd)
+REPO_DIR=$(cd "$TOOLS_DIR/.." && pwd)
+ARCHIVE="${UMIK_ARCHIVE:-$HOME/UMIK-Archive}"
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$TOOLS_DIR/umik"; }
+
+case "${1:-}" in
+    download)
+        found=0
+        failed=0
+        for vol in /Volumes/*/; do
+            vol=${vol%/}
+            [ -d "$vol/recordings" ] || continue
+            found=$((found + 1))
+            echo
+            echo "=== ${vol} ==="
+            if "$TOOLS_DIR/umik-ingest.sh" "$vol"; then
+                "$TOOLS_DIR/umik-ingest.sh" --prune-verified "$vol"
+                echo "=== ${vol}: downloaded + cleared; safe to eject ==="
+            else
+                failed=$((failed + 1))
+                echo "!! ${vol}: ingest reported warnings - NOT clearing it." >&2
+                echo "!! Everything is still on the medium; check the messages above." >&2
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            echo "no UMIK media mounted (looked for /Volumes/*/recordings)" >&2
+            echo "plug in the stick (or the card) and rerun: umik download" >&2
+            exit 1
+        fi
+        echo
+        echo "archive: $ARCHIVE"
+        echo "eject with: diskutil eject /Volumes/<name>   (or Finder)"
+        [ "$failed" -eq 0 ] || exit 1
+        ;;
+    inject)
+        shift
+        exec "$REPO_DIR/build/03-inject.sh" --reuse-credentials "$@"
+        ;;
+    verify)
+        shift
+        exec "$TOOLS_DIR/umik-ingest.sh" --verify "$@"
+        ;;
+    link)
+        dest=/usr/local/bin/umik
+        if ln -sf "$TOOLS_DIR/umik" "$dest" 2>/dev/null; then
+            echo "installed: $dest -> $TOOLS_DIR/umik"
+        else
+            echo "need admin rights; run:  sudo ln -sf '$TOOLS_DIR/umik' $dest"
+            exit 1
+        fi
+        ;;
+    ""|help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "umik: unknown command '${1}'" >&2
+        echo >&2
+        usage >&2
+        exit 1
+        ;;
+esac
