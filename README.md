@@ -35,6 +35,14 @@ purpose: USB 3.0 devices radiate broadband noise right around the GPS
 frequency (1.575 GHz). If a box struggles to get a fix, use the GPS cable
 to move the module a hand-span away from the Pi, ideally near a window.
 
+**Beware charge-only cables.** Two separate field failures were caused by
+charging cables (vape/phone chargers) that carry power but have no data
+pins: the device lights up yet is *electrically absent* from the USB bus —
+`umik.log` shows `no miniDSP device` / `no GPS module on the bus`. Use the
+cable that shipped with the device, and vet any substitute on the Mac
+first: plug it in — if it doesn't appear in **System Information → USB**
+within seconds, the cable is charge-only.
+
 > **If your UMIK-1 has a USB-C socket, you still need no adapter.** miniDSP
 > moved the UMIK-1 from mini-USB to USB-C on later units, but the cable in the
 > box is **USB-C to USB-A**: USB-C at the mic end, USB-A at the host end. It
@@ -312,7 +320,19 @@ off the medium **only after its archived copy re-verifies by hash** — media
 go back empty, `~/UMIK-Archive` is the truth, and anything unverified stays
 put loudly. `umik inject` is the matching one-word re-provision
 (payload + fresh time-seed, credentials kept); run it before ejecting the
-SD card whenever the payload changed.
+SD card whenever the payload changed. Pass `--unit umik1` / `--unit umik2`
+once per card to name the recorder: the name prefixes every session
+directory and lands in `session.json`, which is what keeps the two units'
+recordings apart in the archive (`recordings/<unit>/…`) and in S3.
+
+`umik upload` mirrors the archive to `s3://YOUR-BUCKET` (or
+`umik download --upload` to chain it): GPS-dated sessions go under
+`raw/<YYYY-MM-DD>/<unit>/<session>/`, untrusted-clock sessions under
+`raw/undated/<unit>/…` — the date prefix is earned by `clock_trusted`,
+never guessed. Uploads read only the archive, are add-only (no `--delete`,
+IAM key has no DeleteObject) and idempotent; the hash-chained manifest is
+mirrored too, pinning the whole archive history off-site. Credentials live
+in the `umik` AWS profile (`aws configure --profile umik`).
 
 Without a stick, recordings land on the card's **exFAT `UMIKDATA` partition**
 (when created by step 04), which mounts straight onto a Mac: power off, card
