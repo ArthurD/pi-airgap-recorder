@@ -7,10 +7,16 @@
 #                   off the medium. Media go back empty; the archive is
 #                   the truth. Anything that fails verification is kept
 #                   in place and said so, loudly.
+#   umik upload     mirror the archive to S3 (YOUR-BUCKET):
+#                   raw/<date>/<unit>/<session>/ for GPS-dated sessions,
+#                   raw/undated/<unit>/... otherwise. Add-only, idempotent.
+#                   `umik download --upload` chains it after a download.
+#                   `umik upload --dry-run` previews without touching S3.
 #   umik inject     re-provision the card in one step (payload refresh +
 #                   fresh time-seed). Needs the card's boot partition
 #                   mounted. Passes through to 03-inject.sh
 #                   --reuse-credentials, so console credentials are kept.
+#                   Add --unit umik1 / --unit umik2 to (re)name the unit.
 #   umik verify     re-verify the archive manifest (add --deep to re-hash
 #                   every archived byte).
 #   umik link       install this command as /usr/local/bin/umik.
@@ -33,6 +39,8 @@ usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$TOO
 
 case "${1:-}" in
     download)
+        upload_after=0
+        [ "${2:-}" = "--upload" ] && upload_after=1
         found=0
         failed=0
         for vol in /Volumes/*/; do
@@ -58,7 +66,18 @@ case "${1:-}" in
         echo
         echo "archive: $ARCHIVE"
         echo "eject with: diskutil eject /Volumes/<name>   (or Finder)"
+        # Uploading reads only the archive, so it is safe (and right) to run
+        # even when an ingest warned - the sealed files deserve an off-site
+        # copy immediately either way.
+        if [ "$upload_after" -eq 1 ]; then
+            echo
+            "$TOOLS_DIR/umik-upload.sh" || failed=$((failed + 1))
+        fi
         [ "$failed" -eq 0 ] || exit 1
+        ;;
+    upload)
+        shift
+        exec "$TOOLS_DIR/umik-upload.sh" "$@"
         ;;
     inject)
         shift

@@ -15,13 +15,19 @@ cd "$(dirname "$0")/.."
 # existing account and keeps the current credentials. NEVER use this on a
 # freshly flashed card - there would be no account and no way to log in.
 REUSE=0
+UNIT=""
+WANT_UNIT=0
 ARGS=()
 for a in "$@"; do
+    if [ "$WANT_UNIT" -eq 1 ]; then UNIT="$a"; WANT_UNIT=0; continue; fi
     case "$a" in
         --reuse-credentials) REUSE=1 ;;
+        --unit) WANT_UNIT=1 ;;
+        --unit=*) UNIT="${a#--unit=}" ;;
         *) ARGS+=("$a") ;;
     esac
 done
+[ "$WANT_UNIT" -eq 0 ] || die "--unit needs a value, e.g. --unit umik1"
 BOOT="${ARGS[0]:-}"
 if [ -z "$BOOT" ]; then
     for c in /Volumes/bootfs /Volumes/boot; do
@@ -32,6 +38,24 @@ fi
 [ -f "${BOOT}/config.txt" ] || die "$BOOT does not look like a Pi boot partition (no config.txt)"
 
 say "boot partition: $BOOT"
+
+# --- unit identity ---------------------------------------------------------
+# Names THIS recorder (umik1, umik2, ...). umik-record stamps the name into
+# every session directory and session.json - with two units in the field it
+# is what keeps their recordings apart in the archive and in S3. The file
+# sits at the top of the boot partition, outside umik/, so payload refreshes
+# never touch it; like credentials, it survives re-provisioning.
+if [ -n "$UNIT" ]; then
+    [[ "$UNIT" =~ ^[a-z0-9][a-z0-9-]{0,15}$ ]] \
+        || die "unit must be lowercase letters/digits/hyphens, e.g. umik1"
+    printf '%s\n' "$UNIT" > "${BOOT}/umik-unit"
+    say "unit name written: $UNIT"
+elif [ -f "${BOOT}/umik-unit" ]; then
+    say "unit name kept: $(tr -d '\n' < "${BOOT}/umik-unit")"
+else
+    say "NOTE: this card has no unit name (pass --unit umik1 / --unit umik2);"
+    say "      sessions will fall back to a CPU-serial name like pi-8f3a"
+fi
 
 # --- console credentials ---------------------------------------------------
 if [ "$REUSE" -eq 1 ]; then

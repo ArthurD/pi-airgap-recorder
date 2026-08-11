@@ -25,8 +25,10 @@
 #                                              re-verifies, never anything else
 #
 # Archive layout ($UMIK_ARCHIVE, default ~/UMIK-Archive):
-#   recordings/<volume>/<session>/...          sealed originals
-#   recordings/<volume>/<session>/SHA256SUMS   publishable checksums
+#   recordings/<unit>/<session>/...            sealed originals (unit from
+#                                              session.json; volume label for
+#                                              pre-unit-stamping sessions)
+#   recordings/<unit>/<session>/SHA256SUMS     publishable checksums
 #   logs/<utc-stamp>/                          card activity-log snapshots
 #   manifest.log, manifest.head                hash-chained seal record
 #   ingest.log                                 human-readable run history
@@ -61,6 +63,17 @@ notify() { # best-effort macOS notification; silent when unavailable
 
 sha_of()      { "$SHASUM" -a 256 "$1" | awk '{print $1}'; }
 sha_of_text() { printf '%s' "$1" | "$SHASUM" -a 256 | awk '{print $1}'; }
+
+# Archive under the UNIT that recorded the session (umik1, umik2, ...), not
+# the medium's volume label: both units' media carry the same label, and
+# sticks can move between Pis. The unit is read from session.json; sessions
+# from before unit-stamping fall back to the volume label, which keeps every
+# already-sealed path exactly where the manifest says it is.
+session_unit() { # <session-dir> <fallback>
+    local u
+    u=$(sed -n 's/.*"unit": *"\([a-z0-9-]*\)".*/\1/p' "$1/session.json" 2>/dev/null | head -1)
+    printf '%s' "${u:-$2}"
+}
 
 # --- hash-chained manifest ---------------------------------------------------
 # Each line commits to the previous line's hash; manifest.head is the hash of
@@ -134,7 +147,7 @@ seal_local() { # <file> <vol> <relpath>  seal a locally generated derivative
 # --- ingest ------------------------------------------------------------------
 
 ingest() {
-    local SRC=$1 vol sdir sname dest base src dst rel rep
+    local SRC=$1 vol unit sdir sname dest base src dst rel rep
     local new=0 skipped=0 warned=0 repaired=0
 
     if [ ! -d "$SRC/recordings" ]; then
@@ -156,7 +169,8 @@ ingest() {
     for sdir in "$SRC"/recordings/*/; do
         [ -d "$sdir" ] || continue
         sname=$(basename "$sdir")
-        dest="$ARCHIVE/recordings/$vol/$sname"
+        unit=$(session_unit "$sdir" "$vol")
+        dest="$ARCHIVE/recordings/$unit/$sname"
         mkdir -p "$dest"
 
         for src in "$sdir"*; do
@@ -164,7 +178,7 @@ ingest() {
             base=$(basename "$src")
             case "$base" in .*|._*) continue ;; esac   # dotfiles, AppleDouble
             dst="$dest/$base"
-            rel="recordings/$vol/$sname/$base"
+            rel="recordings/$unit/$sname/$base"
 
             if [ -e "$dst" ]; then
                 # Already sealed. The archive is the truth from that moment;
@@ -197,7 +211,7 @@ ingest() {
                         if cmp -s "$dst" "$rep"; then
                             rm -f "$rep"    # header was already correct
                         else
-                            seal_local "$rep" "$vol" "recordings/$vol/$sname/$(basename "$rep")"
+                            seal_local "$rep" "$vol" "recordings/$unit/$sname/$(basename "$rep")"
                             note "sealed $(basename "$rep") (repaired header derivative)"
                             repaired=$((repaired + 1))
                         fi
@@ -246,13 +260,14 @@ ingest() {
 # against the recorded checksum. Anything unsealed or mismatched stays put.
 
 prune_verified() {
-    local SRC=$1 vol sdir sname dest base src dst want have removed=0 kept=0
+    local SRC=$1 vol unit sdir sname dest base src dst want have removed=0 kept=0
     [ -d "$SRC/recordings" ] || die "$SRC has no recordings/ directory"
     vol=$(basename "$SRC" | tr -cd 'A-Za-z0-9._-')
     for sdir in "$SRC"/recordings/*/; do
         [ -d "$sdir" ] || continue
         sname=$(basename "$sdir")
-        dest="$ARCHIVE/recordings/$vol/$sname"
+        unit=$(session_unit "$sdir" "$vol")
+        dest="$ARCHIVE/recordings/$unit/$sname"
         for src in "$sdir"*; do
             [ -f "$src" ] || continue
             base=$(basename "$src")

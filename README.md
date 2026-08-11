@@ -333,6 +333,39 @@ never guessed. Uploads read only the archive, are add-only (no `--delete`,
 IAM key has no DeleteObject) and idempotent; the hash-chained manifest is
 mirrored too, pinning the whole archive history off-site. Credentials live
 in the `umik` AWS profile (`aws configure --profile umik`).
+`umik upload --dry-run` previews without touching the bucket. Mac-side
+overrides (env): `UMIK_ARCHIVE` (default `~/UMIK-Archive`),
+`UMIK_S3_BUCKET` (default `YOUR-BUCKET`), `UMIK_AWS_PROFILE`
+(default `umik`).
+
+<details>
+<summary><b>S3 mirror setup</b> — one-time, or to rebuild on a new Mac</summary>
+
+1. Bucket `YOUR-BUCKET`: **Block all public access** on,
+   **versioning** on (versioning is the backstop that makes the add-only
+   design tamper-evident — nothing can be silently clobbered).
+2. IAM user `umik-uploader`, no console access, one access key, with a
+   policy scoped to just this bucket — deliberately **no `s3:DeleteObject`**,
+   so even a stolen laptop's key cannot erase the mirror:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       { "Effect": "Allow",
+         "Action": ["s3:PutObject", "s3:ListBucket", "s3:GetObject"],
+         "Resource": ["arn:aws:s3:::YOUR-BUCKET",
+                      "arn:aws:s3:::YOUR-BUCKET/*"] }
+     ]
+   }
+   ```
+
+   (`ListBucket`/`GetObject` are what let `aws s3 sync` skip what is
+   already uploaded.)
+3. On the Mac: `brew install awscli`, then `aws configure --profile umik`
+   with that key. Sanity check:
+   `aws s3 ls s3://YOUR-BUCKET/ --profile umik`.
+</details>
 
 Without a stick, recordings land on the card's **exFAT `UMIKDATA` partition**
 (when created by step 04), which mounts straight onto a Mac: power off, card
@@ -437,9 +470,18 @@ every sampled segment bit-clean.
 
 **Built, awaiting field verification:** GPS time sync (incl. no-position-fix
 fallback), Mac time-seed floor, LED status display, `umik download` /
-`umik inject`, second unit (`umik2`).
+`umik inject`, second unit (`umik2`), unit naming (`--unit`, session-dir
+prefix + `session.json` field), S3 mirroring (`umik upload` — dry-run
+verified against the live bucket 2026-08-10; no real session uploaded yet).
 
 Open items:
+
+- [ ] Name each card at its next `umik inject`: `umik inject --unit umik1`
+      (first box), `umik inject --unit umik2`. Until then sessions fall
+      back to a CPU-serial name (`pi-xxxx`) and archive under the volume
+      label — nothing breaks, but the S3 keys will not say umik1/umik2.
+- [ ] First real `umik download` + `umik upload` end-to-end (the archive
+      `~/UMIK-Archive` does not exist yet on this Mac).
 
 - [ ] GPS retest: first attempt the GT-U7 never enumerated on USB — suspect
       a charge-only micro-USB cable; retry with a known data cable.

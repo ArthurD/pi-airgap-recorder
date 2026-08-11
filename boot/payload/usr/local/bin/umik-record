@@ -188,6 +188,20 @@ if [ "$(free_mb "$DATA_DIR")" -lt "$MIN_FREE_MB" ]; then
     exit 78
 fi
 
+# --- unit identity ----------------------------------------------------------
+# Which physical recorder is this? Named by 03-inject.sh --unit (umik1,
+# umik2, ...) in a file at the top of the boot partition. With two units in
+# the field, every session must carry its origin - the name prefixes the
+# session directory and is recorded in session.json, so the archive and any
+# uploads can never conflate the units, even when sticks move between Pis.
+# Fallback: the CPU serial, unique per Pi, so an unnamed unit still cannot
+# collide with a named one.
+UNIT=$(tr -cd 'a-z0-9-' < /boot/firmware/umik-unit 2>/dev/null | cut -c1-16)
+if [ -z "$UNIT" ]; then
+    UNIT="pi-$(awk '/^Serial/ {s=$3} END {print substr(s, length(s)-3)}' /proc/cpuinfo 2>/dev/null)"
+    [ "$UNIT" = "pi-" ] && UNIT=pi-unknown
+fi
+
 # --- session directory ------------------------------------------------------
 
 SEQ_FILE="${DATA_DIR}/.session-counter"
@@ -238,12 +252,13 @@ sync
 WALL=$(date -u +%Y%m%dT%H%M%SZ)
 
 SESSION=$(printf '%06d' "$SEQ")
-SESSION_DIR="${DATA_DIR}/${SESSION}_${WALL}"
+SESSION_DIR="${DATA_DIR}/${UNIT}_${SESSION}_${WALL}"
 mkdir -p "$SESSION_DIR"
 
 cat > "${SESSION_DIR}/session.json" <<EOF
 {
   "session": "${SESSION}",
+  "unit": "${UNIT}",
   "started_utc": "${WALL}",
   "clock_trusted": ${TRUSTED},
   "time_source": "${TIME_SOURCE}",
