@@ -1,0 +1,53 @@
+[Unit]
+Description=Set the system clock from the battery-backed DS3231 RTC
+# Ordering: BEFORE the time-seed (whose forward-only step then refines RTC
+# drift against a fresher Mac-written seed, and never regresses it), before
+# the GPS sync (which overwrites approximate time and re-disciplines the
+# RTC when a module is attached), and before the recorder (which names the
+# session directory from the clock). A missing or never-set RTC is a quick
+# logged no-op - it must never block recording.
+After=local-fs.target data.mount
+Before=umik-time-seed.service umik-gps-time.service umik-record.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/umik-rtc-time
+
+# --- sandboxing -------------------------------------------------------------
+# Same confinement as umik-time-seed: CAP_SYS_TIME to step the clock,
+# CAP_DAC_OVERRIDE to write umik.log under the 0700 recorder-owned /data
+# directories. The RTC is READ via /sys/class/rtc (sysfs attributes, not a
+# device node), so DevicePolicy stays fully closed; writing the RTC is
+# umik-gps-time's job alone.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_TIME CAP_DAC_OVERRIDE
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/data /run
+ReadWritePaths=-/etc/fake-hwclock.data
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0022
+
+SystemCallFilter=@system-service @clock
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+DevicePolicy=closed
+
+[Install]
+WantedBy=multi-user.target

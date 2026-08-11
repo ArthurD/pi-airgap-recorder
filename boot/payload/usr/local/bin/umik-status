@@ -16,8 +16,9 @@
 #
 #   RED (PWR)  "do I have real time?"   (power indication is repurposed;
 #     off        not determined yet (GPS sync still running)
-#     solid      clock synced from GPS this boot (fix or time-only)
-#     slow blink no trusted time - no GPS module, or no usable signal
+#     solid      clock trusted: GPS sync this boot (fix or time-only), or
+#                carried by the GPS-disciplined DS3231 RTC
+#     slow blink no trusted time - no GPS/RTC, or neither had usable time
 #
 # Blinking is done by the kernel's "timer" LED trigger, so this loop only
 # writes to sysfs when a STATE CHANGES - it never busy-blinks, and a
@@ -115,11 +116,18 @@ while :; do
     fi
 
     # ---- red: clock trust --------------------------------------------------
+    # Trusted = GPS synced this boot OR the battery-backed RTC carried a
+    # GPS-disciplined time (umik-rtc-time). The GPS state file is written on
+    # every path once that service finishes, so its presence marks the end
+    # of "still deciding"; until then stay dark unless the RTC has already
+    # delivered trusted time.
     GPS=$(cat /run/umik-gps.json 2>/dev/null)
+    RTC=$(cat /run/umik-rtc.json 2>/dev/null)
+    WANT_RED=off
+    case "$RTC" in *'"trusted": true'*) WANT_RED=on ;; esac
     case "$GPS" in
         *'"synced": true'*)  WANT_RED=on ;;
-        *'"synced": false'*) WANT_RED=blink ;;
-        *)                   WANT_RED=off ;;
+        *'"synced": false'*) [ "$WANT_RED" = on ] || WANT_RED=blink ;;
     esac
 
     if [ "$WANT_GREEN" != "$CUR_GREEN" ]; then

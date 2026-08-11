@@ -59,6 +59,7 @@ within seconds, the cable is charge-only.
 | Board | Raspberry Pi 4B |
 | Mic | miniDSP UMIK-1, either revision (USB vendor `2752`) |
 | GPS (optional) | GT-U7 (u-blox NEO-6 clone) via USB — or any NMEA-over-USB receiver |
+| RTC (optional) | DS3231 plug-on module (e.g. Dorhea 4-pack) on GPIO pins 1–9 |
 | Card | 128 GB (≈10 days of audio); anything ≥8 GB boots |
 | Base OS | Raspberry Pi OS Lite arm64, Trixie (2026-06-18) |
 
@@ -74,13 +75,14 @@ power-cycle to resume.
 
 ### Timestamps: plug in a GPS module (optional)
 
-The Pi 4B has **no real-time clock**, and with no network there is nothing to
-sync against, so wall-clock timestamps are not normally trustworthy. The
-recorder handles this honestly: sessions are ordered by a **persistent
-counter**, and `session.json` carries `clock_trusted: true` **only when the
-clock was set from GPS that boot** — plausibility heuristics were tried and
-field-defeated (the image's own build epoch looks recent, and every boot
-restarts at it), so trust is GPS or nothing.
+The Pi 4B has **no built-in real-time clock**, and with no network there is
+nothing to sync against, so wall-clock timestamps are not normally
+trustworthy. The recorder handles this honestly: sessions are ordered by a
+**persistent counter**, and `session.json` carries `clock_trusted: true`
+only on **GPS-anchored evidence** — the clock was set from GPS that boot, or
+carried by the GPS-disciplined DS3231 RTC (next section). Plausibility
+heuristics were tried and field-defeated (the image's own build epoch looks
+recent, and every boot restarts at it), so trust is GPS-anchored or nothing.
 
 **A cheap USB GPS receiver fixes this.** Plug a **GT-U7** (u-blox NEO-6
 clone, ~$10; its micro-USB into any free USB-A port) — or any module that
@@ -128,8 +130,50 @@ approximate UTC for days to weeks between power-ups, and indoor boots get
 time via the no-fix fallback even with zero usable satellites. Cold-start
 fix is ~30 s outdoors, minutes near a window, possibly never deep indoors.
 Note that fix coordinates land in `session.json` and `umik.log`; redact them
-if you publish those files. A DS3231 I²C RTC remains an alternative if the
-deployment site never sees the sky and sits unpowered for weeks.
+if you publish those files.
+
+### Set-and-forget time: the DS3231 RTC (optional, recommended)
+
+A **DS3231 battery-backed RTC** turns "GPS every boot" into "**GPS once,
+ever**": boot each box once outdoors with the GPS attached, and from then on
+the coin cell carries real time across power-offs for years — the GPS module
+can be unplugged and shared between units.
+
+**Hardware.** Use the plug-on kind (5-hole female socket underneath, e.g.
+the Dorhea 4-pack). With the Pi powered off, push it onto the **first five
+pins of the inner row** of the GPIO header — physical pins 1/3/5/7/9, the
+row *closer to the middle of the board*, starting at the end nearest the
+microSD slot — battery facing up. Seated right, the module body sits over
+the Pi, not overhanging the board edge, and five bare pins of the outer row
+remain visible beside it. (Wrong row/offset is harmless-but-dead: the module
+simply never appears on I²C.)
+
+**Trust model.** Exactly one code path ever writes the RTC:
+`umik-gps-time`, and **only from a position fix** (the weaker
+no-position-fix time sync sets that boot's clock but never the RTC). The
+DS3231 latches an oscillator-stop flag in hardware whenever it quits
+ticking (flat/removed battery), and the kernel refuses to hand over a time
+while that flag is set — it clears only when the RTC is next written. So at
+boot, `umik-rtc-time.service` reading a valid, plausible time *is proof*
+that GPS set this chip once and it has run continuously since: the clock is
+stepped and counts as **trusted** (`time_source: "rtc"`,
+`clock_trusted: true`), within crystal drift (~1 min/year — re-attach the
+GPS outdoors for one boot whenever you want that zeroed). The flag lives in
+the chip on the unit, so re-injecting or swapping SD cards never launders
+trust. Mac time-seeds still apply on top — a seed only ever steps the clock
+*forward*, and a genuine floor can only refine RTC drift, never regress it.
+
+The full clock hierarchy at boot, weakest first, each layer only ever
+improving on the last: `fake-hwclock` (floor) → DS3231 restore (trusted) →
+Mac time-seed (floor, forward-only) → GPS (trusted, and re-disciplines the
+RTC on a fix). No RTC fitted, never GPS-set, or battery dead → logged no-op,
+`clock_trusted` stays honest, recording starts regardless.
+
+**Rollout to an existing card**: `umik inject --reuse-credentials` (the
+config.txt overlay and the new service ride along; firstrun re-runs
+idempotently on next boot), then one outdoor boot with the GPS attached.
+Watch for the red PWR LED going **solid on a later GPS-less boot** — that is
+the RTC carrying trusted time, and the GPS can come off.
 
 ### Reading the box at a glance: the LEDs
 
@@ -144,8 +188,8 @@ stock behaviour if stopped):
 | green | **short blip every 2 s** | **recording** — verified on disk: the segment file is actually growing |
 | green | fast blink | trouble: recorder or radio-check failed, recorder died, or storage full |
 | red (PWR) | off | clock trust not determined yet (GPS sync still running) |
-| red | **solid** | **clock synced from GPS this boot** (fix or time-only) |
-| red | slow blink | no trusted time — no GPS module, or no usable signal |
+| red | **solid** | **clock trusted** — GPS sync this boot (fix or time-only), or carried by the GPS-disciplined DS3231 RTC |
+| red | slow blink | no trusted time — no GPS/RTC, or neither had usable time |
 
 Happy state at a distance: **green blipping, red solid**. Green blipping +
 red slow-blinking = recording fine, but timestamps are not trusted.
@@ -446,6 +490,7 @@ Via `systemctl edit umik-record` (`Environment=` lines):
 | `UMIK_LOG_INTERVAL` | `60` (seconds between heartbeat log lines) |
 | `UMIK_GPS_WAIT` | `6` (seconds to wait for a USB GPS to enumerate; via `systemctl edit umik-gps-time`) |
 | `UMIK_GPS_FIX_TIMEOUT` | `180` (seconds to wait for a GPS fix before recording starts anyway; raise the unit's `TimeoutStartSec` alongside it) |
+| `UMIK_RTC_WAIT` | `5` (seconds to wait for the DS3231 to appear; via `systemctl edit umik-rtc-time`) |
 
 ### Activity log
 
@@ -469,7 +514,8 @@ segmentation, stick-vs-card fallback, heartbeat, logs, diag, sealed ingest —
 every sampled segment bit-clean.
 
 **Built, awaiting field verification:** GPS time sync (incl. no-position-fix
-fallback), Mac time-seed floor, LED status display, `umik download` /
+fallback), DS3231 RTC trusted-time carry (GPS-disciplines-RTC, `umik-rtc-time`),
+Mac time-seed floor, LED status display, `umik download` /
 `umik inject`, second unit (`umik2`), unit naming (`--unit`, session-dir
 prefix + `session.json` field), S3 mirroring (`umik upload` — dry-run
 verified against the live bucket 2026-08-10; no real session uploaded yet).
@@ -485,8 +531,11 @@ Open items:
 
 - [ ] GPS retest: first attempt the GT-U7 never enumerated on USB — suspect
       a charge-only micro-USB cable; retry with a known data cable.
-- [ ] DS3231 RTC support (modules on hand shortly): GPS-disciplines-RTC;
-      RTC-carried time counts as trusted. Covers Pi 5's built-in RTC too.
+- [ ] DS3231 field test (support is built, modules on hand): re-inject,
+      mount a module, one outdoor GPS boot, then confirm a GPS-less boot
+      shows red-solid and `time_source: "rtc"`. Note: a Pi 5's built-in
+      RTC should work identically (same kernel interface) minus the
+      overlay — untested.
 - [ ] GPG signature verification (needs a trusted keyring on the Mac).
 - [ ] Optional field-power trim (powersave governor, Ethernet kill):
       ~15–20% more battery runtime.

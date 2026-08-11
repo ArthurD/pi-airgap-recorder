@@ -2,11 +2,18 @@
 # umik-gps-time - set the system clock from an optional USB GPS module.
 #
 # Design notes:
-#   * The Pi 4B has no RTC and this box has no network, so wall time is
-#     normally untrusted (see umik-record). A cheap USB GPS receiver (target
-#     hardware: GT-U7, a u-blox NEO-6 clone; any NMEA-over-USB module works)
-#     fixes that without breaking the air-gap: a GPS receiver only LISTENS -
-#     nothing is transmitted, so radio silence holds.
+#   * The Pi 4B has no built-in RTC and this box has no network, so wall
+#     time is normally untrusted (see umik-record). A cheap USB GPS receiver
+#     (target hardware: GT-U7, a u-blox NEO-6 clone; any NMEA-over-USB
+#     module works) fixes that without breaking the air-gap: a GPS receiver
+#     only LISTENS - nothing is transmitted, so radio silence holds.
+#   * When a DS3231 RTC is fitted, a position fix also writes the RTC
+#     (hwclock --systohc). From then on umik-rtc-time hands every GPS-less
+#     boot trusted time, and the GPS module can be unplugged for good.
+#     This is the ONLY code path anywhere that writes the RTC, and only a
+#     real fix qualifies - the RTC outlives this boot as a trust anchor,
+#     so the weaker time-only sync below may set THIS boot's clock but
+#     must never mint long-lived trust.
 #   * No gpsd. The image must provision without ever touching a network, so
 #     everything here is stock tools: stty + cat + awk.
 #   * The GT-U7 enumerates either as u-blox native USB (cdc_acm ->
@@ -327,6 +334,23 @@ GPS_UTC_J="\"$(printf '%s' "$UTC" | tr ' ' T)Z\""
 # early next boot - still untrusted then, but close to reality instead of
 # stuck at some historical epoch.
 command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
+
+# Discipline the battery-backed RTC when one is fitted - the only place the
+# RTC is ever written, and only from a position fix (see header). A valid
+# RTC read on later boots then MEANS "GPS set me once and I never stopped
+# ticking", which umik-rtc-time promotes to trusted time. --noadjfile:
+# /etc/adjtime never exists on this box (and / is read-only to this unit).
+if [ -e /sys/class/rtc/rtc0 ]; then
+    if [ "$GPS_FIX" = true ]; then
+        if hwclock --systohc --utc --noadjfile 2>/dev/null; then
+            applog "RTC disciplined from GPS fix - future boots carry trusted time with no GPS attached"
+        else
+            applog "WARNING: RTC present but hwclock --systohc failed - RTC not disciplined"
+        fi
+    else
+        applog "RTC left alone: a time-only sync is not strong enough evidence to discipline it"
+    fi
+fi
 
 if [ "$GPS_FIX" = true ]; then
     applog "clock SET from GPS fix: ${UTC}Z (moved ${DELTA}s, fix took ${elapsed}s, position ${GPS_LAT},${GPS_LON}, ${GPS_SATS} sats)"

@@ -8,9 +8,10 @@
 #   * Recording is segmented so that an unannounced power cut can damage at
 #     most the in-flight segment. Every completed segment is closed and
 #     synced by arecord on rotation.
-#   * The Pi 4B has no RTC. Without a network there is no reliable wall
-#     clock, so sessions are ordered by a persistent counter on the data
-#     partition. Wall time is recorded but explicitly marked untrusted.
+#   * The Pi 4B has no built-in RTC and no network, so sessions are ordered
+#     by a persistent counter on the data partition. Wall time is recorded
+#     but marked trusted only on GPS-anchored evidence: a GPS sync this
+#     boot, or a DS3231 RTC that GPS disciplined on an earlier boot.
 
 set -eu
 
@@ -208,13 +209,15 @@ SEQ_FILE="${DATA_DIR}/.session-counter"
 SEQ=$(cat "$SEQ_FILE" 2>/dev/null || echo 0)
 case "$SEQ" in ''|*[!0-9]*) SEQ=0 ;; esac
 
-# No RTC and no NTP on this box, so the wall clock is trustworthy ONLY when
-# umik-gps-time set it from GPS this boot. Plausibility heuristics ("looks
-# recent, and ahead of the previous session") were tried and field-defeated:
-# the image's own build epoch is recent enough to pass any fixed threshold,
-# and since every boot restarts at that same epoch, the counter-mtime
-# tiebreak degenerated into a coin flip - one session shipped
-# clock_trusted=true off a fake clock. GPS or nothing.
+# No NTP on this box, so the wall clock is trustworthy ONLY on GPS-anchored
+# evidence: umik-gps-time set it from GPS this boot, or umik-rtc-time
+# restored it from the battery-backed DS3231 that a GPS fix disciplined on
+# an earlier boot. Plausibility heuristics ("looks recent, and ahead of the
+# previous session") were tried and field-defeated: the image's own build
+# epoch is recent enough to pass any fixed threshold, and since every boot
+# restarts at that same epoch, the counter-mtime tiebreak degenerated into
+# a coin flip - one session shipped clock_trusted=true off a fake clock.
+# GPS-anchored or nothing.
 TRUSTED=false
 
 # umik-gps-time.service runs before us; if a USB GPS module got usable time
@@ -233,6 +236,20 @@ case "$GPS_JSON" in
         case "$GPS_JSON" in *'"fix": true'*) ;; *) TIME_SOURCE=gps-time-only ;; esac
         ;;
 esac
+
+# Next in the hierarchy: the battery-backed DS3231 that umik-gps-time
+# disciplined from a position fix on some earlier boot. umik-rtc-time
+# applied it before we started; a valid reading is GPS time within crystal
+# drift (~1 min/year), so it keeps clock_trusted - this is what lets the
+# GPS module be unplugged once it has ever locked.
+RTC_JSON=$(cat /run/umik-rtc.json 2>/dev/null || true)
+if [ "$TRUSTED" = false ]; then
+    case "$RTC_JSON" in *'"trusted": true'*)
+        TRUSTED=true
+        TIME_SOURCE=rtc
+        ;;
+    esac
+fi
 
 # Below GPS in the hierarchy: a Mac-written time-seed applied at boot
 # (umik-time-seed.service). It makes the clock approximately right - real
@@ -263,6 +280,7 @@ cat > "${SESSION_DIR}/session.json" <<EOF
   "clock_trusted": ${TRUSTED},
   "time_source": "${TIME_SOURCE}",
   "gps": ${GPS_JSON:-null},
+  "rtc": ${RTC_JSON:-null},
   "time_seed": ${SEED_JSON:-null},
   "storage": "${STORAGE}",
   "device": {
@@ -282,7 +300,7 @@ EOF
 sync
 
 [ "$TRUSTED" = true ] || \
-    log "WARNING: no RTC and no network - wall clock is NOT trustworthy;"
+    log "WARNING: clock not GPS-anchored (no sync this boot, no disciplined RTC);"
 [ "$TRUSTED" = true ] || \
     log "         rely on the session counter (${SESSION}) for ordering"
 

@@ -2,11 +2,16 @@
 # umik-time-seed - step the clock FORWARD from a time-seed left by the Mac.
 #
 # Design notes:
-#   * The Mac's clock is NTP-disciplined; the Pi has no RTC. So the Mac-side
-#     tools (03-inject.sh at provisioning, umik-ingest.sh at every
+#   * The Mac's clock is NTP-disciplined; the Pi has no built-in RTC. So the
+#     Mac-side tools (03-inject.sh at provisioning, umik-ingest.sh at every
 #     collection) drop "the time right now" into a `umik-time-seed` file
 #     (epoch seconds, one line) on whatever medium they touch. At boot, the
 #     newest seed that is AHEAD of the current clock steps it forward.
+#   * Runs AFTER umik-rtc-time: when the DS3231 restored trusted time,
+#     stepping forward past it is a refinement (a seed is a true floor of
+#     real time, so it can only correct RTC drift downward-in-error), and
+#     a stale seed is a no-op. This script must NEVER write the RTC: a
+#     floor is not trusted time, and the RTC is the box's trust anchor.
 #   * This is a FLOOR, not truth: real time is at least the seed (the file
 #     was demonstrably written before now) but how much later is unknown -
 #     minutes if the box was deployed right after prepping, days if it sat

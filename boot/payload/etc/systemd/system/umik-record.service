@@ -14,6 +14,10 @@ After=umik-usb-detect.service
 # Requires): a missing module or a failed fix must never block recording.
 Wants=umik-gps-time.service
 After=umik-gps-time.service
+# Likewise the battery-backed RTC restore (trusted time carried from an
+# earlier GPS fix); a box without the module is a quick no-op.
+Wants=umik-rtc-time.service
+After=umik-rtc-time.service
 # Order after the exFAT data mount when it exists (nofail mounts are not
 # waited on by local-fs.target, so name it explicitly).
 After=data.mount

@@ -1,0 +1,119 @@
+#!/bin/sh
+# umik-rtc-time - set the system clock from a battery-backed DS3231 RTC.
+#
+# Design notes:
+#   * THE TRUST MODEL. Exactly one thing ever writes this RTC: umik-gps-time,
+#     and only from a GPS position fix. So a valid RTC read means "GPS set
+#     this chip once, and its battery has kept it ticking ever since" -
+#     real time within crystal drift (~1 minute/year on a DS3231), which
+#     this project accepts as trusted. This is what lets the GPS module be
+#     unplugged for good after one clean outdoor fix.
+#   * The "kept ticking ever since" half is enforced by the hardware: the
+#     DS3231 latches an oscillator-stop flag whenever timekeeping halts
+#     (flat or removed battery), and the kernel driver refuses to report a
+#     time while it is set - reads fail until the next set_time clears it.
+#     A trust flag that lives in the chip also travels with the UNIT, not
+#     the card: re-inject or swap SD cards freely, trust is unaffected.
+#   * Belt-and-braces on top: the reported date must sit in the same
+#     plausibility window every other clock source uses (2026..2045). A
+#     factory-fresh or power-cycled DS3231 resets to 2000-01-01, decades
+#     outside it.
+#   * Ordering: runs BEFORE umik-time-seed. The seed only ever steps the
+#     clock FORWARD, so a fresher Mac-written seed may refine RTC drift and
+#     a stale one is a no-op; trust survives either way, because a seed is
+#     a true floor of real time. The seed path must NEVER write the RTC,
+#     though - that would launder an untrusted floor into "trusted"
+#     hardware time.
+#   * Unlike the forward-only seed, a valid RTC sets the clock in EITHER
+#     direction: it outranks whatever floor (fake-hwclock, an old seed)
+#     got to the clock first.
+#   * Every path exits 0: a clock source must never block recording.
+
+set -u
+
+STATE=/run/umik-rtc.json
+RTC_SYS=${UMIK_RTC_SYS:-/sys/class/rtc/rtc0}
+WAIT_SECS=${UMIK_RTC_WAIT:-5}
+
+log() { echo "umik-rtc-time: $*" >&2; }
+
+applog() {
+    log "$*"
+    mkdir -p /data/logs 2>/dev/null || return 0
+    printf '%s up=%3ss umik-rtc-time: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> /data/logs/umik.log 2>/dev/null || true
+}
+
+write_state() {  # $1 = present true|false, $2 = trusted true|false, $3 = note
+    cat > "${STATE}.tmp" <<EOF
+{
+    "present": $1,
+    "trusted": $2,
+    "utc": ${RTC_UTC_J:-null},
+    "stepped_seconds": ${STEP:-null},
+    "note": "$3"
+}
+EOF
+    chmod 0644 "${STATE}.tmp" 2>/dev/null
+    mv -f "${STATE}.tmp" "$STATE" 2>/dev/null || true
+}
+
+RTC_UTC_J=null
+STEP=null
+
+# --- wait for the driver to bind -------------------------------------------
+# The DS3231 is declared in the device tree (dtoverlay=i2c-rtc,ds3231) and
+# probes within the first seconds of boot; a short wait covers module-load
+# ordering. Nothing after that = no module fitted (or no overlay): a box
+# without an RTC, which is fine.
+
+elapsed=0
+while [ ! -e "${RTC_SYS}/since_epoch" ]; do
+    if [ "$elapsed" -ge "$WAIT_SECS" ]; then
+        log "no RTC device after ${WAIT_SECS}s - no DS3231 fitted; clock left as-is"
+        write_state false false "no RTC device"
+        exit 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+# --- read it ----------------------------------------------------------------
+# A read failure here IS the oscillator-stop flag (see header): the chip
+# stopped ticking at some point since GPS last set it, so whatever it now
+# holds is worthless. The kernel logs "SET TIME!" at probe in this case.
+
+EPOCH=$(cat "${RTC_SYS}/since_epoch" 2>/dev/null | tr -cd '0-9')
+case "$EPOCH" in ''|*[!0-9]*)
+    applog "RTC present but reports no valid time (never GPS-set, or its battery went flat) - clock stays untrusted until the next GPS fix"
+    write_state true false "RTC oscillator stopped since last set - needs a GPS fix"
+    exit 0
+;; esac
+
+# Same window as umik-time-seed and the GPS date check (2026..2045): even a
+# "valid" reading is refused if it is decades from reality.
+if [ "$EPOCH" -lt 1767225600 ] || [ "$EPOCH" -gt 2378000000 ]; then
+    applog "RTC time is implausible (epoch ${EPOCH}) - ignoring it; clock stays untrusted"
+    write_state true false "RTC time outside plausibility window"
+    exit 0
+fi
+
+RTC_UTC=$(date -u -d "@$EPOCH" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)
+RTC_UTC_J="\"${RTC_UTC}\""
+NOW=$(date -u +%s)
+
+if ! date -u -s "@$EPOCH" >/dev/null 2>&1; then
+    applog "WARNING: failed to set clock from RTC time ${RTC_UTC}"
+    write_state true false "date -s failed"
+    exit 0
+fi
+STEP=$((EPOCH - NOW))
+
+# Keep the fallback floor fresh for a future boot where the RTC has died.
+command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
+
+applog "clock SET from battery-backed RTC: ${RTC_UTC} (moved ${STEP}s) - TRUSTED, GPS-disciplined within drift"
+write_state true true "clock set from GPS-disciplined RTC"
+exit 0

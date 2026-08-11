@@ -55,10 +55,12 @@ SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
 # Only serial tty character devices (ttyACM = native USB GPS, ttyUSB =
-# CH340/CP210x-bridged GPS) are reachable.
+# CH340/CP210x-bridged GPS) are reachable - plus the RTC, which this unit
+# alone is allowed to write (hwclock --systohc after a position fix).
 DevicePolicy=closed
 DeviceAllow=char-ttyACM rw
 DeviceAllow=char-ttyUSB rw
+DeviceAllow=char-rtc rw
 
 [Install]
 WantedBy=multi-user.target
