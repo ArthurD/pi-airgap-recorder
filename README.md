@@ -89,13 +89,27 @@ anchored or nothing.
 
 Plug an **ethernet cable from your router into the Pi for a single boot**.
 `umik-net-time.service` runs before the recorder: it spots the carrier,
-opens a one-time network window (DHCP via `systemd-networkd`, NTP via
-`systemd-timesyncd` — both otherwise dormant on the box), steps the clock,
+opens a one-time network window (DHCP via `systemd-networkd`, otherwise
+dormant), fetches **NTS-authenticated time** (RFC 8915) from
+`time.cloudflare.com` via a one-shot `chronyd -q`, steps the clock,
 **disciplines the DS3231 RTC**, then tears the whole thing back down —
-services stopped, timesyncd re-masked, link down. Watch for the **red PWR
-LED going solid**: that is the sync landing. Pull the cable whenever you
-like; every later boot carries trusted time from the RTC
-(`time_source: "ntp"` that boot, `"rtc"` afterwards).
+services stopped and re-masked, link down. Watch for the **red PWR LED
+going solid**: that is the sync landing. Pull the cable whenever you like;
+every later boot carries trusted time from the RTC (`time_source: "ntp"`
+that boot, `"rtc"` afterwards).
+
+chrony is not on the stock image and provisioning is offline by design, so
+**the first cable boot installs it through the window itself** (apt-verified
+signed packages; the daemon is disabled and masked the moment it lands —
+only the window ever runs it, one-shot). If the install can't happen (a LAN
+with no internet, repo down), the ladder degrades honestly: plain NTP from
+`time.google.com` (via chrony, or `systemd-timesyncd` if chrony never
+arrived) — but an unauthenticated answer only counts if it survives a
+**TLS cross-check**: one HTTPS response from a WebPKI-validated host, whose
+`Date` header must agree with the fresh NTP time within 10 s. Precision
+from NTP, authentication from TLS. A disagreement, or a failed certificate
+validation (the man-in-the-middle signature), **rejects the sync** — trust
+flags stay false and the RTC is never written.
 
 No cable = a ~2-second logged no-op, and the box never touches a network.
 **Radio silence holds either way** — ethernet is copper, and
@@ -113,9 +127,11 @@ box originates DHCP and NTP and accepts only the conntrack-matched replies
 the window sees a black hole (ARP aside — the price of speaking IP).
 IPv6 is disabled wholesale by sysctl, and outside the window the interface
 is administratively down: plugging a cable into a running box does
-nothing. The one residual trust decision is the time itself: NTP is
-unauthenticated, so do this on your own router, not a network an adversary
-controls — a lie accepted here would be written into the RTC as truth.
+nothing. The time answer itself is authenticated too — NTS when chrony is
+available, the TLS Date cross-check otherwise — so even a hostile network
+can only deny the sync, not forge it (the residual exception: the
+no-chrony, no-wget fallback accepts plain NTP with a loud
+`UNAUTHENTICATED` log line).
 This replaced GPS as the primary time source after a field cycle where the
 GPS fix landed but the RTC write silently failed — see `umik.log` capture
 of `hwclock` errors, which both writers now keep.
@@ -534,7 +550,11 @@ Via `systemctl edit umik-record` (`Environment=` lines):
 | `UMIK_NET_IFACE` | `eth0` (wired interface for the one-time NTP window; via `systemctl edit umik-net-time`) |
 | `UMIK_NET_CARRIER_WAIT` | `10` (seconds to wait for an ethernet carrier before the no-cable no-op) |
 | `UMIK_NET_DHCP_WAIT` | `40` (seconds to wait for a DHCP lease) |
-| `UMIK_NET_NTP_WAIT` | `120` (seconds to wait for the NTP sync; raise the unit's `TimeoutStartSec` alongside these) |
+| `UMIK_NET_NTP_WAIT` | `120` (seconds to wait per sync attempt; raise the unit's `TimeoutStartSec` alongside these) |
+| `UMIK_NET_NTS_SERVER` | `time.cloudflare.com` (NTS-capable server for the authenticated sync) |
+| `UMIK_NET_NTP_SERVER` | `time.google.com` (plain-NTP fallback server) |
+| `UMIK_NET_TLS_HOST` | `https://www.google.com/` (WebPKI host for the fallback's Date cross-check) |
+| `UMIK_NET_TLS_TOLERANCE` | `10` (max seconds of NTP-vs-TLS-date disagreement before the sync is rejected) |
 
 ### Activity log
 
@@ -572,9 +592,10 @@ outdoor GPS boot.
 Open items:
 
 - [ ] Bench-verify `umik-net-time` on umik1: re-inject, boot with ethernet
-      attached, watch red LED go solid; check `umik.log` for "RTC
-      disciplined from NTP" (and, if hwclock fails again, the captured
-      error text — timesyncd's own RTC write is the backstop).
+      attached, watch red LED go solid; check `umik.log` for the chrony
+      install landing, "clock SET from time.cloudflare.com via NTS", and
+      "RTC disciplined" (if hwclock fails again, its error text is now
+      captured).
 - [ ] Then verify the RTC carry: power-cycle with no cable; expect
       `time_source: "rtc"`, red solid, and a dated S3 prefix on upload.
 - [ ] umik2: seat its DS3231 module, then same cable boot.

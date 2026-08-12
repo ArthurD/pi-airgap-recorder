@@ -44,6 +44,10 @@ IFACE=${UMIK_NET_IFACE:-eth0}
 CARRIER_WAIT=${UMIK_NET_CARRIER_WAIT:-10}
 DHCP_WAIT=${UMIK_NET_DHCP_WAIT:-40}
 NTP_WAIT=${UMIK_NET_NTP_WAIT:-120}
+NTS_SERVER=${UMIK_NET_NTS_SERVER:-time.cloudflare.com}
+NTP_SERVER=${UMIK_NET_NTP_SERVER:-time.google.com}
+TLS_HOST=${UMIK_NET_TLS_HOST:-https://www.google.com/}
+TLS_TOLERANCE=${UMIK_NET_TLS_TOLERANCE:-10}
 STATE=/run/umik-net.json
 SYNCFILE=/run/systemd/timesync/synchronized
 RESOLV_BACKUP=/run/umik-resolv.conf.orig
@@ -63,6 +67,7 @@ NET_UTC_J=null
 DELTA=null
 IPADDR=""
 RTC_DISCIPLINED=false
+TLS_STATUS=unchecked
 STARTED_NETWORKD=0
 STARTED_TIMESYNCD=0
 DHCP_PID=""
@@ -76,6 +81,7 @@ write_state() {  # $1 = true|false, $2 = human-readable note
     "ip": "${IPADDR:-none}",
     "utc": ${NET_UTC_J},
     "clock_adjustment_seconds": ${DELTA},
+    "tls_check": "${TLS_STATUS}",
     "rtc_disciplined": ${RTC_DISCIPLINED}
 }
 EOF
@@ -223,8 +229,9 @@ fi
 applog "DHCP lease: ${IPADDR} on ${IFACE} (took ${elapsed}s)"
 
 # --- DNS ---------------------------------------------------------------------
-# timesyncd resolves its NTP pool names through /etc/resolv.conf, which
-# nothing maintains on this box (NetworkManager is purged). Point it at the
+# timesyncd resolves its NTP server name (time.google.com, hardcoded in
+# timesyncd.conf.d at provision) through /etc/resolv.conf, which nothing
+# maintains on this box (NetworkManager is purged). Point it at the
 # DHCP-provided DNS (networkd records it in its lease file), else the
 # gateway; the original file is restored at teardown.
 
@@ -239,49 +246,151 @@ if ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
     fi
 fi
 
-# --- NTP ---------------------------------------------------------------------
-# systemd-timesyncd is masked in steady state (this box must not quietly
-# join networks); unmask it only inside the window. It steps the clock AND
-# writes the RTC itself on sync - our explicit hwclock below is the
-# belt-and-braces second attempt, with its error text kept this time.
+# --- fetching time: NTS via chrony first, everything else is a fallback ------
+# The answer we are about to mint into the RTC should be AUTHENTICATED, not
+# just plausible. Real authentication is NTS (RFC 8915), which needs chrony
+# - not on the stock image, and provisioning is offline by design. But this
+# window is the one moment the box HAS a network, so the first cable boot
+# installs chrony right through it (apt-verified signed packages; the
+# seed-floored clock is close enough for TLS and Valid-Until checks), then
+# syncs against time.cloudflare.com with NTS. chrony is only ever run
+# one-shot (`chronyd -q`) inside the window; its daemon is disabled and
+# masked the moment it lands. NOTE: installing chrony removes
+# systemd-timesyncd (they conflict as time-daemon providers) - fine, chrony
+# is strictly the better client and handles the plain-NTP fallback too.
+#
+# The fallback ladder, each rung logged:
+#   1. chrony + NTS against time.cloudflare.com  - authenticated, done.
+#   2. chrony plain NTP against time.google.com  - unauthenticated, so the
+#      result must pass the TLS Date cross-check below.
+#   3. systemd-timesyncd (only if chrony never installed; NTP= is pinned to
+#      time.google.com in timesyncd.conf.d) - same cross-check required.
+#
+# The TLS cross-check is a poor man's NTS: fetch one HTTPS response from a
+# WebPKI-validated host and compare its Date header (1s granularity) to the
+# clock NTP just set. Precision comes from NTP, authentication from TLS. A
+# disagreement beyond tolerance, or a failed certificate validation (the
+# MITM signature), REJECTS the sync: trust flags stay false and the RTC is
+# not written. The check being merely unavailable (no wget, no route) fails
+# open with a loud log - the bench boot will tell us what the image has.
 
-if [ ! -x /usr/lib/systemd/systemd-timesyncd ] && [ ! -x /lib/systemd/systemd-timesyncd ]; then
-    applog "WARNING: systemd-timesyncd not on this image - cannot fetch time"
+reject_sync() {  # $1 = note for the state file
+    applog "NOTE: the system clock was already stepped by the rejected sync - this boot's timestamps are approximately right but stay UNTRUSTED"
     net_down
-    write_state false "network up but no NTP client available"
+    write_state false "$1"
+    exit 0
+}
+
+tls_cross_check() {
+    if ! command -v wget >/dev/null 2>&1; then
+        TLS_STATUS="unavailable(no wget)"
+        applog "WARNING: wget not on this image - accepting the NTP sync UNAUTHENTICATED"
+        return 0
+    fi
+    HDRS=$(wget -S -nv --no-hsts --max-redirect=0 --timeout=15 -O /dev/null "$TLS_HOST" 2>&1)
+    WGET_RC=$?
+    HTTP_DATE=$(printf '%s\n' "$HDRS" | sed -n 's/^ *[Dd]ate: *//p' | head -1)
+    if [ -n "$HTTP_DATE" ]; then
+        TLS_EPOCH=$(date -u -d "$HTTP_DATE" +%s 2>/dev/null)
+        if [ -n "$TLS_EPOCH" ]; then
+            SKEW=$(( $(date -u +%s) - TLS_EPOCH ))
+            [ "$SKEW" -lt 0 ] && SKEW=$((0 - SKEW))
+            if [ "$SKEW" -le "$TLS_TOLERANCE" ]; then
+                TLS_STATUS="ok(skew ${SKEW}s)"
+                applog "NTP answer authenticated: TLS date from ${TLS_HOST} agrees within ${SKEW}s"
+                return 0
+            fi
+            TLS_STATUS="MISMATCH(${SKEW}s)"
+            applog "CRITICAL: NTP time disagrees with the TLS-authenticated date by ${SKEW}s (tolerance ${TLS_TOLERANCE}s) - REJECTING the sync; RTC untouched"
+            reject_sync "NTP rejected: disagrees with TLS-authenticated date by ${SKEW}s"
+        fi
+    fi
+    if [ "$WGET_RC" -eq 5 ]; then
+        TLS_STATUS="TLS-FAILURE"
+        applog "CRITICAL: TLS certificate verification FAILED for ${TLS_HOST} - possible interception; REJECTING the sync; RTC untouched"
+        reject_sync "NTP rejected: TLS certificate verification failed (possible MITM)"
+    fi
+    TLS_STATUS="unavailable(wget exit ${WGET_RC})"
+    applog "WARNING: TLS cross-check unavailable (wget exit ${WGET_RC}) - accepting the NTP sync UNAUTHENTICATED"
+    return 0
+}
+
+if ! command -v chronyd >/dev/null 2>&1; then
+    applog "chrony not on the image - installing it through the window (one-time; apt-verified from the distro repo)"
+    export DEBIAN_FRONTEND=noninteractive
+    if apt-get -o Acquire::Retries=1 update >/dev/null 2>&1 \
+       && apt-get -y --no-install-recommends install chrony >/dev/null 2>&1; then
+        # Debian auto-starts the daemon on install; this box only ever runs
+        # chrony one-shot inside the window.
+        systemctl disable --now chrony 2>/dev/null
+        systemctl mask chrony 2>/dev/null
+        applog "chrony installed; daemon disabled and masked (only this window runs it, one-shot)"
+    else
+        applog "WARNING: chrony install failed (LAN without internet? repo unreachable?) - falling back to unauthenticated NTP + TLS cross-check"
+    fi
+fi
+
+SYNCED_VIA=""
+BEFORE=$(date -u +%s)
+UP0=$(cut -d. -f1 /proc/uptime)
+
+if command -v chronyd >/dev/null 2>&1; then
+    OUT=$(chronyd -q -t "$NTP_WAIT" "server ${NTS_SERVER} iburst nts" 2>&1)
+    if [ $? -eq 0 ]; then
+        SYNCED_VIA=nts
+        TLS_STATUS=nts
+        applog "clock SET from ${NTS_SERVER} via NTS - cryptographically authenticated time"
+    else
+        applog "WARNING: NTS sync with ${NTS_SERVER} failed ($(printf '%s\n' "$OUT" | tail -1)) - trying plain NTP + TLS cross-check"
+        OUT=$(chronyd -q -t "$NTP_WAIT" "server ${NTP_SERVER} iburst" 2>&1)
+        if [ $? -eq 0 ]; then
+            SYNCED_VIA=ntp-unauthenticated
+            applog "clock SET from ${NTP_SERVER} (plain NTP via chrony)"
+        else
+            applog "WARNING: plain NTP with ${NTP_SERVER} also failed ($(printf '%s\n' "$OUT" | tail -1))"
+        fi
+    fi
+fi
+
+if [ -z "$SYNCED_VIA" ] && { [ -x /usr/lib/systemd/systemd-timesyncd ] || [ -x /lib/systemd/systemd-timesyncd ]; }; then
+    # systemd-timesyncd is masked in steady state (this box must not
+    # quietly join networks); unmask it only inside the window.
+    systemctl unmask systemd-timesyncd 2>/dev/null
+    if systemctl start systemd-timesyncd 2>/dev/null; then
+        STARTED_TIMESYNCD=1
+        elapsed=0
+        while [ "$elapsed" -lt "$NTP_WAIT" ]; do
+            [ -e "$SYNCFILE" ] && break
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        if [ -e "$SYNCFILE" ]; then
+            SYNCED_VIA=ntp-unauthenticated
+            applog "clock SET from ${NTP_SERVER} (systemd-timesyncd, took ${elapsed}s)"
+        fi
+    else
+        applog "WARNING: systemd-timesyncd failed to start"
+    fi
+fi
+
+if [ -z "$SYNCED_VIA" ]; then
+    applog "no time sync achieved (no reachable server, or no NTP client) - clock stays untrusted; closing the window"
+    net_down
+    write_state false "network up but no time sync achieved within the window"
     exit 0
 fi
 
-T0=$(date -u +%s)
-systemctl unmask systemd-timesyncd 2>/dev/null
-if systemctl start systemd-timesyncd 2>/dev/null; then
-    STARTED_TIMESYNCD=1
-else
-    applog "WARNING: systemd-timesyncd failed to start"
-    net_down
-    write_state false "network up but systemd-timesyncd failed to start"
-    exit 0
-fi
+# An unauthenticated answer must survive the TLS cross-check before it is
+# allowed anywhere near the RTC; a rejection exits inside the function.
+[ "$SYNCED_VIA" = nts ] || tls_cross_check
 
-elapsed=0
-while [ "$elapsed" -lt "$NTP_WAIT" ]; do
-    [ -e "$SYNCFILE" ] && break
-    sleep 1
-    elapsed=$((elapsed + 1))
-done
-
-if [ ! -e "$SYNCFILE" ]; then
-    applog "no NTP sync within ${NTP_WAIT}s (server unreachable? DNS?) - clock stays untrusted; closing the window"
-    net_down
-    write_state false "network up but no NTP sync within ${NTP_WAIT}s"
-    exit 0
-fi
-
-# Synced. The seed had already floored the clock near reality, so the step
-# is usually seconds - but however big it was, timestamps from here on are
-# real UTC.
-NOW=$(date -u +%s)
-DELTA=$((NOW - T0 - elapsed))
+# Synced and vetted. The seed had already floored the clock near reality,
+# so the step is usually seconds - but however big it was, timestamps from
+# here on are real UTC. Clock delta measured against the monotonic uptime
+# counter, which no clock step can touch.
+AFTER=$(date -u +%s)
+UP1=$(cut -d. -f1 /proc/uptime)
+DELTA=$(( (AFTER - BEFORE) - (UP1 - UP0) ))
 UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 NET_UTC_J="\"${UTC}\""
 
@@ -293,16 +402,20 @@ command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
 if [ -e /sys/class/rtc/rtc0 ]; then
     if ERR=$(hwclock --systohc --utc --noadjfile 2>&1); then
         RTC_DISCIPLINED=true
-        applog "RTC disciplined from NTP - future boots carry trusted time with no cable attached"
+        applog "RTC disciplined from ${SYNCED_VIA} time - future boots carry trusted time with no cable attached"
     else
-        applog "WARNING: RTC present but hwclock --systohc failed (${ERR:-no error output}) - RTC not disciplined by us (timesyncd may still have written it)"
+        applog "WARNING: RTC present but hwclock --systohc failed (${ERR:-no error output}) - RTC not disciplined"
     fi
 else
-    applog "NOTE: no RTC fitted - NTP time is good for THIS boot only"
+    applog "NOTE: no RTC fitted - network time is good for THIS boot only"
 fi
 
-applog "clock SET from NTP over ${IFACE}: ${UTC} (moved ~${DELTA}s, sync took ${elapsed}s)"
+applog "clock SET over ${IFACE}: ${UTC} via ${SYNCED_VIA} (moved ~${DELTA}s)"
 
 net_down
-write_state true "clock set from NTP over wired ethernet"
+if [ "$SYNCED_VIA" = nts ]; then
+    write_state true "clock set via NTS-authenticated NTP (${NTS_SERVER})"
+else
+    write_state true "clock set via plain NTP, TLS cross-check: ${TLS_STATUS}"
+fi
 exit 0

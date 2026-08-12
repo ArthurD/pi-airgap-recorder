@@ -1,8 +1,9 @@
 # umik-net-time: DHCP on the wired port, used only inside the one-time
 # network window that service opens (systemd-networkd is disabled in steady
-# state and started/stopped around the window). UseNTP hands any
-# DHCP-advertised NTP server straight to systemd-timesyncd, which then
-# works even on a LAN whose DNS or WAN is down.
+# state and started/stopped around the window). UseNTP=no: time servers
+# are hardcoded (NTS: time.cloudflare.com via chrony; fallback:
+# time.google.com) - a DHCP server does not get to nominate this box's
+# time source.
 [Match]
 Name=eth0
 
@@ -17,4 +18,4 @@ LLMNR=no
 MulticastDNS=no
 
 [DHCPv4]
-UseNTP=yes
+UseNTP=no

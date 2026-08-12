@@ -126,6 +126,10 @@ install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-net-time.service"    /etc/sy
 # itself stays disabled - umik-net-time starts and stops it around the window.
 install -D -m 0644 "${PAYLOAD}/etc/systemd/network/90-umik-eth.network" \
     /etc/systemd/network/90-umik-eth.network
+# The window's NTP server, hardcoded (time.google.com); timesyncd stays
+# masked outside the window.
+install -D -m 0644 "${PAYLOAD}/etc/systemd/timesyncd.conf.d/50-umik-ntp.conf" \
+    /etc/systemd/timesyncd.conf.d/50-umik-ntp.conf
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-time-seed.service"   /etc/systemd/system/
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-status.service"      /etc/systemd/system/
 install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-diag.service"        /etc/systemd/system/
