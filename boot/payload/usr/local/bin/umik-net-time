@@ -83,10 +83,49 @@ EOF
     mv -f "${STATE}.tmp" "$STATE" 2>/dev/null || true
 }
 
+# --- inbound lockdown --------------------------------------------------------
+# "Outbound only" made literal: a drop-all input policy for the window, so
+# the box originates DHCP and NTP but answers NOTHING - no ping replies, no
+# TCP resets, no ICMP port-unreachables; a scan sees a black hole. (There
+# is nothing to reach anyway - sshd is purged from disk, no TCP service
+# listens - this removes even the kernel's polite refusals.) Replies to our
+# own queries return via conntrack; the initial DHCP exchange rides an
+# AF_PACKET socket, which netfilter's input hook does not gate, and lease
+# renewals are established UDP. ARP remains - the price of speaking IP at
+# all. nft missing is logged, not fatal: the sysctls (no IPv6, no ping
+# replies) and the empty listener set still hold.
+
+fw_up() {
+    command -v nft >/dev/null 2>&1 || {
+        applog "NOTE: nft not on this image - window relies on sysctls + empty listener set"
+        return 0
+    }
+    nft -f - <<'EOF' 2>/dev/null && applog "inbound firewall up: drop-all (outbound replies only)"
+table inet umik_net_window {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        udp sport 67 udp dport 68 accept
+    }
+}
+EOF
+}
+
+fw_down() {
+    command -v nft >/dev/null 2>&1 || return 0
+    nft delete table inet umik_net_window 2>/dev/null
+}
+
 # Tear the network window back down to the box's steady state: no DHCP
-# client, no networkd, timesyncd stopped and re-masked, link down, original
-# resolv.conf back. Called on every exit path that got past carrier-up.
+# client, no networkd, timesyncd stopped and re-masked, link down, firewall
+# table removed, original resolv.conf back. Called on every exit path that
+# got past carrier-up, and on TERM/INT so even a killed script (systemd
+# timeout) cannot leave the window open.
+TORN_DOWN=0
 net_down() {
+    [ "$TORN_DOWN" -eq 1 ] && return 0
+    TORN_DOWN=1
     [ "$STARTED_TIMESYNCD" -eq 1 ] && {
         systemctl stop systemd-timesyncd 2>/dev/null
         systemctl mask systemd-timesyncd 2>/dev/null
@@ -95,12 +134,15 @@ net_down() {
     [ "$STARTED_NETWORKD" -eq 1 ] && systemctl stop systemd-networkd systemd-networkd.socket 2>/dev/null
     ip -4 addr flush dev "$IFACE" 2>/dev/null
     ip link set "$IFACE" down 2>/dev/null
+    fw_down
     if [ -f "$RESOLV_BACKUP" ]; then
         cat "$RESOLV_BACKUP" > /etc/resolv.conf 2>/dev/null
         rm -f "$RESOLV_BACKUP"
     fi
-    applog "network window closed - link down, DHCP/NTP services stopped"
+    applog "network window closed - link down, firewall removed, DHCP/NTP services stopped"
 }
+
+trap 'net_down; exit 0' TERM INT
 
 # --- is there even a wired interface with a cable in it? --------------------
 
@@ -109,6 +151,10 @@ if [ ! -d "/sys/class/net/${IFACE}" ]; then
     write_state false "no ${IFACE} interface"
     exit 0
 fi
+
+# Lockdown BEFORE the link ever comes up: from the first electrical instant
+# this box is reachable, inbound is already a black hole.
+fw_up
 
 ip link set "$IFACE" up 2>/dev/null
 
@@ -123,6 +169,7 @@ done
 if [ "$CARRIER" -eq 0 ]; then
     # The everyday case: no cable attached. Quiet no-op, link back down.
     ip link set "$IFACE" down 2>/dev/null
+    fw_down
     log "no ethernet carrier after ${CARRIER_WAIT}s - no cable; clock left as-is"
     write_state false "no ethernet cable attached"
     exit 0

@@ -102,6 +102,20 @@ No cable = a ~2-second logged no-op, and the box never touches a network.
 `umik-radio-check` still proves no wireless hardware is live. What you
 trade during that one boot is the air-gap, for the seconds the window is
 open, on your own LAN, only while you have physically plugged the cable in.
+
+**The window is outbound-only, enforced.** Nothing on the image can accept
+a login over a network — `openssh-server` is purged from disk at
+provisioning (and masked on top), telnetd has never shipped with Pi OS
+Lite, and no TCP service listens. On top of that, `umik-net-time` installs
+a drop-all inbound nftables policy *before* the link ever comes up: the
+box originates DHCP and NTP and accepts only the conntrack-matched replies
+— no ping answers, no TCP resets, no ICMP unreachables. A port scan during
+the window sees a black hole (ARP aside — the price of speaking IP).
+IPv6 is disabled wholesale by sysctl, and outside the window the interface
+is administratively down: plugging a cable into a running box does
+nothing. The one residual trust decision is the time itself: NTP is
+unauthenticated, so do this on your own router, not a network an adversary
+controls — a lie accepted here would be written into the RTC as truth.
 This replaced GPS as the primary time source after a field cycle where the
 GPS fix landed but the RTC write silently failed — see `umik.log` capture
 of `hwclock` errors, which both writers now keep.

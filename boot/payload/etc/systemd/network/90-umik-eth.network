@@ -8,6 +8,13 @@ Name=eth0
 
 [Network]
 DHCP=ipv4
+# Outbound-only posture: no link-local addressing (no 169.254 fallback to
+# linger if DHCP fails), no IPv6 router solicitation (IPv6 is disabled by
+# sysctl anyway), and no name-service responders.
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+LLMNR=no
+MulticastDNS=no
 
 [DHCPv4]
 UseNTP=yes
