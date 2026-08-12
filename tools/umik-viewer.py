@@ -432,6 +432,7 @@ kbd{background:var(--chip);border-radius:4px;padding:0 5px;font-size:11px}
 <header><h1>umik viewer</h1>
  <span class="dim" id="rootlbl"></span>
  <span class="dim" style="margin-left:auto">wheel: zoom &nbsp;&middot;&nbsp;
+  side-scroll: pan &nbsp;&middot;&nbsp;
   drag strip below: pan/resize &nbsp;&middot;&nbsp; dbl-click strip: reset
   &nbsp;&middot;&nbsp;<kbd>&larr;</kbd><kbd>&rarr;</kbd> segments
   &nbsp;<kbd>space</kbd> play/pause</span></header>
@@ -612,6 +613,14 @@ function fetchMain(){
 $('specwrap').addEventListener('wheel',e=>{
   if(!curSeg())return;
   e.preventDefault();
+  if(Math.abs(e.deltaX)>Math.abs(e.deltaY)){  // side-scroll: pan the window
+    const w=view.b-view.a;
+    if(w>=dur) return;
+    const dt=e.deltaX*0.0015*w;               // one notch ~ 15% of the window
+    view.a+=dt; view.b+=dt;
+    applyView(false);
+    return;
+  }
   const r=$('specwrap').getBoundingClientRect();
   const frac=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));
   const tc=view.a+frac*(view.b-view.a);
