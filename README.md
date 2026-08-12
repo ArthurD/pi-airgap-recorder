@@ -600,10 +600,12 @@ Open items:
       through the window, "clock SET from time.cloudflare.com via NTS",
       red solid — and the captured hwclock error exposed the missing
       `util-linux-extra`.
-- [ ] Second cable boot after the util-linux-extra fix: expect
-      "RTC disciplined" in `umik.log` and `rtc0/since_epoch` in 2026.
-- [ ] Then verify the RTC carry: power-cycle with no cable; expect
-      `time_source: "rtc"`, red solid, and a dated S3 prefix on upload.
+- [x] Second cable boot after the util-linux-extra fix (2026-08-12):
+      "RTC disciplined from nts time", `rtc0/since_epoch` ticking true in
+      2026.
+- [x] RTC carry verified (2026-08-12): next boot, no network sync — "clock
+      SET from battery-backed RTC ... TRUSTED" at 6 s uptime, red solid,
+      `moved 0s`. Unit 1's clock chain is done: nothing stays plugged in.
 - [ ] umik2: seat its DS3231 module, then same cable boot.
 - [ ] DS3231 field test (support is built, modules on hand): re-inject,
       mount a module, one outdoor GPS boot, then confirm a GPS-less boot
