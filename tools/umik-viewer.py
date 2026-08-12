@@ -191,15 +191,25 @@ def build_index(root):
     collections = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        if os.path.basename(os.path.dirname(dirpath)) != "recordings":
+        # Two layouts hold sessions: a medium's flat recordings/<session>,
+        # and the archive's recordings/<unit>/<session> (unit layer added
+        # with multi-unit support). The collection label is the medium's
+        # containing directory for the former, the unit for the latter.
+        parent_dir = os.path.dirname(dirpath)
+        parent = os.path.basename(parent_dir)
+        gparent = os.path.basename(os.path.dirname(parent_dir))
+        if parent != "recordings" and gparent != "recordings":
             continue
         segs = sorted(f for f in filenames
                       if SEG_RE.match(f) and not f.endswith(".repaired.wav"))
         if not segs:
             continue
         sdir = dirpath
-        coll = os.path.relpath(os.path.dirname(os.path.dirname(sdir)), root)
-        coll = os.path.basename(os.path.abspath(root)) if coll == "." else coll
+        if gparent == "recordings":
+            coll = parent
+        else:
+            coll = os.path.relpath(os.path.dirname(parent_dir), root)
+            coll = os.path.basename(os.path.abspath(root)) if coll == "." else coll
         meta = {}
         try:
             with open(os.path.join(sdir, "session.json")) as f:
