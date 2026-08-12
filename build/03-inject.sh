@@ -142,9 +142,10 @@ dtparam=audio=off
 enable_uart=1
 
 # Battery-backed DS3231 real-time clock on the GPIO header (pins 1-9).
-# umik-gps-time writes it on a GPS position fix; umik-rtc-time restores
-# trusted time from it at every boot after that, so the GPS module can be
-# unplugged once it has ever locked. Harmless when no module is fitted.
+# umik-net-time writes it on a one-time wired-NTP sync (recommended) and
+# umik-gps-time on a GPS position fix; umik-rtc-time restores trusted time
+# from it at every boot after that, so the cable/module can be unplugged
+# once it has ever synced. Harmless when no module is fitted.
 # i2c_arm is the GPIO-header I2C bus - wired-only, no radio implications.
 dtparam=i2c_arm=on
 dtoverlay=i2c-rtc,ds3231

@@ -24,18 +24,21 @@ F="$D/diag-latest.log"
     echo; echo "--- failed units ---"
     systemctl --failed --no-pager -l 2>&1
 
-    for u in umik-radio-check umik-usb-detect umik-rtc-time umik-time-seed umik-gps-time umik-status umik-record; do
+    for u in umik-radio-check umik-usb-detect umik-rtc-time umik-time-seed umik-net-time umik-gps-time umik-status umik-record; do
         echo; echo "--- status: $u ---"
         systemctl status "$u" --no-pager -l 2>&1
     done
 
     echo; echo "--- journal: umik units (this boot) ---"
     journalctl -u umik-record -u umik-radio-check -u umik-usb-detect \
-               -u umik-rtc-time -u umik-gps-time -u umik-status \
+               -u umik-rtc-time -u umik-net-time -u umik-gps-time -u umik-status \
                --no-pager -o short-monotonic 2>&1 | tail -150
 
     echo; echo "--- gps time sync (/run/umik-gps.json) ---"
     cat /run/umik-gps.json 2>/dev/null || echo "(no state file - service did not run)"
+
+    echo; echo "--- wired ntp sync (/run/umik-net.json) ---"
+    cat /run/umik-net.json 2>/dev/null || echo "(no state file - service did not run)"
 
     echo; echo "--- time seed (/run/umik-time-seed.json) ---"
     cat /run/umik-time-seed.json 2>/dev/null || echo "(no state file - service did not run)"

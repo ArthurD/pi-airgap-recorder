@@ -1,0 +1,38 @@
+[Unit]
+Description=One-time trusted clock sync (NTP) over a wired ethernet cable
+# Runs to completion before the recorder so a cable-attached boot names the
+# very first session directory with NTP-correct time. Pulled in via Wants=
+# from umik-record: no cable is a ~2s logged no-op that must never block
+# recording - the script exits 0 on every path.
+# Ordering within the clock hierarchy: after the RTC restore and the seed
+# floor (both weaker; NTP overrides them), before the GPS sync only so the
+# two can never interleave their writes - in practice a box has a cable OR
+# a GPS module attached, not both.
+Before=umik-gps-time.service umik-record.service
+After=local-fs.target data.mount umik-rtc-time.service umik-time-seed.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/umik-net-time
+# Budget: carrier wait (10s) + DHCP (40s) + NTP (120s) + teardown + slack.
+# Raise alongside the UMIK_NET_* variables if you raise those.
+TimeoutStartSec=240
+
+# --- sandboxing (deliberately light) -----------------------------------------
+# This unit is the one place the box is allowed to touch a network, and it
+# orchestrates other services to do it: it starts/stops systemd-networkd
+# and systemd-timesyncd over D-Bus, runs a DHCP client (AF_PACKET raw
+# sockets), rewrites /etc/resolv.conf for the window, steps the clock and
+# writes the RTC device. A tight allowlist here would be long, brittle -
+# and dangerous: the GPS unit's heavy sandbox is the prime suspect for the
+# silent `hwclock --systohc` failure that stranded the RTC at 2000-01-01
+# in the field (its error text was discarded; both writers now keep it).
+# The trust boundary is physical: this code path is reachable only while a
+# human has a cable plugged into the box.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

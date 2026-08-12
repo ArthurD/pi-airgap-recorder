@@ -10,10 +10,11 @@
 #   * When a DS3231 RTC is fitted, a position fix also writes the RTC
 #     (hwclock --systohc). From then on umik-rtc-time hands every GPS-less
 #     boot trusted time, and the GPS module can be unplugged for good.
-#     This is the ONLY code path anywhere that writes the RTC, and only a
-#     real fix qualifies - the RTC outlives this boot as a trust anchor,
-#     so the weaker time-only sync below may set THIS boot's clock but
-#     must never mint long-lived trust.
+#     Only two code paths anywhere write the RTC - this one (position fix
+#     only) and umik-net-time (NTP over a one-time wired connection, now
+#     the recommended way in) - because the RTC outlives this boot as a
+#     trust anchor. The weaker time-only sync below may set THIS boot's
+#     clock but must never mint long-lived trust.
 #   * No gpsd. The image must provision without ever touching a network, so
 #     everything here is stock tools: stty + cat + awk.
 #   * The GT-U7 enumerates either as u-blox native USB (cdc_acm ->
@@ -342,10 +343,13 @@ command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
 # /etc/adjtime never exists on this box (and / is read-only to this unit).
 if [ -e /sys/class/rtc/rtc0 ]; then
     if [ "$GPS_FIX" = true ]; then
-        if hwclock --systohc --utc --noadjfile 2>/dev/null; then
+        # Keep hwclock's error text: this exact call once failed silently in
+        # the field (2>/dev/null), stranding the RTC at 2000-01-01 with no
+        # clue why - the log must carry the reason, not just the verdict.
+        if ERR=$(hwclock --systohc --utc --noadjfile 2>&1); then
             applog "RTC disciplined from GPS fix - future boots carry trusted time with no GPS attached"
         else
-            applog "WARNING: RTC present but hwclock --systohc failed - RTC not disciplined"
+            applog "WARNING: RTC present but hwclock --systohc failed (${ERR:-no error output}) - RTC not disciplined"
         fi
     else
         applog "RTC left alone: a time-only sync is not strong enough evidence to discipline it"

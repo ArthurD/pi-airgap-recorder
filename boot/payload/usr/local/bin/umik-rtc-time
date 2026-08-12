@@ -2,12 +2,14 @@
 # umik-rtc-time - set the system clock from a battery-backed DS3231 RTC.
 #
 # Design notes:
-#   * THE TRUST MODEL. Exactly one thing ever writes this RTC: umik-gps-time,
-#     and only from a GPS position fix. So a valid RTC read means "GPS set
-#     this chip once, and its battery has kept it ticking ever since" -
-#     real time within crystal drift (~1 minute/year on a DS3231), which
-#     this project accepts as trusted. This is what lets the GPS module be
-#     unplugged for good after one clean outdoor fix.
+#   * THE TRUST MODEL. Exactly two things ever write this RTC: umik-net-time
+#     (from an NTP sync over a one-time wired ethernet connection - the
+#     recommended way) and umik-gps-time (only from a GPS position fix).
+#     So a valid RTC read means "an authoritative time source set this
+#     chip once, and its battery has kept it ticking ever since" - real
+#     time within crystal drift (~1 minute/year on a DS3231), which this
+#     project accepts as trusted. This is what lets the cable or GPS
+#     module be unplugged for good after one clean sync.
 #   * The "kept ticking ever since" half is enforced by the hardware: the
 #     DS3231 latches an oscillator-stop flag whenever timekeeping halts
 #     (flat or removed battery), and the kernel driver refuses to report a
@@ -87,8 +89,8 @@ done
 
 EPOCH=$(cat "${RTC_SYS}/since_epoch" 2>/dev/null | tr -cd '0-9')
 case "$EPOCH" in ''|*[!0-9]*)
-    applog "RTC present but reports no valid time (never GPS-set, or its battery went flat) - clock stays untrusted until the next GPS fix"
-    write_state true false "RTC oscillator stopped since last set - needs a GPS fix"
+    applog "RTC present but reports no valid time (never set, or its battery went flat) - clock stays untrusted until the next NTP/GPS sync"
+    write_state true false "RTC oscillator stopped since last set - needs an NTP/GPS sync"
     exit 0
 ;; esac
 
@@ -114,6 +116,6 @@ STEP=$((EPOCH - NOW))
 # Keep the fallback floor fresh for a future boot where the RTC has died.
 command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
 
-applog "clock SET from battery-backed RTC: ${RTC_UTC} (moved ${STEP}s) - TRUSTED, GPS-disciplined within drift"
-write_state true true "clock set from GPS-disciplined RTC"
+applog "clock SET from battery-backed RTC: ${RTC_UTC} (moved ${STEP}s) - TRUSTED, NTP/GPS-disciplined within drift"
+write_state true true "clock set from disciplined RTC"
 exit 0

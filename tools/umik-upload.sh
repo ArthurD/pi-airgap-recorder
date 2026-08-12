@@ -65,16 +65,17 @@ for sdir in "$ARCHIVE"/recordings/*/*/; do
     sessions=$((sessions + 1))
 
     # The date prefix is earned, not assumed: only a session that recorded
-    # clock_trusted=true (GPS set the clock that boot) files under its start
-    # date. Everything else - seeded floors, dead clocks, pre-GPS sessions -
-    # goes under raw/undated/ where nothing pretends to know when it was.
-    # time_source must name a trusted source too (gps, gps-time-only, or a
-    # GPS-disciplined rtc): old-payload sessions could claim
-    # clock_trusted=true off the fake baseline clock with no time source.
+    # clock_trusted=true (GPS/NTP set the clock that boot) files under its
+    # start date. Everything else - seeded floors, dead clocks, pre-GPS
+    # sessions - goes under raw/undated/ where nothing pretends to know
+    # when it was. time_source must name a trusted source too (gps,
+    # gps-time-only, ntp, or a disciplined rtc): old-payload sessions could
+    # claim clock_trusted=true off the fake baseline clock with no time
+    # source.
     datepart=undated
     sj="$sdir/session.json"
     if [ -f "$sj" ] && [ "$(json_str "$sj" clock_trusted)" = "true" ] \
-        && case "$(json_str "$sj" time_source)" in gps*|rtc) true ;; *) false ;; esac; then
+        && case "$(json_str "$sj" time_source)" in gps*|ntp|rtc) true ;; *) false ;; esac; then
         d=$(json_str "$sj" started_utc \
             | sed -En 's/^([0-9]{4})([0-9]{2})([0-9]{2})T.*/\1-\2-\3/p')
         [ -n "$d" ] && datepart=$d

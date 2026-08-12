@@ -15,9 +15,13 @@ After=umik-usb-detect.service
 Wants=umik-gps-time.service
 After=umik-gps-time.service
 # Likewise the battery-backed RTC restore (trusted time carried from an
-# earlier GPS fix); a box without the module is a quick no-op.
+# earlier GPS fix or NTP sync); a box without the module is a quick no-op.
 Wants=umik-rtc-time.service
 After=umik-rtc-time.service
+# And the one-time wired-NTP sync (the recommended way to discipline the
+# RTC): a boot with no ethernet cable attached is a ~2s no-op.
+Wants=umik-net-time.service
+After=umik-net-time.service
 # Order after the exFAT data mount when it exists (nofail mounts are not
 # waited on by local-fs.target, so name it explicitly).
 After=data.mount

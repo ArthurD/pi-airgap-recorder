@@ -237,11 +237,23 @@ case "$GPS_JSON" in
         ;;
 esac
 
-# Next in the hierarchy: the battery-backed DS3231 that umik-gps-time
-# disciplined from a position fix on some earlier boot. umik-rtc-time
-# applied it before we started; a valid reading is GPS time within crystal
-# drift (~1 min/year), so it keeps clock_trusted - this is what lets the
-# GPS module be unplugged once it has ever locked.
+# Same trust grade, different wire: umik-net-time fetched NTP over a
+# one-time ethernet cable this boot (and disciplined the RTC while it was
+# at it). Real UTC from an authoritative source, so clock_trusted.
+NET_JSON=$(cat /run/umik-net.json 2>/dev/null || true)
+if [ "$TRUSTED" = false ]; then
+    case "$NET_JSON" in *'"synced": true'*)
+        TRUSTED=true
+        TIME_SOURCE=ntp
+        ;;
+    esac
+fi
+
+# Next in the hierarchy: the battery-backed DS3231 that umik-gps-time or
+# umik-net-time disciplined on some earlier boot. umik-rtc-time applied it
+# before we started; a valid reading is GPS/NTP time within crystal drift
+# (~1 min/year), so it keeps clock_trusted - this is what lets the GPS
+# module or ethernet cable be unplugged once it has ever synced.
 RTC_JSON=$(cat /run/umik-rtc.json 2>/dev/null || true)
 if [ "$TRUSTED" = false ]; then
     case "$RTC_JSON" in *'"trusted": true'*)
@@ -280,6 +292,7 @@ cat > "${SESSION_DIR}/session.json" <<EOF
   "clock_trusted": ${TRUSTED},
   "time_source": "${TIME_SOURCE}",
   "gps": ${GPS_JSON:-null},
+  "net": ${NET_JSON:-null},
   "rtc": ${RTC_JSON:-null},
   "time_seed": ${SEED_JSON:-null},
   "storage": "${STORAGE}",
@@ -300,7 +313,7 @@ EOF
 sync
 
 [ "$TRUSTED" = true ] || \
-    log "WARNING: clock not GPS-anchored (no sync this boot, no disciplined RTC);"
+    log "WARNING: clock not anchored (no GPS/NTP sync this boot, no disciplined RTC);"
 [ "$TRUSTED" = true ] || \
     log "         rely on the session counter (${SESSION}) for ordering"
 

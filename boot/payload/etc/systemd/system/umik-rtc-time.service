@@ -18,8 +18,8 @@ ExecStart=/usr/local/bin/umik-rtc-time
 # Same confinement as umik-time-seed: CAP_SYS_TIME to step the clock,
 # CAP_DAC_OVERRIDE to write umik.log under the 0700 recorder-owned /data
 # directories. The RTC is READ via /sys/class/rtc (sysfs attributes, not a
-# device node), so DevicePolicy stays fully closed; writing the RTC is
-# umik-gps-time's job alone.
+# device node), so DevicePolicy stays fully closed; writing the RTC is for
+# umik-net-time and umik-gps-time alone.
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_SYS_TIME CAP_DAC_OVERRIDE
 ProtectSystem=strict

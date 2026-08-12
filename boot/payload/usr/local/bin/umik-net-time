@@ -1,0 +1,261 @@
+#!/bin/sh
+# umik-net-time - one-time trusted clock sync over a WIRED ethernet cable.
+#
+# Design notes:
+#   * WHY THIS EXISTS. The original "find initial time" story was GPS: boot
+#     once outdoors, get a fix, discipline the DS3231 RTC, unplug the module
+#     forever. The first field attempt got the fix but the RTC write failed
+#     silently (see umik-gps-time), and outdoor boots are logistics. A wired
+#     ethernet cable is the pivot: plug the box into a router for ONE boot,
+#     this service fetches NTP time, disciplines the RTC, then tears the
+#     network back down. Every later boot gets trusted time from the RTC
+#     with nothing attached.
+#   * RADIO SILENCE HOLDS. Ethernet is copper - nothing here powers a radio,
+#     and umik-radio-check still asserts no wireless hardware exists. What
+#     changes is the air-gap: for the seconds between carrier-up and
+#     teardown this box is on a network. That window exists only when a
+#     human has physically plugged a cable in; with no cable this service
+#     is a ~2s no-op and the box never touches a network, same as before.
+#   * NO CABLE = NO-OP. Like the GPS module, a network is an optional,
+#     never-blocking time source: no interface, no carrier, no DHCP, no
+#     NTP - each is a logged no-op and recording starts exactly as before.
+#     Every path exits 0 and tears the link back down.
+#   * STOCK TOOLS ONLY, like everything else on this box: ip(8) for the
+#     link, systemd-networkd for DHCP (part of the image; disabled in
+#     steady state, started only inside this window), systemd-timesyncd
+#     for NTP (present but masked at provision; unmasked for the window
+#     and re-masked after). Fallback DHCP clients are tried if networkd
+#     is ever missing. Anything absent is logged loudly, not fatal.
+#   * THE RTC WRITE IS THE WHOLE POINT. An NTP sync is the same trust
+#     grade this project gives a GPS fix (real UTC from an authoritative
+#     source), so it disciplines the RTC the same way. Two writers exist
+#     now: umik-gps-time (position fix) and this script (NTP sync); both
+#     capture hwclock's error text instead of discarding it - a silent
+#     RTC failure already cost one field cycle. systemd-timesyncd also
+#     writes the RTC itself on every successful sync, so the chip gets
+#     two chances per window.
+#   * Everything umik-record needs lands in /run/umik-net.json. /run is
+#     tmpfs, so a stale file from a previous boot cannot claim the clock
+#     is synced.
+
+set -u
+
+IFACE=${UMIK_NET_IFACE:-eth0}
+CARRIER_WAIT=${UMIK_NET_CARRIER_WAIT:-10}
+DHCP_WAIT=${UMIK_NET_DHCP_WAIT:-40}
+NTP_WAIT=${UMIK_NET_NTP_WAIT:-120}
+STATE=/run/umik-net.json
+SYNCFILE=/run/systemd/timesync/synchronized
+RESOLV_BACKUP=/run/umik-resolv.conf.orig
+
+log() { echo "umik-net-time: $*" >&2; }
+
+applog() {
+    log "$*"
+    mkdir -p /data/logs 2>/dev/null || return 0
+    printf '%s up=%3ss umik-net-time: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo '?')" "$*" \
+        >> /data/logs/umik.log 2>/dev/null || true
+}
+
+NET_UTC_J=null
+DELTA=null
+IPADDR=""
+RTC_DISCIPLINED=false
+STARTED_NETWORKD=0
+STARTED_TIMESYNCD=0
+DHCP_PID=""
+
+write_state() {  # $1 = true|false, $2 = human-readable note
+    cat > "${STATE}.tmp" <<EOF
+{
+    "synced": $1,
+    "note": "$2",
+    "interface": "${IFACE}",
+    "ip": "${IPADDR:-none}",
+    "utc": ${NET_UTC_J},
+    "clock_adjustment_seconds": ${DELTA},
+    "rtc_disciplined": ${RTC_DISCIPLINED}
+}
+EOF
+    chmod 0644 "${STATE}.tmp" 2>/dev/null
+    mv -f "${STATE}.tmp" "$STATE" 2>/dev/null || true
+}
+
+# Tear the network window back down to the box's steady state: no DHCP
+# client, no networkd, timesyncd stopped and re-masked, link down, original
+# resolv.conf back. Called on every exit path that got past carrier-up.
+net_down() {
+    [ "$STARTED_TIMESYNCD" -eq 1 ] && {
+        systemctl stop systemd-timesyncd 2>/dev/null
+        systemctl mask systemd-timesyncd 2>/dev/null
+    }
+    [ -n "$DHCP_PID" ] && kill "$DHCP_PID" 2>/dev/null
+    [ "$STARTED_NETWORKD" -eq 1 ] && systemctl stop systemd-networkd systemd-networkd.socket 2>/dev/null
+    ip -4 addr flush dev "$IFACE" 2>/dev/null
+    ip link set "$IFACE" down 2>/dev/null
+    if [ -f "$RESOLV_BACKUP" ]; then
+        cat "$RESOLV_BACKUP" > /etc/resolv.conf 2>/dev/null
+        rm -f "$RESOLV_BACKUP"
+    fi
+    applog "network window closed - link down, DHCP/NTP services stopped"
+}
+
+# --- is there even a wired interface with a cable in it? --------------------
+
+if [ ! -d "/sys/class/net/${IFACE}" ]; then
+    log "no ${IFACE} on this box - skipping network time"
+    write_state false "no ${IFACE} interface"
+    exit 0
+fi
+
+ip link set "$IFACE" up 2>/dev/null
+
+elapsed=0
+CARRIER=0
+while [ "$elapsed" -lt "$CARRIER_WAIT" ]; do
+    [ "$(cat "/sys/class/net/${IFACE}/carrier" 2>/dev/null)" = "1" ] && { CARRIER=1; break; }
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+if [ "$CARRIER" -eq 0 ]; then
+    # The everyday case: no cable attached. Quiet no-op, link back down.
+    ip link set "$IFACE" down 2>/dev/null
+    log "no ethernet carrier after ${CARRIER_WAIT}s - no cable; clock left as-is"
+    write_state false "no ethernet cable attached"
+    exit 0
+fi
+
+applog "ethernet carrier on ${IFACE} - opening a one-time network window for NTP"
+
+# --- DHCP --------------------------------------------------------------------
+# Preferred: systemd-networkd (ships with the image, left disabled; the
+# .network file for ${IFACE} is installed at provision). Fallbacks cover a
+# future image that drops networkd.
+
+if [ -x /usr/lib/systemd/systemd-networkd ] || [ -x /lib/systemd/systemd-networkd ]; then
+    if systemctl start systemd-networkd 2>/dev/null; then
+        STARTED_NETWORKD=1
+    else
+        applog "WARNING: systemd-networkd failed to start"
+    fi
+fi
+if [ "$STARTED_NETWORKD" -eq 0 ]; then
+    if command -v dhclient >/dev/null 2>&1; then
+        dhclient -nw "$IFACE" 2>/dev/null && applog "fallback DHCP: dhclient on ${IFACE}"
+    elif command -v dhcpcd >/dev/null 2>&1; then
+        dhcpcd -b "$IFACE" 2>/dev/null && applog "fallback DHCP: dhcpcd on ${IFACE}"
+    elif command -v udhcpc >/dev/null 2>&1; then
+        udhcpc -b -i "$IFACE" >/dev/null 2>&1 &
+        DHCP_PID=$!
+        applog "fallback DHCP: udhcpc on ${IFACE}"
+    else
+        applog "WARNING: no DHCP client on this image (no networkd/dhclient/dhcpcd/udhcpc) - cannot fetch time"
+        net_down
+        write_state false "carrier present but no DHCP client available"
+        exit 0
+    fi
+fi
+
+elapsed=0
+while [ "$elapsed" -lt "$DHCP_WAIT" ]; do
+    IPADDR=$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')
+    [ -n "$IPADDR" ] && ip -4 route list default 2>/dev/null | grep -q default && break
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+if [ -z "$IPADDR" ]; then
+    applog "no DHCP lease on ${IFACE} after ${DHCP_WAIT}s - cannot fetch time; closing the window"
+    net_down
+    write_state false "carrier present but DHCP got no lease in ${DHCP_WAIT}s"
+    exit 0
+fi
+applog "DHCP lease: ${IPADDR} on ${IFACE} (took ${elapsed}s)"
+
+# --- DNS ---------------------------------------------------------------------
+# timesyncd resolves its NTP pool names through /etc/resolv.conf, which
+# nothing maintains on this box (NetworkManager is purged). Point it at the
+# DHCP-provided DNS (networkd records it in its lease file), else the
+# gateway; the original file is restored at teardown.
+
+if ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+    DNS=$(grep -rh '^DNS=' /run/systemd/netif/leases/ 2>/dev/null | head -1 | cut -d= -f2 | awk '{print $1}')
+    [ -n "$DNS" ] || DNS=$(ip -4 route list default 2>/dev/null | awk '{print $3; exit}')
+    if [ -n "$DNS" ]; then
+        [ -f /etc/resolv.conf ] && cp /etc/resolv.conf "$RESOLV_BACKUP" 2>/dev/null
+        printf 'nameserver %s\n' "$DNS" > /etc/resolv.conf 2>/dev/null \
+            && applog "resolv.conf pointed at ${DNS} for the window" \
+            || applog "WARNING: could not write /etc/resolv.conf - NTP by hostname may fail"
+    fi
+fi
+
+# --- NTP ---------------------------------------------------------------------
+# systemd-timesyncd is masked in steady state (this box must not quietly
+# join networks); unmask it only inside the window. It steps the clock AND
+# writes the RTC itself on sync - our explicit hwclock below is the
+# belt-and-braces second attempt, with its error text kept this time.
+
+if [ ! -x /usr/lib/systemd/systemd-timesyncd ] && [ ! -x /lib/systemd/systemd-timesyncd ]; then
+    applog "WARNING: systemd-timesyncd not on this image - cannot fetch time"
+    net_down
+    write_state false "network up but no NTP client available"
+    exit 0
+fi
+
+T0=$(date -u +%s)
+systemctl unmask systemd-timesyncd 2>/dev/null
+if systemctl start systemd-timesyncd 2>/dev/null; then
+    STARTED_TIMESYNCD=1
+else
+    applog "WARNING: systemd-timesyncd failed to start"
+    net_down
+    write_state false "network up but systemd-timesyncd failed to start"
+    exit 0
+fi
+
+elapsed=0
+while [ "$elapsed" -lt "$NTP_WAIT" ]; do
+    [ -e "$SYNCFILE" ] && break
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+if [ ! -e "$SYNCFILE" ]; then
+    applog "no NTP sync within ${NTP_WAIT}s (server unreachable? DNS?) - clock stays untrusted; closing the window"
+    net_down
+    write_state false "network up but no NTP sync within ${NTP_WAIT}s"
+    exit 0
+fi
+
+# Synced. The seed had already floored the clock near reality, so the step
+# is usually seconds - but however big it was, timestamps from here on are
+# real UTC.
+NOW=$(date -u +%s)
+DELTA=$((NOW - T0 - elapsed))
+UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+NET_UTC_J="\"${UTC}\""
+
+# Keep the fallback floor fresh too.
+command -v fake-hwclock >/dev/null 2>&1 && fake-hwclock save 2>/dev/null
+
+# Discipline the battery-backed RTC - the reason this service exists. Keep
+# hwclock's stderr: its one silent failure is why the GPS pivot happened.
+if [ -e /sys/class/rtc/rtc0 ]; then
+    if ERR=$(hwclock --systohc --utc --noadjfile 2>&1); then
+        RTC_DISCIPLINED=true
+        applog "RTC disciplined from NTP - future boots carry trusted time with no cable attached"
+    else
+        applog "WARNING: RTC present but hwclock --systohc failed (${ERR:-no error output}) - RTC not disciplined by us (timesyncd may still have written it)"
+    fi
+else
+    applog "NOTE: no RTC fitted - NTP time is good for THIS boot only"
+fi
+
+applog "clock SET from NTP over ${IFACE}: ${UTC} (moved ~${DELTA}s, sync took ${elapsed}s)"
+
+net_down
+write_state true "clock set from NTP over wired ethernet"
+exit 0
