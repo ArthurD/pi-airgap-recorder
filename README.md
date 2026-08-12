@@ -98,10 +98,11 @@ going solid**: that is the sync landing. Pull the cable whenever you like;
 every later boot carries trusted time from the RTC (`time_source: "ntp"`
 that boot, `"rtc"` afterwards).
 
-chrony is not on the stock image and provisioning is offline by design, so
-**the first cable boot installs it through the window itself** (apt-verified
-signed packages; the daemon is disabled and masked the moment it lands —
-only the window ever runs it, one-shot). If the install can't happen (a LAN
+chrony is not on the stock image (nor, surprisingly, is `hwclock` — Pi OS
+Lite omits `util-linux-extra`) and provisioning is offline by design, so
+**the first cable boot installs both through the window itself**
+(apt-verified signed packages; the chrony daemon is disabled and masked
+the moment it lands — only the window ever runs it, one-shot). If the install can't happen (a LAN
 with no internet, repo down), the ladder degrades honestly: plain NTP from
 `time.google.com` (via chrony, or `systemd-timesyncd` if chrony never
 arrived) — but an unauthenticated answer only counts if it survives a
@@ -587,15 +588,20 @@ discarded (`2>/dev/null`), so the DS3231 stayed at its 2000-01-01 default
 and the next indoor boot fell back to the seed, red LED blinking. Both RTC
 writers now capture hwclock's error text, and the primary time-set path is
 now **wired NTP** (`umik-net-time`, one ethernet-cable boot) instead of an
-outdoor GPS boot.
+outdoor GPS boot. The first bench run of that window (2026-08-12, NTS sync
+verified end-to-end) also caught the culprit at last: `hwclock: not found`
+— **Pi OS Lite doesn't ship hwclock** (Debian split it into
+`util-linux-extra`), so the GPS boot never stood a chance. The window now
+installs `util-linux-extra` alongside chrony.
 
 Open items:
 
-- [ ] Bench-verify `umik-net-time` on umik1: re-inject, boot with ethernet
-      attached, watch red LED go solid; check `umik.log` for the chrony
-      install landing, "clock SET from time.cloudflare.com via NTS", and
-      "RTC disciplined" (if hwclock fails again, its error text is now
-      captured).
+- [x] Bench-verify `umik-net-time` on umik1 (2026-08-12): chrony installed
+      through the window, "clock SET from time.cloudflare.com via NTS",
+      red solid — and the captured hwclock error exposed the missing
+      `util-linux-extra`.
+- [ ] Second cable boot after the util-linux-extra fix: expect
+      "RTC disciplined" in `umik.log` and `rtc0/since_epoch` in 2026.
 - [ ] Then verify the RTC carry: power-cycle with no cable; expect
       `time_source: "rtc"`, red solid, and a dated S3 prefix on upload.
 - [ ] umik2: seat its DS3231 module, then same cable boot.

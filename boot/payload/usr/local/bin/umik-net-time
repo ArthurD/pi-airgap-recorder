@@ -315,18 +315,29 @@ tls_cross_check() {
     return 0
 }
 
-if ! command -v chronyd >/dev/null 2>&1; then
-    applog "chrony not on the image - installing it through the window (one-time; apt-verified from the distro repo)"
+# What the window may need to install, one-time, apt-verified: chrony (the
+# NTS client) and util-linux-extra (hwclock - Raspberry Pi OS Lite ships
+# util-linux WITHOUT it since Debian split the package). The missing
+# hwclock is the ACTUAL cause of the "silent" RTC failure on the GPS field
+# boot: the first bench run of this window captured the error at last -
+# "hwclock: not found" - after the GPS path had discarded it.
+NEED=""
+command -v chronyd >/dev/null 2>&1 || NEED="chrony"
+command -v hwclock >/dev/null 2>&1 || NEED="${NEED} util-linux-extra"
+if [ -n "$NEED" ]; then
+    applog "installing through the window (one-time; apt-verified):${NEED# }"
     export DEBIAN_FRONTEND=noninteractive
     if apt-get -o Acquire::Retries=1 update >/dev/null 2>&1 \
-       && apt-get -y --no-install-recommends install chrony >/dev/null 2>&1; then
-        # Debian auto-starts the daemon on install; this box only ever runs
-        # chrony one-shot inside the window.
-        systemctl disable --now chrony 2>/dev/null
-        systemctl mask chrony 2>/dev/null
-        applog "chrony installed; daemon disabled and masked (only this window runs it, one-shot)"
+       && apt-get -y --no-install-recommends install $NEED >/dev/null 2>&1; then
+        case " $NEED " in *" chrony "*)
+            # Debian auto-starts the daemon on install; this box only ever
+            # runs chrony one-shot inside the window.
+            systemctl disable --now chrony 2>/dev/null
+            systemctl mask chrony 2>/dev/null
+        ;; esac
+        applog "installed: ${NEED# } (any chrony daemon disabled and masked; only this window runs it, one-shot)"
     else
-        applog "WARNING: chrony install failed (LAN without internet? repo unreachable?) - falling back to unauthenticated NTP + TLS cross-check"
+        applog "WARNING: install failed (wanted:${NEED}; LAN without internet? repo unreachable?) - continuing with what the box has"
     fi
 fi
 
