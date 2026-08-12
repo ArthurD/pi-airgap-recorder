@@ -3,3 +3,6 @@ cache/
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# macOS Finder droppings
+.DS_Store
