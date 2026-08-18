@@ -9,6 +9,14 @@
 #   logs/<utc-stamp>/...                    card activity-log snapshots
 #   manifest/manifest.log, manifest.head    hash chain - the head pins every
 #                                           byte ever sealed, on- or off-site
+#   manifest/ingest.log                     human-readable ingest run history
+#
+# Uploads request SHA-256 checksums, so S3 validates every part on arrival.
+# NOTE: files above the CLI's multipart threshold get a COMPOSITE checksum
+# (a hash of part hashes, suffixed "-<n>"), which is NOT comparable to the
+# whole-file hash in SHA256SUMS. Proving the bucket holds the sealed bytes is
+# `umik verify-s3`, which stamps every object with a FULL_OBJECT SHA-256
+# server-side and diffs it against the seals.
 #
 # Add-only by construction: `aws s3 sync` without --delete never removes a
 # key, every session prefix is unique (unit + counter + timestamp), and the
@@ -52,7 +60,7 @@ json_str() { # <file> <key>  first string value of "key" in a machine-written js
 s3sync() { # <src-dir> <s3-prefix>  -> prints the number of files it uploaded
     local out
     out=$(aws s3 sync ${DRY[@]+"${DRY[@]}"} --profile "$PROFILE" --no-progress \
-          "$1" "$2") || return 1
+          --checksum-algorithm SHA256 "$1" "$2") || return 1
     printf '%s\n' "$out" | grep -c 'upload' || true
 }
 
@@ -101,15 +109,20 @@ if [ -d "$ARCHIVE/logs" ]; then
     fi
 fi
 
-# The manifest grows append-only, so overwriting the bucket copy with the
-# longer local one is safe - and bucket versioning keeps every prior head.
-# Publishing the head pins the entire archive history off-site.
+# These three grow append-only, so overwriting the bucket copy with the longer
+# local one is safe - and bucket versioning keeps every prior head. Publishing
+# the head pins the entire archive history off-site. ingest.log rides along
+# because it is the only human-readable account of what was sealed when, and
+# the archive it describes is meant to become deletable.
 if [ -f "$ARCHIVE/manifest.log" ]; then
-    if aws s3 cp ${DRY[@]+"${DRY[@]}"} --profile "$PROFILE" --no-progress --only-show-errors \
-        "$ARCHIVE/manifest.log" "s3://$BUCKET/manifest/manifest.log" \
-       && aws s3 cp ${DRY[@]+"${DRY[@]}"} --profile "$PROFILE" --no-progress --only-show-errors \
-        "$ARCHIVE/manifest.head" "s3://$BUCKET/manifest/manifest.head"; then
-        say "manifest + head -> s3://$BUCKET/manifest/ (head $(cat "$ARCHIVE/manifest.head"))"
+    ok=1
+    for m in manifest.log manifest.head ingest.log; do
+        [ -f "$ARCHIVE/$m" ] || continue
+        aws s3 cp ${DRY[@]+"${DRY[@]}"} --profile "$PROFILE" --no-progress --only-show-errors \
+            --checksum-algorithm SHA256 "$ARCHIVE/$m" "s3://$BUCKET/manifest/$m" || ok=0
+    done
+    if [ "$ok" -eq 1 ]; then
+        say "manifest + head + ingest.log -> s3://$BUCKET/manifest/ (head $(cat "$ARCHIVE/manifest.head"))"
     else
         echo "!! manifest: upload FAILED" >&2
         failed=$((failed + 1))

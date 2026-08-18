@@ -19,6 +19,10 @@
 #                   Add --unit umik1 / --unit umik2 to (re)name the unit.
 #   umik verify     re-verify the archive manifest (add --deep to re-hash
 #                   every archived byte).
+#   umik verify-s3  prove the BUCKET holds the sealed bytes: stamp every
+#                   object with a server-side FULL_OBJECT SHA-256 (no
+#                   download, no egress) and diff it against SHA256SUMS.
+#                   Run this before trusting S3 as the only copy.
 #   umik link       install this command as /usr/local/bin/umik.
 #
 # The collection loop, going forward:
@@ -86,6 +90,10 @@ case "${1:-}" in
     verify)
         shift
         exec "$TOOLS_DIR/umik-ingest.sh" --verify "$@"
+        ;;
+    verify-s3)
+        shift
+        exec "$TOOLS_DIR/umik-verify-s3.sh" "$@"
         ;;
     link)
         # First user-writable directory already on PATH wins; sudo only as
