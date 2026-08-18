@@ -48,7 +48,7 @@ recordings, a DS3231 RTC module, a USB GPS receiver, an AWS account.
 Build the card on a Mac (about 15 minutes, most of it downloading):
 
 ```sh
-git clone https://github.com/<you>/pi-airgap-recorder.git
+git clone https://github.com/ArthurD/pi-airgap-recorder.git
 cd pi-airgap-recorder
 
 ./build/00-fetch-verify.sh                     # download Pi OS + verify SHA-256
@@ -869,5 +869,6 @@ If you fork this for a different microphone, the mic-specific parts are
 narrow — `umik-record` matches USB vendor `2752` and probes formats; the
 air-gap, timestamp-trust and sealing layers do not care what is recording.
 
-**License:** see `LICENSE`. Note that without one, default copyright applies
-and nobody may reuse this — pick one before publishing.
+**License:** MIT — see [`LICENSE`](LICENSE). Use it, fork it, sell it; just
+keep the copyright notice. It comes with no warranty, which for a device you
+point at the world and walk away from is worth reading literally.
