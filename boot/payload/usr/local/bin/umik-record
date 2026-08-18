@@ -19,7 +19,13 @@ set -eu
 # and a newer USB-C one - and they do not necessarily share a product ID. So we
 # match on the miniDSP *vendor* ID and take any audio device it presents.
 # Set UMIK_PID to narrow it if you ever attach more than one miniDSP device.
-UMIK_VID=2752
+#
+# Nothing below this line is miniDSP-specific: the format probe asks the
+# hardware what it accepts, and the calibration gain simply reads "unknown"
+# when the product string has none. So the vendor is a knob, not a premise:
+#   UMIK_VID=<vvvv>  record from a different USB vendor's device
+#   UMIK_VID=any     record from the first USB audio capture device found
+UMIK_VID=${UMIK_VID:-2752}
 UMIK_PID=${UMIK_PID:-}
 
 # Storage: a USB drive mounted at /data/usb by umik-usb-detect wins, so
@@ -80,8 +86,12 @@ WAIT_SECS=${UMIK_WAIT_SECONDS:-60}
 # --- locate the UMIK-1 -----------------------------------------------------
 
 # Does a "vvvv:pppp" usbid belong to the mic we want?
+# UMIK_VID=any matches any USB audio device - /proc/asound only lists sound
+# cards in the first place, so "any" still cannot select a keyboard.
 id_matches() {
-    if [ -n "$UMIK_PID" ]; then
+    if [ "$UMIK_VID" = "any" ]; then
+        return 0
+    elif [ -n "$UMIK_PID" ]; then
         [ "$1" = "${UMIK_VID}:${UMIK_PID}" ]
     else
         case "$1" in "${UMIK_VID}:"*) return 0 ;; *) return 1 ;; esac
@@ -101,10 +111,14 @@ find_card() {
     return 1
 }
 
-find_product() {
+# Product string for the exact device that owns the card we picked. This takes
+# the resolved usbid rather than re-running id_matches: /sys/bus/usb/devices
+# lists every USB device, so under UMIK_VID=any a looser match here would
+# happily report a hub's or keyboard's product string as the microphone's.
+find_product() { # <vvvv:pppp>
     for d in /sys/bus/usb/devices/*/; do
         [ -r "${d}idVendor" ] && [ -r "${d}idProduct" ] || continue
-        id_matches "$(cat "${d}idVendor"):$(cat "${d}idProduct")" || continue
+        [ "$(cat "${d}idVendor"):$(cat "${d}idProduct")" = "$1" ] || continue
         if [ -r "${d}product" ]; then cat "${d}product"; return 0; fi
     done
     return 1
@@ -114,7 +128,11 @@ find_product() {
 elapsed=0
 while ! FOUND=$(find_card); do
     if [ "$elapsed" -ge "$WAIT_SECS" ]; then
-        applog "FATAL: no miniDSP device (vendor ${UMIK_VID}) after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port?"
+        if [ "$UMIK_VID" = "any" ]; then
+            applog "FATAL: no USB audio capture device after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port?"
+        else
+            applog "FATAL: no device from USB vendor ${UMIK_VID} after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port? (set UMIK_VID=any to accept any USB mic)"
+        fi
         for u in /proc/asound/card*/usbid; do
             [ -r "$u" ] && applog "  saw sound device: $(cat "$u")"
         done
@@ -130,7 +148,7 @@ USBID=${FOUND#* }
 # The product string comes from the USB device itself - untrusted input. It
 # is only ever data here (heredocs substitute values without re-evaluating
 # them), but strip JSON-breaking and control characters before storing it.
-PRODUCT=$(find_product 2>/dev/null | tr -cd 'A-Za-z0-9 ._:()+-' | cut -c1-64)
+PRODUCT=$(find_product "$USBID" 2>/dev/null | tr -cd 'A-Za-z0-9 ._:()+-' | cut -c1-64)
 [ -n "$PRODUCT" ] || PRODUCT="unknown"
 # Pull the calibration gain out of the product string if it is there.
 GAIN=$(printf '%s' "$PRODUCT" | sed -n 's/.*[Gg]ain:*[[:space:]]*\([0-9.]*\)[[:space:]]*dB.*/\1/p')

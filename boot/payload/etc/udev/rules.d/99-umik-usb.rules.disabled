@@ -22,6 +22,10 @@ ATTR{bDeviceClass}=="09", GOTO="umik_usb_end"
 # ID is deliberate: the UMIK-1 exists in mini-USB and USB-C hardware revisions
 # which do not necessarily enumerate with the same product ID, and locking this
 # rule to one of them would silently refuse the other.
+#
+# Using a different microphone? Setting UMIK_VID on umik-record is not enough -
+# this rule would deauthorise the device before ALSA ever saw it. Add its
+# vendor ID here too (`lsusb` to find it).
 ATTR{idVendor}=="2752", GOTO="umik_usb_end"
 
 # Allow the optional GPS time-source module (umik-gps-time). GT-U7 boards

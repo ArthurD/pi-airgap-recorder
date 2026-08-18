@@ -1,51 +1,52 @@
 # pi-airgap-recorder
 
-A burnable Raspberry Pi 4B image that records continuously from a miniDSP
-UMIK-1 measurement microphone from the moment it is powered on, with no
-Wi-Fi, no Bluetooth, no SSH and no network of any kind.
+A burnable Raspberry Pi 4B image that records continuously from a USB
+microphone from the moment it is powered on, with no Wi-Fi, no Bluetooth, no
+SSH and no network of any kind.
 
 **Power on → recording. Pull the plug → recording stops. Nothing else.**
 
-There is no app, no pairing step, no configuration on the device, and no way
-to log into it over a network — because there is no network. You build the
-card on a Mac, put it in the Pi, and give it power. Everything after that is
-LEDs and files.
+No app, no pairing, no configuration on the device, and no way to log into it
+over a network — because there is no network. You build the card on a Mac, put
+it in the Pi, and give it power. Everything after that is LEDs and files.
 
-### What makes it different from "a Pi with `arecord` in rc.local"
+### What this adds over `arecord` in a startup script
 
 | | |
 |---|---|
-| **Air-gapped by construction** | Radio hardware disabled in the device tree, drivers blacklisted *and* stubbed, firmware blobs deleted, `openssh-server` purged from disk. A boot-time check asserts all of it, and **the recorder refuses to start if any radio is live**. |
-| **Honest timestamps** | A clock is only trusted on anchored evidence — NTS-authenticated NTP over one ethernet boot, GPS, or a DS3231 RTC proven to have ticked continuously. Guessing is treated as a bug; `clock_trusted: false` is a valid, common answer. |
-| **Survives the plug being pulled** | 10-minute segments, dirty data capped at 1–2 s, `fsck.repair` on boot, and a repair tool for the truncated tail. Worst case is 1–2 seconds of audio. |
-| **Chain-of-custody ingest** | Recordings are SHA-256 sealed as they stream off the medium into an append-only, hash-chained manifest, and only deleted from the card once the archived copy re-verifies. |
-| **Verifiable off-site backup** | An optional S3 mirror whose bytes can be proven — server-side — to match the seals, without downloading them back. |
+| **Air-gapped by construction** | Radio disabled in the device tree, drivers blacklisted *and* stubbed, firmware blobs deleted, `openssh-server` purged from disk. A boot check asserts all of it, and **the recorder refuses to start if any radio is live**. |
+| **Honest timestamps** | A clock is trusted only on anchored evidence — authenticated NTP, GPS, or an RTC proven to have ticked continuously. `clock_trusted: false` is a valid, common answer. |
+| **Survives the plug being pulled** | 10-minute segments, dirty data capped at 1–2 s, `fsck.repair` on boot, and a repair tool for the truncated tail. |
+| **Chain-of-custody ingest** | Recordings are SHA-256 sealed as they stream off the medium into an append-only hash-chained manifest, and deleted from the card only once the archived copy re-verifies. |
+| **Verifiable off-site backup** | An optional S3 mirror whose bytes can be proven — server-side, no egress — to match the seals. |
 
-### Who this is for
+**Who it's for:** anyone who needs a recording to be *defensible* as well as
+audible — acoustic and noise surveys, environmental monitoring, evidence
+capture — or who just wants a field recorder that provably cannot phone home.
+Ignore the S3 and sealing sections and it is still simply "power on, record."
 
-People who need a recording to be *defensible* as well as audible: acoustic
-and noise surveys, long-baseline environmental monitoring, evidence capture,
-or anyone who wants a device that provably cannot phone home. It is equally
-usable as a plain unattended field recorder — ignore the S3 and sealing
-sections and it is still just "power on, record."
-
-### Requirements
-
-A Raspberry Pi 4B, a miniDSP UMIK-1, an SD card, and **a Mac to build the
-card** (the build scripts use `diskutil` and Apple's `hdiutil`/`shasum`; the
-on-Pi half is plain Debian and portable). Optional: a USB stick for
-recordings, a DS3231 RTC module, a USB GPS receiver, an AWS account.
+**Requirements:** a Raspberry Pi 4B, a USB microphone, an SD card, and **a Mac
+to build the card** (the build scripts use `diskutil` and `hdiutil`; the on-Pi
+half is plain Debian). Optional: a USB stick for recordings, a
+[DS3231 RTC module](https://www.amazon.com/dp/B08X4H3NBR) (**recommended** —
+see [Timestamps](#timestamps)), a USB GPS receiver, an AWS account.
 
 > **Recording law is your responsibility.** In many places recording people
-> without consent is illegal, and the rules differ by country and by state.
-> This tool makes recordings hard to dispute; it does not make them lawful.
-> Know your jurisdiction before you deploy it.
+> without consent is illegal, and rules differ by country and state. This tool
+> makes recordings hard to dispute; it does not make them lawful.
+
+**Contents:** [Quick start](#quick-start) · [Hardware](#hardware) ·
+[Timestamps](#timestamps) · [LEDs](#leds) · [Build](#build) ·
+[Recordings](#recordings) · [S3 mirror](#s3-mirror) ·
+[Chain of custody](#chain-of-custody) · [Commands](#command-reference) ·
+[Security design](#security-design) · [Tunables](#tunables) ·
+[Status](#status)
 
 ---
 
 ## Quick start
 
-Build the card on a Mac (about 15 minutes, most of it downloading):
+Build the card on a Mac (~15 minutes, mostly downloading):
 
 ```sh
 git clone https://github.com/ArthurD/pi-airgap-recorder.git
@@ -56,408 +57,239 @@ cd pi-airgap-recorder
 diskutil list external physical                # find your card, e.g. /dev/disk4
 ./build/02-flash.sh /dev/disk4                 # DESTRUCTIVE; verifies readback
 ./build/04-add-data-partition.sh /dev/disk4    # 8GiB root + Mac-readable exFAT
-./build/03-inject.sh --unit umik1               # prompts for hostname + password
+./build/03-inject.sh --unit umik1              # prompts for hostname + password
 diskutil eject /dev/disk4
 ```
 
-Card into the Pi, UMIK-1 into a **black USB 2.0 port**, power on. First boot
+Card into the Pi, mic into a **black USB 2.0 port**, power on. First boot
 provisions and reboots itself (~2–4 min); recording starts on the second boot
 and every boot after.
 
-**Check it is working from across the room:** green LED blipping every 2 s
-means audio is verifiably hitting the disk. Red LED solid means the clock is
-trusted.
+**Check it from across the room:** green LED blipping every 2 s means audio is
+verifiably hitting the disk; red LED solid means the clock is trusted.
 
 Collect the audio:
 
 ```sh
-./tools/umik link            # install the `umik` command once
+./tools/umik link      # install the `umik` command once
 # pull power → pull the stick → stick into the Mac
-umik download                # seal, verify, then clear the stick
+umik download          # seal, verify, then clear the stick
 ```
 
-That is the whole loop. Everything below is detail, options, and the
-reasoning behind the defaults.
+That is the whole loop. Everything below is detail and reasoning.
+
+---
 
 ## Hardware
 
-**The UMIK-1 goes in a black USB 2.0 port. Not the USB-C port, and no hub.**
-
-The Pi 4B has **four USB-A ports** (2× USB 3.0, 2× USB 2.0) plus one USB-C.
-The USB-C port is *power input only* — it has no host data role, so the mic
-cannot go there. No hub is needed. Note that on the Pi 4B **all four USB-A
-ports sit behind the same VL805 xHCI controller** — the black 2.0 ports are
-not a separate controller, so port choice matters less than folklore says.
-Field captures through a black port verified bit-clean; if USB audio
-corruption ever appears, the fixes are a bootloader/VL805 firmware update
-(`rpi-eeprom`) or a cheap high-speed USB 2.0 hub in front of the mic.
-
-### Port map
+**The mic goes in a black USB 2.0 port. Not the USB-C port, and no hub.**
 
 | Port | Device |
 |---|---|
-| black USB 2.0 | **UMIK-1** (field-verified spot; isochronous audio likes 2.0) |
-| black USB 2.0 | **GT-U7 GPS** (optional; slow serial, 2.0 is plenty) |
-| blue USB 3.0, either | **USB stick** |
+| black USB 2.0 | **microphone** (isochronous audio likes 2.0) |
+| black USB 2.0 | **GPS** (optional) |
+| blue USB 3.0 | **USB stick** — use the port *farthest* from the GPS |
 | USB-C | power in — nothing else works there |
 
-No hub. The stick goes in a blue port on the *far side* from the GPS on
-purpose: USB 3.0 devices radiate broadband noise right around the GPS
-frequency (1.575 GHz). If a box struggles to get a fix, use the GPS cable
-to move the module a hand-span away from the Pi, ideally near a window.
+The Pi's USB-C is power-only, so the mic cannot go there. All four USB-A ports
+sit behind the same VL805 controller, so port choice matters less than folklore
+says; field captures through a black port verified bit-clean. USB 3.0 devices
+radiate broadband noise around the GPS band (1.575 GHz), hence keeping a stick
+away from a GPS module.
 
 **Beware charge-only cables.** Two separate field failures were caused by
-charging cables (vape/phone chargers) that carry power but have no data
-pins: the device lights up yet is *electrically absent* from the USB bus —
-`umik.log` shows `no miniDSP device` / `no GPS module on the bus`. Use the
-cable that shipped with the device, and vet any substitute on the Mac
-first: plug it in — if it doesn't appear in **System Information → USB**
-within seconds, the cable is charge-only.
+charging cables with no data pins: the device lights up yet is *electrically
+absent* from the bus, and `umik.log` shows `no miniDSP device`. Vet any
+substitute on the Mac first — if it doesn't appear in **System Information →
+USB** within seconds, it's charge-only.
 
-> **If your UMIK-1 has a USB-C socket, you still need no adapter.** miniDSP
-> moved the UMIK-1 from mini-USB to USB-C on later units, but the cable in the
-> box is **USB-C to USB-A**: USB-C at the mic end, USB-A at the host end. It
-> plugs directly into the Pi. USB-C on the mic body and USB-C on the Pi are
-> unrelated — the Pi's is a power inlet.
->
-> Because those two revisions may not share a USB product ID, the recorder and
-> the udev rule match on the miniDSP **vendor** ID (`2752`) and accept any
-> audio device it presents, rather than pinning one product ID. Set `UMIK_PID`
-> to narrow it only if you attach more than one miniDSP device.
+> **A USB-C UMIK-1 needs no adapter.** miniDSP moved the UMIK-1 from mini-USB
+> to USB-C, but the supplied cable is USB-C (mic) to USB-A (host) and plugs
+> straight into the Pi.
 
 | | |
 |---|---|
 | Board | Raspberry Pi 4B |
-| Mic | miniDSP UMIK-1, either revision (USB vendor `2752`) |
-| Time set (pick one) | wired ethernet for ONE boot (NTP; recommended) — or a GT-U7 GPS (u-blox NEO-6 clone) / any NMEA-over-USB receiver |
-| RTC (optional) | DS3231 plug-on module (e.g. Dorhea 4-pack) on GPIO pins 1–9 — carries the time so the cable/GPS comes off |
-| Card | 128 GB (≈10 days of audio); anything ≥8 GB boots |
+| Mic | any USB audio capture device; miniDSP UMIK-1 out of the box (see [below](#using-a-different-microphone)) |
+| RTC | [DS3231 plug-on module](https://www.amazon.com/dp/B08X4H3NBR) — **recommended** |
+| Time set | one wired-ethernet boot (NTP) or a GT-U7 / any NMEA-over-USB GPS |
+| Card | 128 GB ≈ 10 days of audio; anything ≥8 GB boots |
 | Base OS | Raspberry Pi OS Lite arm64, Trixie (2026-06-18) |
 
-### Storage budget
+**Storage budget.** 48 kHz / 24-bit / mono is 144 KB/s → 518 MB/hour →
+**12.4 GB/day**; a 128 GB card holds ~10 days. A mic that enumerates as
+2-channel doubles that. Below 512 MB free the recorder stops cleanly rather
+than letting `arecord` crash-loop against a full disk.
 
-48 kHz / 24-bit / mono is **144 KB/s → 518 MB/hour → 12.4 GB/day**, so a
-128 GB card holds **~10 days**. (A UMIK-1 that enumerates as 2-channel
-doubles those rates — the recorder captures whatever channel count the
-hardware accepts, and `session.json` records which.) When free space drops below 512 MB the
-recorder stops cleanly and says so in the journal, instead of letting
-`arecord` crash-loop against a full disk. Move old sessions off and
-power-cycle to resume.
+### Using a different microphone
 
-### Timestamps: the trust model
+Out of the box the recorder matches the miniDSP USB vendor ID (`2752`),
+accepting either UMIK-1 hardware revision. Nothing downstream is
+miniDSP-specific — the format probe asks the hardware what it accepts, and the
+calibration gain reads `unknown` when the product string has none — so the
+vendor is a knob:
 
-The Pi 4B has **no built-in real-time clock**, and in steady state this box
-touches no network, so wall-clock timestamps are not normally trustworthy.
-The recorder handles this honestly: sessions are ordered by a **persistent
-counter**, and `session.json` carries `clock_trusted: true` only on
-**anchored evidence** — the clock was set from NTP (one wired-ethernet
-boot) or GPS that boot, or carried by the disciplined DS3231 RTC (below).
-Plausibility heuristics were tried and field-defeated (the image's own
-build epoch looks recent, and every boot restarts at it), so trust is
-anchored or nothing.
+```sh
+sudo systemctl edit umik-record     # then add, under [Service]:
+# Environment=UMIK_VID=any          # first USB audio capture device found
+# Environment=UMIK_VID=046d         # or pin a specific vendor (lsusb)
+```
 
-### First time-set: one wired-ethernet boot (recommended)
+`/proc/asound` only lists sound cards, so even `any` cannot select a keyboard.
+One catch: if you enabled the optional default-deny udev rule, add your
+vendor's ID there too, or the device is refused before ALSA sees it.
 
-Plug an **ethernet cable from your router into the Pi for a single boot**.
-`umik-net-time.service` runs before the recorder: it spots the carrier,
-opens a one-time network window (DHCP via `systemd-networkd`, otherwise
-dormant), fetches **NTS-authenticated time** (RFC 8915) from
-`time.cloudflare.com` via a one-shot `chronyd -q`, steps the clock,
-**disciplines the DS3231 RTC**, then tears the whole thing back down —
-services stopped and re-masked, link down. Watch for the **red PWR LED
-going solid**: that is the sync landing. Pull the cable whenever you like;
-every later boot carries trusted time from the RTC (`time_source: "ntp"`
-that boot, `"rtc"` afterwards).
+---
 
-chrony is not on the stock image (nor, surprisingly, is `hwclock` — Pi OS
-Lite omits `util-linux-extra`) and provisioning is offline by design, so
-**the first cable boot installs both through the window itself**
-(apt-verified signed packages; the chrony daemon is disabled and masked
-the moment it lands — only the window ever runs it, one-shot). If the install can't happen (a LAN
-with no internet, repo down), the ladder degrades honestly: plain NTP from
-`time.google.com` (via chrony, or `systemd-timesyncd` if chrony never
-arrived) — but an unauthenticated answer only counts if it survives a
-**TLS cross-check**: one HTTPS response from a WebPKI-validated host, whose
-`Date` header must agree with the fresh NTP time within 10 s. Precision
-from NTP, authentication from TLS. A disagreement, or a failed certificate
-validation (the man-in-the-middle signature), **rejects the sync** — trust
-flags stay false and the RTC is never written.
+## Timestamps
 
-No cable = a ~2-second logged no-op, and the box never touches a network.
-**Radio silence holds either way** — ethernet is copper, and
-`umik-radio-check` still proves no wireless hardware is live. What you
-trade during that one boot is the air-gap, for the seconds the window is
-open, on your own LAN, only while you have physically plugged the cable in.
+The Pi 4B has no built-in RTC and this box touches no network, so wall-clock
+time is not trustworthy by default. Sessions are therefore ordered by a
+**persistent counter**, and `session.json` sets `clock_trusted: true` only on
+anchored evidence. Plausibility heuristics were tried and field-defeated — the
+image's own build epoch looks recent, and every boot restarts at it — so trust
+is anchored or nothing.
 
-**The window is outbound-only, enforced.** Nothing on the image can accept
-a login over a network — `openssh-server` is purged from disk at
-provisioning (and masked on top), telnetd has never shipped with Pi OS
-Lite, and no TCP service listens. On top of that, `umik-net-time` installs
-a drop-all inbound nftables policy *before* the link ever comes up: the
-box originates DHCP and NTP and accepts only the conntrack-matched replies
-— no ping answers, no TCP resets, no ICMP unreachables. A port scan during
-the window sees a black hole (ARP aside — the price of speaking IP).
-IPv6 is disabled wholesale by sysctl, and outside the window the interface
-is administratively down: plugging a cable into a running box does
-nothing. The time answer itself is authenticated too — NTS when chrony is
-available, the TLS Date cross-check otherwise — so even a hostile network
-can only deny the sync, not forge it (the residual exception: the
-no-chrony, no-wget fallback accepts plain NTP with a loud
-`UNAUTHENTICATED` log line).
-This replaced GPS as the primary time source after a field cycle where the
-GPS fix landed but the RTC write silently failed — see `umik.log` capture
-of `hwclock` errors, which both writers now keep.
+Hierarchy at boot, weakest first, each layer only improving on the last:
 
-### Or: plug in a GPS module (works fully off-grid)
+```
+fake-hwclock (floor) → DS3231 restore (trusted) → Mac time-seed (floor,
+forward-only) → wired NTP (trusted, disciplines the RTC) → GPS (trusted,
+re-disciplines the RTC on a fix)
+```
 
-**A cheap USB GPS receiver also works.** Plug a **GT-U7** (u-blox NEO-6
-clone, ~$10; its micro-USB into any free USB-A port) — or any module that
-speaks NMEA over USB — and leave it attached. At every boot,
-`umik-gps-time.service` runs *before* the recorder:
+### Recommended: a DS3231 RTC + one ethernet boot
 
-1. It waits up to 6 s for a USB serial device, then identifies the GPS by
-   behaviour (whatever emits NMEA), not by vendor ID — clone boards use
-   assorted serial bridges.
-2. It waits up to **3 minutes** (tunable) for a satellite fix, taking time
-   only from an NMEA sentence with a **valid checksum** and a plausible
-   date — the dummy time modules emit from cold start is rejected.
-3. **A position fix is preferred but not required for time.** If the window
-   expires without a fix — typical indoors — but the module has been
-   reporting coherent, plausible UTC the whole time (decoded from a single
-   visible satellite, or from the GT-U7's battery-backed clock seeded by an
-   earlier fix), that time is accepted anyway, marked
-   `time_source: "gps-time-only"`.
-4. It steps the system clock, so the session directory and every segment
-   filename carry real UTC (to within a couple of seconds), and
-   `session.json` gets `clock_trusted: true`, the `time_source`, and a
-   `gps` block — with coordinates, satellite count and altitude when there
-   was a real fix.
+This turns "sync every boot" into **sync once, ever** — nothing stays attached
+afterwards. It is the setup both field units run.
 
-No module, no NMEA, or no fix in time → each is a logged no-op and recording
-starts exactly as before, untrusted clock and all. The module can never block
-recording. **The air-gap holds**: a GPS receiver only listens — it transmits
-nothing — so the radio-silence posture is unchanged (`umik-radio-check` is
-unaffected).
+The [DS3231 module linked above](https://www.amazon.com/dp/B08X4H3NBR) is a
+**direct drop-in**: no wiring, no soldering, no HAT. With the Pi powered off,
+push it onto the **first five pins of the inner GPIO row** — physical pins
+1/3/5/7/9, the row closer to the middle of the board, starting at the end
+nearest the microSD slot — battery facing up. Seated right, the module sits
+over the Pi rather than overhanging the edge. Wrong row is harmless but dead:
+it simply never appears on I²C.
 
-**Even with no GPS at all, the clock now gets a floor.** `03-inject.sh` and
-every `umik-ingest.sh` collection leave a `umik-time-seed` file (the Mac's
-NTP-disciplined clock, as epoch seconds) on whatever medium they touch; at
-boot `umik-time-seed.service` steps the Pi's clock **forward** to the newest
-plausible seed, before the session directory is named. Real time is *at
-least* the seed — the file was written before the boot — so session names
-carry real dates, accurate to "when the media last touched the Mac."
-`session.json` says `time_source: "seeded"` and `clock_trusted` stays
-`false`: it is a floor, not a sync, and NTP/GPS override it whenever they can.
+Then boot **once** with an ethernet cable from your router.
+`umik-net-time.service` runs before the recorder: it spots the carrier, opens a
+one-time network window (DHCP via `systemd-networkd`, otherwise dormant),
+fetches **NTS-authenticated time** (RFC 8915) from `time.cloudflare.com` via a
+one-shot `chronyd -q`, steps the clock, **disciplines the DS3231**, then tears
+it all back down — services stopped and re-masked, link down. Watch for the red
+LED going solid. Pull the cable whenever you like; every later boot carries
+trusted time from the RTC.
 
-**Seed the module once outdoors.** A brand-new GT-U7 has never had a fix, so
-indoors it may know nothing: power the box (or just the module) for a few
-minutes under open sky once. After that its battery-backed clock keeps
-approximate UTC for days to weeks between power-ups, and indoor boots get
-time via the no-fix fallback even with zero usable satellites. Cold-start
-fix is ~30 s outdoors, minutes near a window, possibly never deep indoors.
-Note that fix coordinates land in `session.json` and `umik.log`; redact them
-if you publish those files.
+**Why the RTC is trustworthy.** The DS3231 latches an oscillator-stop flag in
+hardware whenever it quits ticking, and the kernel refuses to return a time
+while that flag is set — it clears only when the chip is next written. So a
+readable, plausible time at boot *is proof* that an authoritative source set
+this chip once and it has run continuously since. Drift is ~1 min/year; redo a
+cable boot whenever you want that zeroed. The flag lives in the chip on the
+unit, so swapping or re-injecting SD cards never launders trust.
 
-### Set-and-forget time: the DS3231 RTC (optional, recommended)
+chrony is not on the stock image (nor is `hwclock` — Pi OS Lite omits
+`util-linux-extra`), and provisioning is offline by design, so **the first
+cable boot installs both through the window itself**, then disables and masks
+chrony. If that install can't happen, the ladder degrades honestly to plain NTP
+from `time.google.com` — but an unauthenticated answer counts only if it
+survives a **TLS cross-check**: one HTTPS response from a WebPKI-validated
+host whose `Date` header agrees within 10 s. Precision from NTP,
+authentication from TLS. A disagreement or a failed certificate validation
+**rejects the sync** — trust stays false and the RTC is never written.
 
-A **DS3231 battery-backed RTC** turns "sync every boot" into "**sync once,
-ever**": boot each box once with an ethernet cable (or outdoors with the
-GPS), and from then on the coin cell carries real time across power-offs
-for years — nothing stays attached.
+No cable is a ~2-second logged no-op. **Radio silence holds either way** —
+ethernet is copper, and `umik-radio-check` still proves no wireless hardware is
+live. What you trade for those seconds is the air-gap, on your own LAN, only
+while you have physically plugged a cable in. The window is
+[outbound-only and enforced](#the-one-time-network-window).
 
-**Hardware.** Use the plug-on kind (5-hole female socket underneath, e.g.
-the Dorhea 4-pack). With the Pi powered off, push it onto the **first five
-pins of the inner row** of the GPIO header — physical pins 1/3/5/7/9, the
-row *closer to the middle of the board*, starting at the end nearest the
-microSD slot — battery facing up. Seated right, the module body sits over
-the Pi, not overhanging the board edge, and five bare pins of the outer row
-remain visible beside it. (Wrong row/offset is harmless-but-dead: the module
-simply never appears on I²C.)
+### Alternative: GPS (fully off-grid)
 
-**Trust model.** Exactly two code paths ever write the RTC:
-`umik-net-time` (from an NTP sync over the one-time cable) and
-`umik-gps-time` (**only from a position fix** — the weaker no-position-fix
-time sync sets that boot's clock but never the RTC). The DS3231 latches an
-oscillator-stop flag in hardware whenever it quits ticking (flat/removed
-battery), and the kernel refuses to hand over a time while that flag is
-set — it clears only when the RTC is next written. So at boot,
-`umik-rtc-time.service` reading a valid, plausible time *is proof* that an
-authoritative source set this chip once and it has run continuously since:
-the clock is stepped and counts as **trusted** (`time_source: "rtc"`,
-`clock_trusted: true`), within crystal drift (~1 min/year — redo the cable
-boot whenever you want that zeroed). The flag lives in the chip on the
-unit, so re-injecting or swapping SD cards never launders trust. Mac
-time-seeds still apply on top — a seed only ever steps the clock
-*forward*, and a genuine floor can only refine RTC drift, never regress it.
+A **GT-U7** (u-blox NEO-6 clone, ~$10) or any NMEA-over-USB module works
+instead, and needs no LAN at all. `umik-gps-time.service` identifies the GPS by
+behaviour rather than vendor ID, waits up to 3 minutes for a fix, and accepts
+time only from a checksum-valid sentence with a plausible date. **A position
+fix is preferred but not required**: if the window expires without one — typical
+indoors — but the module has been reporting coherent UTC throughout, that is
+accepted as `time_source: "gps-time-only"`. Only a real fix disciplines the RTC.
 
-The full clock hierarchy at boot, weakest first, each layer only ever
-improving on the last: `fake-hwclock` (floor) → DS3231 restore (trusted) →
-Mac time-seed (floor, forward-only) → wired NTP (trusted, disciplines the
-RTC) → GPS (trusted, re-disciplines the RTC on a fix). No RTC fitted,
-never set, or battery dead → logged no-op, `clock_trusted` stays honest,
-recording starts regardless.
+Seed a new module once outdoors, since it has never had a fix; afterwards its
+battery-backed clock keeps approximate UTC for weeks. A GPS receiver only
+listens, so the air-gap is unchanged. Note that fix coordinates land in
+`session.json` — redact them if you publish those files.
 
-**Rollout to an existing card**: `umik inject --reuse-credentials` (the
-config.txt overlay and the new services ride along; firstrun re-runs
-idempotently on next boot), then one boot with an ethernet cable attached.
-Watch for the red PWR LED going **solid on a later cable-less boot** — that
-is the RTC carrying trusted time, and nothing needs to stay plugged in.
+### Fallback: the Mac time-seed
 
-### Reading the box at a glance: the LEDs
+With no RTC, cable or GPS, the clock still gets a floor. `03-inject.sh` and
+every `umik download` leave a `umik-time-seed` file (the Mac's NTP-disciplined
+clock, as epoch seconds) on the medium; at boot the Pi steps its clock
+**forward** to the newest plausible seed. Real time is *at least* the seed, so
+session names carry real dates accurate to "when the media last touched the
+Mac." `clock_trusted` stays `false`: it is a floor, not a sync.
 
-With no screen and no network, the Pi's two onboard LEDs are the only live
-feedback. `umik-status.service` repurposes both (and hands them back to
-stock behaviour if stopped):
+---
+
+## LEDs
+
+With no screen and no network, the two onboard LEDs are the only live feedback.
+`umik-status.service` repurposes both, and restores stock behaviour if stopped.
 
 | LED | Pattern | Meaning |
 |---|---|---|
-| green (ACT) | off | still booting — recorder not started yet |
-| green | solid | recorder running but not writing yet (mic probe); suspicious if it stays solid for minutes |
-| green | **short blip every 2 s** | **recording** — verified on disk: the segment file is actually growing |
-| green | fast blink | trouble: recorder or radio-check failed, recorder died, or storage full |
-| red (PWR) | off | clock trust not determined yet (NTP/GPS sync still running) |
-| red | **solid** | **clock trusted** — wired-NTP or GPS sync this boot, or carried by the disciplined DS3231 RTC |
-| red | slow blink | no trusted time — no NTP/GPS/RTC, or none had usable time |
+| green (ACT) | off | still booting |
+| green | solid | running but not writing yet — suspicious after minutes |
+| green | **blip every 2 s** | **recording**, verified: the segment file is growing |
+| green | fast blink | trouble: radio-check failed, recorder died, or disk full |
+| red (PWR) | off | clock trust not yet determined |
+| red | **solid** | **clock trusted** — NTP or GPS this boot, or carried by the RTC |
+| red | slow blink | no trusted time |
 
-Happy state at a distance: **green blipping, red solid**. Green blipping +
-red slow-blinking = recording fine, but timestamps are not trusted.
-
----
-
-## Does "stop gracefully on power removal" work?
-
-**Not literally — nothing can make it literal.** Yanking the plug gives the OS
-zero notice; you cannot flush a file you did not know was ending. What this
-image does instead is make it not matter:
-
-1. **Segmented capture.** `arecord` rotates every 10 minutes, closing and
-   syncing each segment. A power cut can only damage the in-flight segment.
-2. **Bounded dirty data.** `vm.dirty_expire_centisecs=200` plus ext4
-   `commit=1` cap unwritten audio at roughly **1–2 seconds** (default ~30 s).
-3. **`fsck.repair=yes`** on every boot cleans up the filesystem journal.
-4. **Truncated ≠ lost.** All the audio bytes are on disk; only the WAV header
-   size fields are stale. `tools/repair-wav.sh` rewrites them.
-
-Realistic worst case: **1–2 seconds of audio at the moment of the cut.**
-A genuinely clean close would need a UPS/supercap HAT with a power-fail GPIO;
-the recorder already handles SIGTERM properly, so adding one later is a small
-unit file, not a redesign.
-
----
-
-## Architecture
-
-One big partition, stock plumbing, our config on top:
-
-> Flash the stock image, drop a provisioning payload on the **FAT boot
-> partition** (which macOS mounts natively), and let the Pi harden itself on
-> first boot. The stock initramfs auto-expands the root filesystem across the
-> whole card (the `resize` flag in `cmdline.txt`, which we deliberately leave
-> alone); recordings are simply a directory on it.
-
-Everything injected is written in this repo. No third-party scripts, no
-`curl | bash`, and — because `alsa-utils` already ships in Trixie Lite — the
-Pi **never touches a network at any point**, not even to provision.
-
-```
-build/     runs on the Mac      fetch → verify → decompress → flash → inject
-boot/      lands on the card    firstrun.sh + payload/
-tools/     host-side utilities  repair-wav.sh · umik-ingest.sh · umik-viewer.py
-```
-
-### Trust chain
-
-| Artifact | How it is verified |
-|---|---|
-| Raspberry Pi OS image | HTTPS (TLS ≥1.2, cert validation mandatory, https-only redirects) + SHA-256 against the published checksum |
-| Everything else | Already inside that verified image |
-
-`fetch()` in `build/lib.sh` is the single network entry point. There is no
-`-k`, no `--insecure`, no way to disable certificate validation.
-
-**Known gap:** the detached GPG signature is downloaded but not checked —
-this host has no `gpg`, and bootstrapping gnupg from source would rest on
-nothing stronger than the TLS + SHA-256 we already have. If you have a trusted
-keyring: `gpg --verify <image>.img.xz.sig <image>.img.xz`.
-
----
-
-## Radio silence: four independent layers
-
-Any one of these alone would be sufficient. All four are applied.
-
-1. **Device tree** — `dtoverlay=disable-wifi`, `dtoverlay=disable-bt` in
-   `config.txt`. The hardware is not present, so no driver can bind to it.
-2. **Boot blacklist** — `modprobe.blacklist=brcmfmac,cfg80211,bluetooth,btusb,…`
-3. **`install <mod> /bin/false`** — a plain blacklist only stops *automatic*
-   loading; this makes even a deliberate `modprobe` fail.
-4. **Firmware gone** — `firmware-brcm80211` and `bluez-firmware` are purged
-   and the Broadcom blobs deleted from `/lib/firmware/brcm/`. There is
-   nothing left to load into the radio.
-
-Also purged outright: `bluez`, `wpasupplicant`, `network-manager`,
-`avahi-daemon`, `rfkill`, `openssh-server`, `cloud-init` (and its seed files
-on the boot partition), and `userconf-pi` (the first-boot user wizard).
-
-**Enforced, not just configured.** `umik-radio-check.service` asserts at every
-boot that there are no wireless interfaces, no HCI devices, no radio modules,
-no rfkill switches and no radio firmware. `umik-record.service` `Requires=`
-it, so **if a radio is ever live, the box refuses to record.**
-
-### Recorder sandbox
-
-`umik-record.service` runs as an unprivileged `recorder` user under
-`PrivateNetwork=yes` + `IPAddressDeny=any` (it structurally cannot open a
-socket), `ProtectSystem=strict` with `ReadWritePaths=/data`,
-`SystemCallFilter=@system-service`, `MemoryDenyWriteExecute=yes`,
-`DevicePolicy=closed` with only ALSA character devices, and a capability set
-of exactly `CAP_SYS_NICE`.
-
-### Access
-
-No SSH, no network. The console maintenance account (created at inject time)
-works on HDMI + USB keyboard, and on the GPIO serial console (`enable_uart=1`
-is set; with Bluetooth disabled the good PL011 UART serves it). Optionally,
-`/etc/udev/rules.d/99-umik-usb.rules.disabled` can be renamed to default-deny
-every USB device except the UMIK-1 — but that blocks keyboards too, so only
-enable it if you have serial access.
+Happy state at a distance: **green blipping, red solid.**
 
 ---
 
 ## Build
+
+Flash the stock image, drop a provisioning payload on the FAT boot partition
+(which macOS mounts natively), and let the Pi harden itself on first boot:
+
+```
+build/     runs on the Mac      fetch → verify → decompress → flash → inject
+boot/      lands on the card    firstrun.sh + payload/ (services, scripts, config)
+tools/     host-side utilities  umik · umik-ingest.sh · umik-upload.sh ·
+                                umik-verify-s3.sh · umik-viewer.py · repair-wav.sh
+```
 
 ```sh
 ./build/00-fetch-verify.sh              # download + SHA-256 verify
 ./build/01-decompress.sh                # python3 lzma; no xz needed
 diskutil list external physical         # find your card
 ./build/02-flash.sh /dev/diskN          # DESTRUCTIVE; verifies readback
-./build/04-add-data-partition.sh /dev/diskN   # 8GiB root + Mac-readable exFAT data
-./build/03-inject.sh                    # prompts for hostname + console password
+./build/04-add-data-partition.sh /dev/diskN   # 8GiB root + Mac-readable exFAT
+./build/03-inject.sh --unit umik1       # prompts for hostname + console password
 diskutil eject /dev/diskN
 ```
 
-Layout produced: `p1` FAT32 boot · `p2` ext4 root (8 GiB) · `p3` **exFAT
-`UMIKDATA`** — the rest of the card, mounted at `/data` on the Pi and readable
-directly on a Mac. The stock initramfs auto-resize cannot overrun it: `parted
-resizepart` fails harmlessly against a following partition, and firstrun grows
-the root *filesystem* to its 8 GiB with `resize2fs` instead. Skipping step 04
-still works — recordings then live on the ext4 root (not Mac-readable).
+Layout: `p1` FAT32 boot · `p2` ext4 root (8 GiB) · `p3` **exFAT `UMIKDATA`** —
+the rest of the card, mounted at `/data` and readable directly on a Mac. The
+stock auto-resize cannot overrun it (`parted resizepart` fails harmlessly
+against a following partition, and firstrun grows the root filesystem with
+`resize2fs` instead). Skipping step 04 still works; recordings then live on the
+ext4 root, which a Mac cannot read.
 
-Then: card in the Pi, UMIK-1 in a black USB 2.0 port, power on.
+If it doesn't come up, put the card back in the Mac and read
+`/Volumes/bootfs/umik-firstrun.log` — the provisioning log lands on the FAT
+partition precisely so a headless failure stays diagnosable.
 
-First boot expands the filesystem, provisions, and reboots itself (~2–4 min).
-Recording starts automatically on the second boot and on every boot after. If
-it does not come up, put the card back in the Mac and read
-`/Volumes/bootfs/umik-firstrun.log` — the provisioning log is written to the
-FAT partition precisely so a headless failure is still diagnosable.
+**The console password from `03-inject.sh` is the only way into a running box.
+Lose it and you reflash.** Pass `--unit <name>` once per card to name the
+recorder; the name prefixes every session directory and lands in
+`session.json`, which is what keeps multiple units apart in the archive.
 
-The console password prompted for by `03-inject.sh` is the **only** way into
-the running box. Lose it and you reflash.
-
-**Updating an already-provisioned card** (new script versions, tunables):
-put the card in the Mac and re-run `./build/03-inject.sh --reuse-credentials`.
-It re-copies the payload and re-arms firstrun, which re-runs idempotently on
-the next boot and reinstalls everything; the console account, recordings and
+**Updating a provisioned card:** re-run `./build/03-inject.sh
+--reuse-credentials` (or `umik inject`). It re-copies the payload and re-arms
+firstrun, which re-runs idempotently; the console account, recordings and
 session counters are untouched.
 
 ---
@@ -466,313 +298,200 @@ session counters are untouched.
 
 ```
 /data/recordings/
-  000001_20260728T161500Z/
-    session.json               device, calibration gain, format, clock trust, GPS fix
+  umik1_000001_20260728T161500Z/
+    session.json               device, gain, format, clock trust, GPS fix
     seg-20260728-161500.wav    10-minute segments
-    seg-20260728-162500.wav
 ```
-
-`session.json` records the UMIK-1's per-unit **calibration gain**, which the
-mic reports in its USB product string (e.g. `Umik-1  Gain:18dB`).
 
 **Getting audio off — the easy way: a USB stick.** At every boot,
 `umik-usb-detect` waits up to 6 s for a USB drive (exFAT, FAT32 or ext4). If
-one is attached, it is mounted at `/data/usb` and **recordings go to the
-stick**; if not, they go to the SD card. The stick can never *block*
-recording — every failure path falls back to the SD card and says so in the
-journal. `session.json` records which storage each session used, and each
-location keeps its own session counter.
+one is present it is mounted at `/data/usb` and recordings go there; if not,
+they go to the SD card. The stick can never *block* recording — every failure
+path falls back and says so. Each location keeps its own session counter.
 
-Collection loop: **pull power → pull stick → stick in the Mac → `umik
-download` → eject, stick back, power on.** Pulling power first means the
-stick is never yanked mid-write; a power cut costs the usual 1–2 s worst
-case. `umik download` (install once with `./tools/umik link`) runs the
-sealed ingest over every mounted UMIK medium, then clears each recording
-off the medium **only after its archived copy re-verifies by hash** — media
-go back empty, `~/UMIK-Archive` is the truth, and anything unverified stays
-put loudly. `umik inject` is the matching one-word re-provision
-(payload + fresh time-seed, credentials kept); run it before ejecting the
-SD card whenever the payload changed. Pass `--unit umik1` / `--unit umik2`
-once per card to name the recorder: the name prefixes every session
-directory and lands in `session.json`, which is what keeps the two units'
-recordings apart in the archive (`recordings/<unit>/…`) and in S3.
+**Collection loop:** pull power → pull stick → stick in the Mac →
+`umik download` → eject, stick back, power on. Pulling power first means the
+stick is never yanked mid-write.
 
-`umik upload` mirrors the archive to your S3 bucket (or `umik download
---upload` to chain it): dated sessions go under
-`raw/<YYYY-MM-DD>/<unit>/<session>/`, untrusted-clock sessions under
-`raw/undated/<unit>/…` — the date prefix is earned by `clock_trusted`,
-never guessed. Uploads read only the archive, are add-only (no `--delete`,
-IAM key has no DeleteObject) and idempotent; the hash-chained manifest is
-mirrored too, pinning the whole archive history off-site.
+`umik download` seals every mounted medium, then clears each recording **only
+after its archived copy re-verifies by hash** — media go back empty,
+`~/UMIK-Archive` is the truth, and anything unverified stays put loudly.
 
-**Point it at your own bucket first.** There is deliberately no default —
-S3 bucket names are one global namespace, and a repo that shipped one would
-have fresh clones uploading into a stranger's bucket:
+Without a stick, recordings land on the exFAT `UMIKDATA` partition, which
+mounts straight onto a Mac. Only if both are absent do they fall back to the
+ext4 root.
+
+### Why it survives losing power
+
+Yanking the plug gives the OS zero notice — nothing can make a graceful close
+literal. Instead the design makes it not matter: `arecord` rotates and syncs
+every 10 minutes, `vm.dirty_expire_centisecs=200` plus ext4 `commit=1` cap
+unwritten audio at **1–2 seconds**, `fsck.repair=yes` runs each boot, and a
+truncated tail loses nothing but its WAV header — all the audio bytes are on
+disk. Fix one with `./tools/repair-wav.sh path/to/seg-*.wav`; `umik download`
+does it automatically, sealing the repaired copy alongside the byte-exact
+original.
+
+### "It sounds like white noise" — no, it's just quiet
+
+A measurement microphone has low sensitivity (roughly −12 dBFS at 94 dB SPL),
+so a quiet room records around **−70 dBFS RMS**: near-silence at normal volume,
+hiss when cranked — that's the noise floor, not a broken recording. Speech near
+the mic lands at −30 to −18 dBFS. Apply ~+40 dB makeup gain to listen:
+
+```sh
+python3 tools/umik-viewer.py ~/UMIK-Archive     # then open the URL it prints
+```
+
+An offline web UI (python3 + numpy): collection → session → segment, an
+Audacity-style spectrogram, click to move the playhead, play with adjustable
+gain, arrow keys to thumb through segments. Binds `127.0.0.1` only.
+
+---
+
+## S3 mirror
+
+`umik upload` mirrors the archive to your bucket (or `umik download --upload`
+to chain it): dated sessions under `raw/<YYYY-MM-DD>/<unit>/<session>/`,
+untrusted-clock sessions under `raw/undated/<unit>/…` — the date prefix is
+earned by `clock_trusted`, never guessed. Uploads read only the archive, are
+add-only and idempotent; the hash-chained manifest is mirrored too, pinning the
+whole archive history off-site.
+
+**Point it at your own bucket first.** There is deliberately no default — S3
+bucket names are one global namespace, and a shipped default would have fresh
+clones uploading into a stranger's bucket:
 
 ```sh
 cp tools/umik.local.conf.example tools/umik.local.conf   # gitignored
 $EDITOR tools/umik.local.conf                            # set UMIK_S3_BUCKET
 ```
 
-Credentials live in the `umik` AWS profile (`aws configure --profile umik`).
-`umik upload --dry-run` previews without touching the bucket. Anything in the
-environment (`UMIK_ARCHIVE`, `UMIK_S3_BUCKET`, `UMIK_AWS_PROFILE`) overrides
-the config file.
-
-### Proving the bucket holds what you sealed
-
-Completeness is not correctness. `aws s3 sync` decides what to upload from
-size and mtime, and an S3 ETag is a multipart digest that compares to
-nothing — so "the mirror looks complete" never meant "the mirror is correct."
-That gap matters the moment you consider deleting the local archive.
-
-```sh
-umik verify-s3               # stamp what needs it, then verify everything
-umik verify-s3 --dry-run     # report what would be stamped
-umik verify-s3 --verify-only # skip stamping; check what is already stamped
-```
-
-It asks S3 to copy each object onto itself with `--checksum-algorithm
-SHA256`. S3 reads its own stored bytes, computes a whole-object SHA-256, and
-stores it; the tool compares that against the `SHA256SUMS` seals. Because the
-hash is derived from what the bucket actually holds, this is a real
-end-to-end check — **and the data never leaves AWS, so verifying hundreds of
-gigabytes costs API calls instead of egress**. Real output:
-
-```
-==> stamping FULL_OBJECT SHA-256 (server-side, no download; 5 parallel)
-==> processed 1515 of 1515 objects
-==> stamped 648, already full-object 867, failed 0
-==> reading back S3 checksums (5 parallel)
-
-==> VERIFIED (S3 bytes match the seal) : 1515
-==> MISMATCHED                         : 0
-==> expected but absent from S3        : 0
-==> in S3 but not expected locally     : 0
-
-==> ALL 1515 OBJECT(S) VERIFIED against their seals - S3 holds the sealed bytes
-```
-
-It exits non-zero on any mismatch and says, in as many words, not to delete
-the local copy. Run it after each upload; `umik upload` requests SHA-256 on
-transfer too, but multipart uploads yield a *composite* checksum (a hash of
-part hashes) that is **not** comparable to a whole-file seal, so `verify-s3`
-is the authority.
-
-> Note: stamping writes a new object version. On a versioned bucket the
-> previous versions linger and cost storage — add a lifecycle rule expiring
-> noncurrent versions.
-
 <details>
-<summary><b>S3 mirror setup</b> — one-time, or to rebuild on a new Mac</summary>
-
-Replace `YOUR-BUCKET` below with the name you chose.
+<summary><b>Bucket + IAM setup</b> — one-time</summary>
 
 1. Bucket `YOUR-BUCKET`: **Block all public access** on, **versioning** on
-   (versioning is the backstop that makes the add-only design
-   tamper-evident — nothing can be silently clobbered).
-2. IAM user `umik-uploader`, no console access, one access key, with a
-   policy scoped to just this bucket — deliberately **no `s3:DeleteObject`**,
-   so even a stolen laptop's key cannot erase the mirror:
+   (versioning is what makes the add-only design tamper-evident).
+2. IAM user, no console access, one access key, scoped to just this bucket —
+   deliberately **no `s3:DeleteObject`**, so even a stolen laptop's key cannot
+   erase the mirror:
 
    ```json
-   {
-     "Version": "2012-10-17",
+   { "Version": "2012-10-17",
      "Statement": [
        { "Effect": "Allow",
          "Action": ["s3:PutObject", "s3:ListBucket", "s3:GetObject"],
          "Resource": ["arn:aws:s3:::YOUR-BUCKET",
                       "arn:aws:s3:::YOUR-BUCKET/*"] }
-     ]
-   }
+     ] }
    ```
 
-   (`ListBucket`/`GetObject` are what let `aws s3 sync` skip what is
-   already uploaded. `umik verify-s3` needs `PutObject` as well, since the
-   server-side checksum stamp is written as a copy.)
-3. On the Mac: `brew install awscli`, then `aws configure --profile umik`
-   with that key. Then point the tools at it:
-
-   ```sh
-   cp tools/umik.local.conf.example tools/umik.local.conf
-   $EDITOR tools/umik.local.conf          # UMIK_S3_BUCKET=YOUR-BUCKET
-   aws s3 ls s3://YOUR-BUCKET/ --profile umik    # sanity check
-   ```
+   (`ListBucket`/`GetObject` let `aws s3 sync` skip what is already uploaded;
+   `PutObject` also covers `verify-s3`, whose checksum stamp is written as a
+   server-side copy.)
+3. `brew install awscli`, `aws configure --profile umik`, then
+   `aws s3 ls s3://YOUR-BUCKET/ --profile umik` to sanity-check.
 </details>
 
-Without a stick, recordings land on the card's **exFAT `UMIKDATA` partition**
-(when created by step 04), which mounts straight onto a Mac: power off, card
-in the Mac, drag the files. Only if both are absent do recordings fall back
-to the ext4 root, which needs a Linux machine (or console copy) to read.
+### Proving the bucket holds what you sealed
 
-Repair a power-cut tail segment with:
-
-```sh
-./tools/repair-wav.sh path/to/seg-*.wav
-```
-
-### "It sounds like white noise" — no, it's just quiet
-
-The UMIK-1 is a **measurement** microphone with low sensitivity (roughly
-−12 dBFS at 94 dB SPL). A quiet room records around **−70 dBFS RMS**: played
-back at normal volume that is near-silence, and cranked up it sounds like
-hiss — which is the mic's noise floor, not a broken recording. Speech or
-music near the mic lands at healthy −30 to −18 dBFS. Field data verified:
-full 24-bit resolution in use, channels perfectly correlated, real
-room-ambience spectrum. To *listen* to ambience, apply ~+40 dB makeup gain —
-`tools/umik-viewer.py` (spectrogram browser with a gain control) does this
-for you.
-
-### Browsing recordings: the spectrogram viewer
+Completeness is not correctness. `aws s3 sync` decides what to upload from size
+and mtime, and an S3 ETag is a multipart digest comparable to nothing — so "the
+mirror looks complete" never meant "the mirror is correct." That gap matters
+the moment you consider deleting the local archive.
 
 ```sh
-python3 tools/umik-viewer.py "/path/to/collected/data"   # then open the URL it prints
+umik verify-s3                 # stamp what needs it, then verify everything
+umik verify-s3 --dry-run       # report what would be stamped
+umik verify-s3 --verify-only   # check what is already stamped
 ```
 
-A local, offline web UI (needs only python3 + numpy): pick a collection →
-session → segment, see an Audacity-style spectrogram, click to move the
-playhead, play with adjustable makeup gain, arrow keys to thumb through
-segments. Nothing leaves the machine; it binds to 127.0.0.1 only.
+It asks S3 to copy each object onto itself with `--checksum-algorithm SHA256`.
+S3 reads its own stored bytes, computes a whole-object SHA-256 and stores it;
+the tool compares that against the `SHA256SUMS` seals. Because the hash comes
+from what the bucket actually holds, this is a real end-to-end check — **and
+the data never leaves AWS, so verifying hundreds of gigabytes costs API calls
+instead of egress.**
 
-### Chain of custody: sealing recordings for publication
+```
+==> VERIFIED (S3 bytes match the seal) : 1515
+==> MISMATCHED                         : 0
+==> ALL 1515 OBJECT(S) VERIFIED against their seals
+```
 
-`tools/umik-ingest.sh` turns collection into an evidence-grade, fully offline
-pipeline. Install once:
+It exits non-zero on any mismatch and says not to delete the local copy. Run it
+after each upload: `umik upload` requests SHA-256 on transfer too, but
+multipart uploads yield a *composite* checksum (a hash of part hashes) that is
+**not** seal-comparable, so `verify-s3` is the authority.
+
+> Stamping writes a new object version. On a versioned bucket the previous
+> versions linger — add a lifecycle rule expiring noncurrent versions.
+
+---
+
+## Chain of custody
+
+`tools/umik-ingest.sh` makes collection evidence-grade and fully offline.
+`umik download` runs it for you; to seal automatically on every mount:
 
 ```sh
 ./tools/umik-ingest.sh --install-agent
 ```
 
-From then on, whenever the card (or a stick) mounts, every new recording is
-automatically **sealed**: SHA-256 hashed as the bytes stream off the medium,
-copied to `~/UMIK-Archive/`, the copy re-read and verified, and the hash
-recorded in a per-session `SHA256SUMS` (publish it next to the audio — anyone
-verifies with `shasum -a 256 -c SHA256SUMS`) and in an append-only,
-hash-chained manifest. Editing any archived byte or manifest line breaks
-`--verify`. Power-cut tail segments get a sealed `.repaired.wav` derivative;
-the original is kept byte-exact. Card activity logs are snapshotted too.
+Every new recording is SHA-256 hashed **as the bytes stream off the medium**,
+copied to `~/UMIK-Archive/`, re-read and verified, and the hash recorded twice:
+in a per-session `SHA256SUMS` (publish it next to the audio — anyone checks
+with `shasum -a 256 -c SHA256SUMS`) and in an append-only, hash-chained
+manifest whose head commits to every seal ever made. Editing any archived byte
+or manifest line breaks verification. Card activity logs are snapshotted too.
 
 ```sh
-./tools/umik-ingest.sh --verify --deep      # prove the whole archive intact
-./tools/umik-ingest.sh --prune-verified     # free card space, only for files
-                                            # whose seal re-verifies
+umik verify              # check the manifest hash chain
+umik verify --deep       # ...and re-hash every archived byte
 ```
 
-What this proves: the audio is bit-identical from the moment of ingest
-through publication. What it cannot prove: what happened before the card
+**What this proves:** the audio is bit-identical from the moment of ingest
+through publication. **What it cannot prove:** what happened before the card
 reached the Mac — that would require signing on the Pi itself.
-
-### Tunables
-
-Via `systemctl edit umik-record` (`Environment=` lines):
-
-| Variable | Default |
-|---|---|
-| `UMIK_SEGMENT_SECONDS` | `600` |
-| `UMIK_RATE` | `48000` |
-| `UMIK_CHANNELS` | `1` (auto-falls back to `2`, then `1` — many UMIK-1s enumerate as a 2-channel device) |
-| `UMIK_FORMAT` | `S24_3LE S32_LE S16_LE` (first that works) |
-| `UMIK_DATA_DIR` | unset (auto: `/data/usb/recordings` if a stick is mounted, else `/data/recordings`) |
-| `UMIK_MIN_FREE_MB` | `512` |
-| `UMIK_PID` | unset (any miniDSP device) |
-| `UMIK_USB_WAIT` | `6` (seconds to wait for a USB drive; via `systemctl edit umik-usb-detect`) |
-| `UMIK_LOG_INTERVAL` | `60` (seconds between heartbeat log lines) |
-| `UMIK_GPS_WAIT` | `6` (seconds to wait for a USB GPS to enumerate; via `systemctl edit umik-gps-time`) |
-| `UMIK_GPS_FIX_TIMEOUT` | `180` (seconds to wait for a GPS fix before recording starts anyway; raise the unit's `TimeoutStartSec` alongside it) |
-| `UMIK_RTC_WAIT` | `5` (seconds to wait for the DS3231 to appear; via `systemctl edit umik-rtc-time`) |
-| `UMIK_NET_IFACE` | `eth0` (wired interface for the one-time NTP window; via `systemctl edit umik-net-time`) |
-| `UMIK_NET_CARRIER_WAIT` | `10` (seconds to wait for an ethernet carrier before the no-cable no-op) |
-| `UMIK_NET_DHCP_WAIT` | `40` (seconds to wait for a DHCP lease) |
-| `UMIK_NET_NTP_WAIT` | `120` (seconds to wait per sync attempt; raise the unit's `TimeoutStartSec` alongside these) |
-| `UMIK_NET_NTS_SERVER` | `time.cloudflare.com` (NTS-capable server for the authenticated sync) |
-| `UMIK_NET_NTP_SERVER` | `time.google.com` (plain-NTP fallback server) |
-| `UMIK_NET_TLS_HOST` | `https://www.google.com/` (WebPKI host for the fallback's Date cross-check) |
-| `UMIK_NET_TLS_TOLERANCE` | `10` (max seconds of NTP-vs-TLS-date disagreement before the sync is rejected) |
-
-### Activity log
-
-journald is volatile (RAM) on this box, so every service also appends the
-interesting events to a plain-text **`logs/umik.log`** on the same medium as
-the recordings — the stick when recording to the stick, the card's exFAT
-partition otherwise. Open it on the Mac like any text file. It records each
-boot's radio-check verdict, USB-drive detection, GPS detection and clock
-sync (the log's timestamps visibly jump when the clock is stepped — the jump
-*is* the adjustment, documented), mic discovery, session start/stop, and a
-heartbeat line every minute showing the current segment's
-growing size and free space — a stalled recorder is visible as a stopped
-heartbeat. Rotates at 5 MB, keeping one previous file.
 
 ---
 
 ## Command reference
 
-Everything Mac-side is one command. Install it once:
-
 ```sh
-./tools/umik link        # symlinks `umik` into the first writable dir on PATH
+./tools/umik link        # symlink `umik` into the first writable dir on PATH
 ```
 
 | Command | What it does |
 |---|---|
-| `umik download` | Seal every mounted medium into the archive, verify, then clear the medium |
+| `umik download` | Seal every mounted medium into the archive, verify, clear the medium |
 | `umik download --upload` | ...and mirror to S3 afterwards |
 | `umik upload` | Mirror the archive to S3 (add-only, idempotent) |
 | `umik upload --dry-run` | Show what would upload, touch nothing |
-| `umik verify` | Re-verify the manifest hash chain |
-| `umik verify --deep` | ...and re-hash every archived byte |
+| `umik verify` | Re-verify the manifest hash chain (`--deep` re-hashes everything) |
 | `umik verify-s3` | Prove the bucket holds the sealed bytes (server-side, no egress) |
 | `umik inject --unit umik1` | Re-provision a mounted card, keeping its console account |
-| `umik link` | Install the command on PATH |
 
-### A collection, start to finish
+A collection, start to finish:
 
 ```console
 $ umik download
 
 === /Volumes/UMIK2 ===
-    ingest start: /Volumes/UMIK2 -> /Users/you/UMIK-Archive (volume 'UMIK2')
     sealed recordings/umik2/umik2_000012_.../seg-20260816-190515.wav (172800044 bytes)
     ...
-    sealed seg-20260817-182527.repaired.wav (repaired header derivative)
     ingest done: 142 sealed, 1 repaired derivative(s), 0 already sealed, 0 warning(s)
 ==> pruned 142 verified file(s) from /Volumes/UMIK2, kept 0
 === /Volumes/UMIK2: downloaded + cleared; safe to eject ===
 
-archive: /Users/you/UMIK-Archive
-eject with: diskutil eject /Volumes/<name>   (or Finder)
-```
-
-Nothing is deleted from the stick until its archived copy re-hashes to the
-same value. If any file fails, the medium is left **entirely** untouched and
-the run says so loudly.
-
-```console
 $ umik verify
 ==> manifest chain OK: 1468 seals, head fd3acd610c7dca14caec76d58415ac0ba4cb0c4501d18eaabc285ae08ce36494
 ```
 
-That head hash commits to every seal ever made. Publish it — a dated head
-pins the entire archive history, and any later edit to any archived byte or
-manifest line breaks the chain.
+That head hash commits to every seal ever made — publish it, and any later edit
+to any archived byte breaks the chain.
 
-```console
-$ umik upload
-==> umik1/umik1_000029_...: 222 file(s) -> s3://YOUR-BUCKET/raw/2026-08-15/umik1/...
-==> manifest + head + ingest.log -> s3://YOUR-BUCKET/manifest/ (head fd3acd61...)
-==> done: 26 session(s) scanned, 224 file(s) uploaded, 0 failure(s)
-```
-
-### Inspecting what you recorded
-
-```sh
-python3 tools/umik-viewer.py ~/UMIK-Archive     # spectrogram browser on 127.0.0.1
-./tools/repair-wav.sh path/to/seg-*.wav         # fix a power-cut tail by hand
-shasum -a 256 -c SHA256SUMS                     # anyone can check a published session
-```
-
-`session.json` in every session directory is the metadata of record — device,
-calibration gain, sample format, clock trust and its source, GPS fix if there
-was one:
+`session.json` is the metadata of record:
 
 ```json
 {
@@ -788,86 +507,162 @@ was one:
 
 ---
 
-## Status (2026-08-18)
+## Security design
 
-Two units have been running this in the field. Nothing below is aspirational.
+### Radio silence: four independent layers
 
-**Field-verified**: capture and format probe, segmentation, stick-vs-card
+Any one would suffice; all four are applied.
+
+1. **Device tree** — `dtoverlay=disable-wifi`, `dtoverlay=disable-bt`. The
+   hardware isn't present, so no driver can bind.
+2. **Boot blacklist** — `modprobe.blacklist=brcmfmac,cfg80211,bluetooth,btusb,…`
+3. **`install <mod> /bin/false`** — a blacklist only stops *automatic* loading;
+   this makes even a deliberate `modprobe` fail.
+4. **Firmware gone** — `firmware-brcm80211` and `bluez-firmware` purged, the
+   Broadcom blobs deleted. Nothing remains to load into the radio.
+
+Also purged: `bluez`, `wpasupplicant`, `network-manager`, `avahi-daemon`,
+`rfkill`, `openssh-server`, `cloud-init`, `userconf-pi`.
+
+**Enforced, not just configured.** `umik-radio-check.service` asserts at every
+boot that there are no wireless interfaces, HCI devices, radio modules, rfkill
+switches or radio firmware — and `umik-record.service` `Requires=` it, so **if
+a radio is ever live, the box refuses to record.**
+
+### The one-time network window
+
+Nothing on the image can accept a login over a network: `openssh-server` is
+purged from disk, and no TCP service listens. `umik-net-time` additionally
+installs a drop-all inbound nftables policy *before* the link comes up — the
+box originates DHCP and NTP and accepts only conntrack-matched replies. No ping
+answers, no TCP resets. A port scan during the window sees a black hole (ARP
+aside — the price of speaking IP). IPv6 is disabled wholesale; outside the
+window the interface is administratively down, so plugging a cable into a
+running box does nothing.
+
+### Recorder sandbox
+
+`umik-record.service` runs as an unprivileged `recorder` user under
+`PrivateNetwork=yes` + `IPAddressDeny=any` (it structurally cannot open a
+socket), `ProtectSystem=strict` with `ReadWritePaths=/data`,
+`SystemCallFilter=@system-service`, `MemoryDenyWriteExecute=yes`,
+`DevicePolicy=closed` with only ALSA character devices, and exactly
+`CAP_SYS_NICE`.
+
+### Access, and the supply chain
+
+No SSH, no network. The console account works on HDMI + USB keyboard and on the
+GPIO serial console. Optionally,
+`/etc/udev/rules.d/99-umik-usb.rules.disabled` can be renamed to default-deny
+every USB device except the mic — but that blocks keyboards too, so enable it
+only with serial access.
+
+The Pi OS image is verified over HTTPS (TLS ≥1.2, mandatory cert validation)
+plus SHA-256 against the published checksum; everything else is already inside
+that verified image. `fetch()` in `build/lib.sh` is the single network entry
+point, with no `-k` and no way to disable certificate validation. Nothing is
+injected that isn't in this repo — no third-party scripts, no `curl | bash` —
+and because `alsa-utils` ships in Trixie Lite, **the Pi never touches a network
+to provision.**
+
+**Known gap:** the detached GPG signature is downloaded but not checked (this
+host has no `gpg`, and bootstrapping it would rest on nothing stronger than the
+TLS + SHA-256 already used). With a trusted keyring:
+`gpg --verify <image>.img.xz.sig <image>.img.xz`.
+
+---
+
+## Tunables
+
+Via `systemctl edit umik-record` (or the named unit), as `Environment=` lines:
+
+| Variable | Default |
+|---|---|
+| `UMIK_VID` | `2752` (miniDSP). Any vendor ID, or `any` for the first USB capture device |
+| `UMIK_PID` | unset (any product from that vendor) |
+| `UMIK_SEGMENT_SECONDS` | `600` |
+| `UMIK_RATE` | `48000` |
+| `UMIK_CHANNELS` | `1` (falls back to `2`, then `1`) |
+| `UMIK_FORMAT` | `S24_3LE S32_LE S16_LE` (first that works) |
+| `UMIK_DATA_DIR` | unset (auto: stick if mounted, else SD) |
+| `UMIK_MIN_FREE_MB` | `512` |
+| `UMIK_LOG_INTERVAL` | `60` (heartbeat seconds) |
+| `UMIK_USB_WAIT` | `6` (via `umik-usb-detect`) |
+| `UMIK_GPS_WAIT` / `UMIK_GPS_FIX_TIMEOUT` | `6` / `180` (via `umik-gps-time`) |
+| `UMIK_RTC_WAIT` | `5` (via `umik-rtc-time`) |
+| `UMIK_NET_IFACE` | `eth0` (via `umik-net-time`) |
+| `UMIK_NET_CARRIER_WAIT` / `DHCP_WAIT` / `NTP_WAIT` | `10` / `40` / `120` |
+| `UMIK_NET_NTS_SERVER` | `time.cloudflare.com` |
+| `UMIK_NET_NTP_SERVER` | `time.google.com` |
+| `UMIK_NET_TLS_HOST` / `TLS_TOLERANCE` | `https://www.google.com/` / `10` s |
+
+Raise the unit's `TimeoutStartSec` alongside any wait you increase.
+
+**Activity log.** journald is volatile (RAM) here, so every service also appends
+to a plain-text `logs/umik.log` on the same medium as the recordings. It records
+each boot's radio-check verdict, USB and GPS detection, clock sync (timestamps
+visibly jump when the clock is stepped — the jump *is* the adjustment), mic
+discovery, session start/stop, and a heartbeat every minute showing segment
+size and free space. A stalled recorder shows as a stopped heartbeat. Rotates
+at 5 MB, keeping one previous file.
+
+---
+
+## Status
+
+Two units have run this in the field. Nothing here is aspirational.
+
+**Field-verified:** capture and format probe, segmentation, stick-vs-card
 fallback, heartbeat, logs, diag, sealed ingest (every sampled segment
-bit-clean), Mac time-seed floor, LED status display, unit naming,
-`umik download` / `umik upload` end-to-end (dated + undated S3 prefixes
-both exercised 2026-08-12), GPS time sync from a position fix (umik1,
-2026-08-11: fix in 1 s with a warm module, session dir named with real
-UTC, red LED solid).
+bit-clean), Mac time-seed floor, LED status, unit naming, `umik download` /
+`umik upload` end-to-end with both dated and undated S3 prefixes, and GPS time
+sync from a position fix (fix in 1 s with a warm module).
 
 **The RTC design proved out unattended (2026-08-17).** Both units ran long
-sessions with *nothing attached* — no cable, no GPS — and came back with
-`time_source: "rtc"`, `clock_trusted: true`: 23.4 h / 141 segments on umik2,
-36.4 h / 219 segments on umik1. Across both runs the Pi's own timestamps
-matched the collecting Mac's clock to the second, so DS3231 drift over a day
-and a half was below one second. 362 files sealed, zero warnings, both sticks
-verified and cleared.
+sessions with *nothing attached* and returned `time_source: "rtc"`,
+`clock_trusted: true` — 23.4 h / 141 segments on one, 36.4 h / 219 segments on
+the other. Across both runs the Pi's timestamps matched the collecting Mac's
+clock to the second, so drift over a day and a half was under one second. 362
+files sealed, zero warnings.
 
-**The S3 mirror is now provably correct (2026-08-18).** `umik verify-s3`
-stamped and checked all 1515 objects against their seals: 1515 verified, 0
-mismatched. Before this, only completeness had ever been checked, never
-content.
+**The S3 mirror is provably correct (2026-08-18).** `umik verify-s3` stamped
+and checked all 1515 objects against their seals: 1515 verified, 0 mismatched.
+Previously only completeness had ever been checked, never content.
 
-**Field-FAILED and pivoted from:** GPS→RTC disciplining. The 2026-08-11
-outdoor boot got its fix but `hwclock --systohc` failed with its error
-discarded (`2>/dev/null`), so the DS3231 stayed at its 2000-01-01 default
-and the next indoor boot fell back to the seed, red LED blinking. Both RTC
-writers now capture hwclock's error text, and the primary time-set path is
-now **wired NTP** (`umik-net-time`, one ethernet-cable boot) instead of an
-outdoor GPS boot. The first bench run of that window (2026-08-12, NTS sync
-verified end-to-end) also caught the culprit at last: `hwclock: not found`
-— **Pi OS Lite doesn't ship hwclock** (Debian split it into
-`util-linux-extra`), so the GPS boot never stood a chance. The window now
-installs `util-linux-extra` alongside chrony.
+**Field-failed and pivoted from:** GPS→RTC disciplining. An outdoor boot got
+its fix but `hwclock --systohc` failed with its error discarded, so the DS3231
+stayed at its 2000-01-01 default. Both RTC writers now capture hwclock's error
+text — which promptly exposed the real culprit: `hwclock: not found`, because
+**Pi OS Lite doesn't ship it** (Debian split it into `util-linux-extra`). The
+GPS boot never stood a chance. The network window now installs it alongside
+chrony, and wired NTP replaced GPS as the primary time source.
 
-Open items:
+Open:
 
-- [x] Bench-verify `umik-net-time` on umik1 (2026-08-12): chrony installed
-      through the window, "clock SET from time.cloudflare.com via NTS",
-      red solid — and the captured hwclock error exposed the missing
-      `util-linux-extra`.
-- [x] Second cable boot after the util-linux-extra fix (2026-08-12):
-      "RTC disciplined from nts time", `rtc0/since_epoch` ticking true in
-      2026.
-- [x] RTC carry verified (2026-08-12): next boot, no network sync — "clock
-      SET from battery-backed RTC ... TRUSTED" at 6 s uptime, red solid,
-      `moved 0s`. Unit 1's clock chain is done: nothing stays plugged in.
-- [x] umik2 cable boot (2026-08-12): its DS3231 was already seated and
-      ticking; same two-act proof as umik1.
-- [x] DS3231 field test (2026-08-17): both units ran a day-plus on RTC time
-      alone with nothing attached. Note: a Pi 5's built-in RTC should work
-      identically (same kernel interface) minus the overlay — untested.
-- [x] Prove S3 holds the sealed bytes, not just files of the right size
-      (2026-08-18): `umik verify-s3`, all 1515 objects.
 - [ ] GPG signature verification (needs a trusted keyring on the Mac).
-- [ ] Lifecycle rule to expire noncurrent S3 versions — `verify-s3` stamping
-      writes a new version of each object, and the uploader IAM user has no
-      DeleteObject by design, so this needs admin credentials.
-- [ ] `umik-viewer.py` reads a local directory only; browsing straight from
-      S3 would need a fetch step.
-- [ ] Optional field-power trim (powersave governor, Ethernet kill):
-      ~15–20% more battery runtime.
+- [ ] Lifecycle rule to expire noncurrent S3 versions (needs admin credentials;
+      the uploader IAM user has no DeleteObject by design).
+- [ ] `umik-viewer.py` reads a local directory only; browsing straight from S3
+      would need a fetch step.
+- [ ] Optional field-power trim (powersave governor, Ethernet kill): ~15–20%
+      more battery runtime.
 - [ ] Optional UPS/supercap HAT for a truly graceful close.
-- [ ] Root-cause the one crash-loop boot (`c1f05d17`, first field run);
-      mitigations are in, and it has not recurred in any collection since.
+- [ ] Root-cause one crash-loop boot from the first field run; mitigations are
+      in and it has not recurred since.
+- [ ] A Pi 5's built-in RTC should work identically (same kernel interface)
+      minus the overlay — untested.
 
 ---
 
 ## Contributing and license
 
-Issues and pull requests are welcome, particularly field reports: what
-hardware you ran it on, and what broke. Much of what is documented here was
-learned by something failing in a field, so that kind of report is the most
-useful thing you can send.
+Issues and pull requests welcome, particularly field reports: what hardware you
+ran it on, and what broke. Most of what is documented here was learned by
+something failing in a field, so those are the most useful reports to send.
 
-If you fork this for a different microphone, the mic-specific parts are
-narrow — `umik-record` matches USB vendor `2752` and probes formats; the
-air-gap, timestamp-trust and sealing layers do not care what is recording.
+Forking for a different microphone is a config change, not a rewrite — see
+[Using a different microphone](#using-a-different-microphone). The air-gap,
+timestamp-trust and sealing layers do not care what is recording.
 
 **License:** MIT — see [`LICENSE`](LICENSE). Use it, fork it, sell it; just
 keep the copyright notice. It comes with no warranty, which for a device you
