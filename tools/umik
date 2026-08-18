@@ -7,7 +7,8 @@
 #                   off the medium. Media go back empty; the archive is
 #                   the truth. Anything that fails verification is kept
 #                   in place and said so, loudly.
-#   umik upload     mirror the archive to S3 (YOUR-BUCKET):
+#   umik upload     mirror the archive to your S3 bucket (set UMIK_S3_BUCKET
+#                   in tools/umik.local.conf - see umik.local.conf.example):
 #                   raw/<date>/<unit>/<session>/ for GPS-dated sessions,
 #                   raw/undated/<unit>/... otherwise. Add-only, idempotent.
 #                   `umik download --upload` chains it after a download.

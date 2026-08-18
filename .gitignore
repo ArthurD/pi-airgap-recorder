@@ -4,5 +4,8 @@ cache/
 # Local Claude Code settings
 .claude/settings.local.json
 
+# Local S3 settings (your bucket name); copy from umik.local.conf.example
+tools/umik.local.conf
+
 # macOS Finder droppings
 .DS_Store

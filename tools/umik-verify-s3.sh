@@ -31,9 +31,17 @@
 
 set -uo pipefail
 
-ARCHIVE="${UMIK_ARCHIVE:-$HOME/UMIK-Archive}"
-BUCKET="${UMIK_S3_BUCKET:-YOUR-BUCKET}"
-PROFILE="${UMIK_AWS_PROFILE:-umik}"
+TOOLS_DIR=$(cd "$(dirname "$0")" && pwd)
+
+# Same precedence as umik-upload.sh: environment, then the untracked local
+# config, then nothing. No bucket default ships in a public repo.
+_ENV_ARCHIVE=${UMIK_ARCHIVE-}; _ENV_BUCKET=${UMIK_S3_BUCKET-}; _ENV_PROFILE=${UMIK_AWS_PROFILE-}
+CONF="${UMIK_CONF:-$TOOLS_DIR/umik.local.conf}"
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+ARCHIVE="${_ENV_ARCHIVE:-${UMIK_ARCHIVE:-$HOME/UMIK-Archive}}"
+BUCKET="${_ENV_BUCKET:-${UMIK_S3_BUCKET:-}}"
+PROFILE="${_ENV_PROFILE:-${UMIK_AWS_PROFILE:-umik}}"
 JOBS="${UMIK_JOBS:-5}"
 
 # S3 throttles a burst of server-side copies of 86-173 MB objects, and a bare
@@ -70,6 +78,8 @@ say() { echo "==> $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 command -v aws >/dev/null 2>&1 || die "aws CLI not found"
+[ -n "$BUCKET" ] || die "no S3 bucket configured - copy tools/umik.local.conf.example to
+       $CONF and set UMIK_S3_BUCKET (or export it)"
 [ -d "$ARCHIVE/recordings" ] || die "no archive at $ARCHIVE/recordings"
 
 json_str() { sed -n "s/.*\"$2\": *\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | head -1; }

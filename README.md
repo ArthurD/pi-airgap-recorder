@@ -1,12 +1,83 @@
-# umik-autorecord
+# pi-airgap-recorder
 
 A burnable Raspberry Pi 4B image that records continuously from a miniDSP
 UMIK-1 measurement microphone from the moment it is powered on, with no
 Wi-Fi, no Bluetooth, no SSH and no network of any kind.
 
-Power on → recording. Pull the plug → recording stops. Nothing else.
+**Power on → recording. Pull the plug → recording stops. Nothing else.**
+
+There is no app, no pairing step, no configuration on the device, and no way
+to log into it over a network — because there is no network. You build the
+card on a Mac, put it in the Pi, and give it power. Everything after that is
+LEDs and files.
+
+### What makes it different from "a Pi with `arecord` in rc.local"
+
+| | |
+|---|---|
+| **Air-gapped by construction** | Radio hardware disabled in the device tree, drivers blacklisted *and* stubbed, firmware blobs deleted, `openssh-server` purged from disk. A boot-time check asserts all of it, and **the recorder refuses to start if any radio is live**. |
+| **Honest timestamps** | A clock is only trusted on anchored evidence — NTS-authenticated NTP over one ethernet boot, GPS, or a DS3231 RTC proven to have ticked continuously. Guessing is treated as a bug; `clock_trusted: false` is a valid, common answer. |
+| **Survives the plug being pulled** | 10-minute segments, dirty data capped at 1–2 s, `fsck.repair` on boot, and a repair tool for the truncated tail. Worst case is 1–2 seconds of audio. |
+| **Chain-of-custody ingest** | Recordings are SHA-256 sealed as they stream off the medium into an append-only, hash-chained manifest, and only deleted from the card once the archived copy re-verifies. |
+| **Verifiable off-site backup** | An optional S3 mirror whose bytes can be proven — server-side — to match the seals, without downloading them back. |
+
+### Who this is for
+
+People who need a recording to be *defensible* as well as audible: acoustic
+and noise surveys, long-baseline environmental monitoring, evidence capture,
+or anyone who wants a device that provably cannot phone home. It is equally
+usable as a plain unattended field recorder — ignore the S3 and sealing
+sections and it is still just "power on, record."
+
+### Requirements
+
+A Raspberry Pi 4B, a miniDSP UMIK-1, an SD card, and **a Mac to build the
+card** (the build scripts use `diskutil` and Apple's `hdiutil`/`shasum`; the
+on-Pi half is plain Debian and portable). Optional: a USB stick for
+recordings, a DS3231 RTC module, a USB GPS receiver, an AWS account.
+
+> **Recording law is your responsibility.** In many places recording people
+> without consent is illegal, and the rules differ by country and by state.
+> This tool makes recordings hard to dispute; it does not make them lawful.
+> Know your jurisdiction before you deploy it.
 
 ---
+
+## Quick start
+
+Build the card on a Mac (about 15 minutes, most of it downloading):
+
+```sh
+git clone https://github.com/<you>/pi-airgap-recorder.git
+cd pi-airgap-recorder
+
+./build/00-fetch-verify.sh                     # download Pi OS + verify SHA-256
+./build/01-decompress.sh                       # no `xz` binary needed
+diskutil list external physical                # find your card, e.g. /dev/disk4
+./build/02-flash.sh /dev/disk4                 # DESTRUCTIVE; verifies readback
+./build/04-add-data-partition.sh /dev/disk4    # 8GiB root + Mac-readable exFAT
+./build/03-inject.sh --unit umik1               # prompts for hostname + password
+diskutil eject /dev/disk4
+```
+
+Card into the Pi, UMIK-1 into a **black USB 2.0 port**, power on. First boot
+provisions and reboots itself (~2–4 min); recording starts on the second boot
+and every boot after.
+
+**Check it is working from across the room:** green LED blipping every 2 s
+means audio is verifiably hitting the disk. Red LED solid means the clock is
+trusted.
+
+Collect the audio:
+
+```sh
+./tools/umik link            # install the `umik` command once
+# pull power → pull the stick → stick into the Mac
+umik download                # seal, verify, then clear the stick
+```
+
+That is the whole loop. Everything below is detail, options, and the
+reasoning behind the defaults.
 
 ## Hardware
 
@@ -426,25 +497,80 @@ once per card to name the recorder: the name prefixes every session
 directory and lands in `session.json`, which is what keeps the two units'
 recordings apart in the archive (`recordings/<unit>/…`) and in S3.
 
-`umik upload` mirrors the archive to `s3://YOUR-BUCKET` (or
-`umik download --upload` to chain it): GPS-dated sessions go under
+`umik upload` mirrors the archive to your S3 bucket (or `umik download
+--upload` to chain it): dated sessions go under
 `raw/<YYYY-MM-DD>/<unit>/<session>/`, untrusted-clock sessions under
 `raw/undated/<unit>/…` — the date prefix is earned by `clock_trusted`,
 never guessed. Uploads read only the archive, are add-only (no `--delete`,
 IAM key has no DeleteObject) and idempotent; the hash-chained manifest is
-mirrored too, pinning the whole archive history off-site. Credentials live
-in the `umik` AWS profile (`aws configure --profile umik`).
-`umik upload --dry-run` previews without touching the bucket. Mac-side
-overrides (env): `UMIK_ARCHIVE` (default `~/UMIK-Archive`),
-`UMIK_S3_BUCKET` (default `YOUR-BUCKET`), `UMIK_AWS_PROFILE`
-(default `umik`).
+mirrored too, pinning the whole archive history off-site.
+
+**Point it at your own bucket first.** There is deliberately no default —
+S3 bucket names are one global namespace, and a repo that shipped one would
+have fresh clones uploading into a stranger's bucket:
+
+```sh
+cp tools/umik.local.conf.example tools/umik.local.conf   # gitignored
+$EDITOR tools/umik.local.conf                            # set UMIK_S3_BUCKET
+```
+
+Credentials live in the `umik` AWS profile (`aws configure --profile umik`).
+`umik upload --dry-run` previews without touching the bucket. Anything in the
+environment (`UMIK_ARCHIVE`, `UMIK_S3_BUCKET`, `UMIK_AWS_PROFILE`) overrides
+the config file.
+
+### Proving the bucket holds what you sealed
+
+Completeness is not correctness. `aws s3 sync` decides what to upload from
+size and mtime, and an S3 ETag is a multipart digest that compares to
+nothing — so "the mirror looks complete" never meant "the mirror is correct."
+That gap matters the moment you consider deleting the local archive.
+
+```sh
+umik verify-s3               # stamp what needs it, then verify everything
+umik verify-s3 --dry-run     # report what would be stamped
+umik verify-s3 --verify-only # skip stamping; check what is already stamped
+```
+
+It asks S3 to copy each object onto itself with `--checksum-algorithm
+SHA256`. S3 reads its own stored bytes, computes a whole-object SHA-256, and
+stores it; the tool compares that against the `SHA256SUMS` seals. Because the
+hash is derived from what the bucket actually holds, this is a real
+end-to-end check — **and the data never leaves AWS, so verifying hundreds of
+gigabytes costs API calls instead of egress**. Real output:
+
+```
+==> stamping FULL_OBJECT SHA-256 (server-side, no download; 5 parallel)
+==> processed 1515 of 1515 objects
+==> stamped 648, already full-object 867, failed 0
+==> reading back S3 checksums (5 parallel)
+
+==> VERIFIED (S3 bytes match the seal) : 1515
+==> MISMATCHED                         : 0
+==> expected but absent from S3        : 0
+==> in S3 but not expected locally     : 0
+
+==> ALL 1515 OBJECT(S) VERIFIED against their seals - S3 holds the sealed bytes
+```
+
+It exits non-zero on any mismatch and says, in as many words, not to delete
+the local copy. Run it after each upload; `umik upload` requests SHA-256 on
+transfer too, but multipart uploads yield a *composite* checksum (a hash of
+part hashes) that is **not** comparable to a whole-file seal, so `verify-s3`
+is the authority.
+
+> Note: stamping writes a new object version. On a versioned bucket the
+> previous versions linger and cost storage — add a lifecycle rule expiring
+> noncurrent versions.
 
 <details>
 <summary><b>S3 mirror setup</b> — one-time, or to rebuild on a new Mac</summary>
 
-1. Bucket `YOUR-BUCKET`: **Block all public access** on,
-   **versioning** on (versioning is the backstop that makes the add-only
-   design tamper-evident — nothing can be silently clobbered).
+Replace `YOUR-BUCKET` below with the name you chose.
+
+1. Bucket `YOUR-BUCKET`: **Block all public access** on, **versioning** on
+   (versioning is the backstop that makes the add-only design
+   tamper-evident — nothing can be silently clobbered).
 2. IAM user `umik-uploader`, no console access, one access key, with a
    policy scoped to just this bucket — deliberately **no `s3:DeleteObject`**,
    so even a stolen laptop's key cannot erase the mirror:
@@ -462,10 +588,16 @@ overrides (env): `UMIK_ARCHIVE` (default `~/UMIK-Archive`),
    ```
 
    (`ListBucket`/`GetObject` are what let `aws s3 sync` skip what is
-   already uploaded.)
+   already uploaded. `umik verify-s3` needs `PutObject` as well, since the
+   server-side checksum stamp is written as a copy.)
 3. On the Mac: `brew install awscli`, then `aws configure --profile umik`
-   with that key. Sanity check:
-   `aws s3 ls s3://YOUR-BUCKET/ --profile umik`.
+   with that key. Then point the tools at it:
+
+   ```sh
+   cp tools/umik.local.conf.example tools/umik.local.conf
+   $EDITOR tools/umik.local.conf          # UMIK_S3_BUCKET=YOUR-BUCKET
+   aws s3 ls s3://YOUR-BUCKET/ --profile umik    # sanity check
+   ```
 </details>
 
 Without a stick, recordings land on the card's **exFAT `UMIKDATA` partition**
@@ -572,7 +704,93 @@ heartbeat. Rotates at 5 MB, keeping one previous file.
 
 ---
 
-## Status (2026-08-12)
+## Command reference
+
+Everything Mac-side is one command. Install it once:
+
+```sh
+./tools/umik link        # symlinks `umik` into the first writable dir on PATH
+```
+
+| Command | What it does |
+|---|---|
+| `umik download` | Seal every mounted medium into the archive, verify, then clear the medium |
+| `umik download --upload` | ...and mirror to S3 afterwards |
+| `umik upload` | Mirror the archive to S3 (add-only, idempotent) |
+| `umik upload --dry-run` | Show what would upload, touch nothing |
+| `umik verify` | Re-verify the manifest hash chain |
+| `umik verify --deep` | ...and re-hash every archived byte |
+| `umik verify-s3` | Prove the bucket holds the sealed bytes (server-side, no egress) |
+| `umik inject --unit umik1` | Re-provision a mounted card, keeping its console account |
+| `umik link` | Install the command on PATH |
+
+### A collection, start to finish
+
+```console
+$ umik download
+
+=== /Volumes/UMIK2 ===
+    ingest start: /Volumes/UMIK2 -> /Users/you/UMIK-Archive (volume 'UMIK2')
+    sealed recordings/umik2/umik2_000012_.../seg-20260816-190515.wav (172800044 bytes)
+    ...
+    sealed seg-20260817-182527.repaired.wav (repaired header derivative)
+    ingest done: 142 sealed, 1 repaired derivative(s), 0 already sealed, 0 warning(s)
+==> pruned 142 verified file(s) from /Volumes/UMIK2, kept 0
+=== /Volumes/UMIK2: downloaded + cleared; safe to eject ===
+
+archive: /Users/you/UMIK-Archive
+eject with: diskutil eject /Volumes/<name>   (or Finder)
+```
+
+Nothing is deleted from the stick until its archived copy re-hashes to the
+same value. If any file fails, the medium is left **entirely** untouched and
+the run says so loudly.
+
+```console
+$ umik verify
+==> manifest chain OK: 1468 seals, head fd3acd610c7dca14caec76d58415ac0ba4cb0c4501d18eaabc285ae08ce36494
+```
+
+That head hash commits to every seal ever made. Publish it — a dated head
+pins the entire archive history, and any later edit to any archived byte or
+manifest line breaks the chain.
+
+```console
+$ umik upload
+==> umik1/umik1_000029_...: 222 file(s) -> s3://YOUR-BUCKET/raw/2026-08-15/umik1/...
+==> manifest + head + ingest.log -> s3://YOUR-BUCKET/manifest/ (head fd3acd61...)
+==> done: 26 session(s) scanned, 224 file(s) uploaded, 0 failure(s)
+```
+
+### Inspecting what you recorded
+
+```sh
+python3 tools/umik-viewer.py ~/UMIK-Archive     # spectrogram browser on 127.0.0.1
+./tools/repair-wav.sh path/to/seg-*.wav         # fix a power-cut tail by hand
+shasum -a 256 -c SHA256SUMS                     # anyone can check a published session
+```
+
+`session.json` in every session directory is the metadata of record — device,
+calibration gain, sample format, clock trust and its source, GPS fix if there
+was one:
+
+```json
+{
+  "session": "000029",
+  "unit": "umik1",
+  "started_utc": "20260815T235050Z",
+  "clock_trusted": true,
+  "time_source": "rtc",
+  "rtc": { "present": true, "trusted": true, "note": "clock set from disciplined RTC" },
+  "format": { "encoding": "S24_3LE", "sample_rate": 48000, "channels": 1 }
+}
+```
+
+---
+
+## Status (2026-08-18)
+
+Two units have been running this in the field. Nothing below is aspirational.
 
 **Field-verified**: capture and format probe, segmentation, stick-vs-card
 fallback, heartbeat, logs, diag, sealed ingest (every sampled segment
@@ -581,6 +799,19 @@ bit-clean), Mac time-seed floor, LED status display, unit naming,
 both exercised 2026-08-12), GPS time sync from a position fix (umik1,
 2026-08-11: fix in 1 s with a warm module, session dir named with real
 UTC, red LED solid).
+
+**The RTC design proved out unattended (2026-08-17).** Both units ran long
+sessions with *nothing attached* — no cable, no GPS — and came back with
+`time_source: "rtc"`, `clock_trusted: true`: 23.4 h / 141 segments on umik2,
+36.4 h / 219 segments on umik1. Across both runs the Pi's own timestamps
+matched the collecting Mac's clock to the second, so DS3231 drift over a day
+and a half was below one second. 362 files sealed, zero warnings, both sticks
+verified and cleared.
+
+**The S3 mirror is now provably correct (2026-08-18).** `umik verify-s3`
+stamped and checked all 1515 objects against their seals: 1515 verified, 0
+mismatched. Before this, only completeness had ever been checked, never
+content.
 
 **Field-FAILED and pivoted from:** GPS→RTC disciplining. The 2026-08-11
 outdoor boot got its fix but `hwclock --systohc` failed with its error
@@ -606,15 +837,37 @@ Open items:
 - [x] RTC carry verified (2026-08-12): next boot, no network sync — "clock
       SET from battery-backed RTC ... TRUSTED" at 6 s uptime, red solid,
       `moved 0s`. Unit 1's clock chain is done: nothing stays plugged in.
-- [ ] umik2: seat its DS3231 module, then same cable boot.
-- [ ] DS3231 field test (support is built, modules on hand): re-inject,
-      mount a module, one outdoor GPS boot, then confirm a GPS-less boot
-      shows red-solid and `time_source: "rtc"`. Note: a Pi 5's built-in
-      RTC should work identically (same kernel interface) minus the
-      overlay — untested.
+- [x] umik2 cable boot (2026-08-12): its DS3231 was already seated and
+      ticking; same two-act proof as umik1.
+- [x] DS3231 field test (2026-08-17): both units ran a day-plus on RTC time
+      alone with nothing attached. Note: a Pi 5's built-in RTC should work
+      identically (same kernel interface) minus the overlay — untested.
+- [x] Prove S3 holds the sealed bytes, not just files of the right size
+      (2026-08-18): `umik verify-s3`, all 1515 objects.
 - [ ] GPG signature verification (needs a trusted keyring on the Mac).
+- [ ] Lifecycle rule to expire noncurrent S3 versions — `verify-s3` stamping
+      writes a new version of each object, and the uploader IAM user has no
+      DeleteObject by design, so this needs admin credentials.
+- [ ] `umik-viewer.py` reads a local directory only; browsing straight from
+      S3 would need a fetch step.
 - [ ] Optional field-power trim (powersave governor, Ethernet kill):
       ~15–20% more battery runtime.
 - [ ] Optional UPS/supercap HAT for a truly graceful close.
 - [ ] Root-cause the one crash-loop boot (`c1f05d17`, first field run);
-      mitigations are in — check `logs/umik.log.1` next collection.
+      mitigations are in, and it has not recurred in any collection since.
+
+---
+
+## Contributing and license
+
+Issues and pull requests are welcome, particularly field reports: what
+hardware you ran it on, and what broke. Much of what is documented here was
+learned by something failing in a field, so that kind of report is the most
+useful thing you can send.
+
+If you fork this for a different microphone, the mic-specific parts are
+narrow — `umik-record` matches USB vendor `2752` and probes formats; the
+air-gap, timestamp-trust and sealing layers do not care what is recording.
+
+**License:** see `LICENSE`. Note that without one, default copyright applies
+and nobody may reuse this — pick one before publishing.

@@ -28,14 +28,25 @@
 #   umik upload             sync everything new to the bucket
 #   umik upload --dry-run   show what would upload, touch nothing
 #
-# Config via env: UMIK_S3_BUCKET (default YOUR-BUCKET),
-#                 UMIK_AWS_PROFILE (default umik), UMIK_ARCHIVE
+# Config: UMIK_S3_BUCKET (required - no default), UMIK_AWS_PROFILE (default
+# umik), UMIK_ARCHIVE (default ~/UMIK-Archive). Set them in the environment or
+# in tools/umik.local.conf (untracked; see umik.local.conf.example).
 
 set -euo pipefail
 
-ARCHIVE="${UMIK_ARCHIVE:-$HOME/UMIK-Archive}"
-BUCKET="${UMIK_S3_BUCKET:-YOUR-BUCKET}"
-PROFILE="${UMIK_AWS_PROFILE:-umik}"
+TOOLS_DIR=$(cd "$(dirname "$0")" && pwd)
+
+# Where your bucket name lives. There is deliberately NO default bucket: this
+# repo is public, so shipping one would both publish somebody's bucket name and
+# let a fresh clone try to upload into a stranger's. Precedence is environment,
+# then the untracked local config, then nothing (which is an error).
+_ENV_ARCHIVE=${UMIK_ARCHIVE-}; _ENV_BUCKET=${UMIK_S3_BUCKET-}; _ENV_PROFILE=${UMIK_AWS_PROFILE-}
+CONF="${UMIK_CONF:-$TOOLS_DIR/umik.local.conf}"
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+ARCHIVE="${_ENV_ARCHIVE:-${UMIK_ARCHIVE:-$HOME/UMIK-Archive}}"
+BUCKET="${_ENV_BUCKET:-${UMIK_S3_BUCKET:-}}"
+PROFILE="${_ENV_PROFILE:-${UMIK_AWS_PROFILE:-umik}}"
 
 DRY=()
 case "${1:-}" in
@@ -47,6 +58,8 @@ esac
 say() { echo "==> $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+[ -n "$BUCKET" ] || die "no S3 bucket configured - copy tools/umik.local.conf.example to
+       $CONF and set UMIK_S3_BUCKET (or export it)"
 command -v aws >/dev/null 2>&1 \
     || die "aws CLI not found - install it with: brew install awscli"
 aws configure list --profile "$PROFILE" >/dev/null 2>&1 \

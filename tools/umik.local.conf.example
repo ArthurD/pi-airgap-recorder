@@ -1,0 +1,17 @@
+# Local settings for the Mac-side tools. Copy to umik.local.conf, which is
+# gitignored, so your bucket name never lands in a public repo:
+#
+#     cp tools/umik.local.conf.example tools/umik.local.conf
+#     $EDITOR tools/umik.local.conf
+#
+# Anything already set in the environment wins over this file.
+
+# Required for `umik upload` and `umik verify-s3`. S3 bucket names are a
+# single global namespace, so pick one nobody else has.
+UMIK_S3_BUCKET=your-umik-recordings-bucket
+
+# AWS CLI profile holding the uploader key (aws configure --profile umik).
+UMIK_AWS_PROFILE=umik
+
+# Where sealed recordings are archived on this Mac.
+#UMIK_ARCHIVE="$HOME/UMIK-Archive"
