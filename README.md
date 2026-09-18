@@ -258,7 +258,8 @@ Flash the stock image, drop a provisioning payload on the FAT boot partition
 build/     runs on the Mac      fetch → verify → decompress → flash → inject
 boot/      lands on the card    firstrun.sh + payload/ (services, scripts, config)
 tools/     host-side utilities  umik · umik-ingest.sh · umik-upload.sh ·
-                                umik-verify-s3.sh · umik-viewer.py · repair-wav.sh
+                                umik-verify-s3.sh · umik-lib.sh · umik-viewer.py ·
+                                repair-wav.sh
 ```
 
 ```sh
@@ -351,12 +352,22 @@ gain, arrow keys to thumb through segments. Binds `127.0.0.1` only.
 
 ## S3 mirror
 
-`umik upload` mirrors the archive to your bucket (or `umik download --upload`
+`umik upload` writes the archive into your bucket (or `umik download --upload`
 to chain it): dated sessions under `raw/<YYYY-MM-DD>/<unit>/<session>/`,
 untrusted-clock sessions under `raw/undated/<unit>/…` — the date prefix is
 earned by `clock_trusted`, never guessed. Uploads read only the archive, are
-add-only and idempotent; the hash-chained manifest is mirrored too, pinning the
-whole archive history off-site.
+add-only and idempotent; each run also pins its own write-once
+`manifest/<utc-stamp>_<head>/` set, putting the whole archive history off-site.
+
+**Every object is written exactly once.** Each file goes up as a single-part
+`PutObject` carrying `--checksum-sha256` set to *its `SHA256SUMS` seal*, so S3
+hashes what it actually receives and refuses the request unless it matches the
+seal — a corrupted or truncated transfer cannot be stored at all. Because the
+PUT is single-part, the checksum S3 keeps is a whole-object SHA-256, directly
+comparable to the seal forever after. `--if-none-match '*'` makes each write
+conditional on the key not existing, so a re-run can only add. Nothing is ever
+overwritten, restamped or repaired in place; that matters most on a bucket with
+Object Lock, where a "fix" is just a second undeletable version of the same key.
 
 **Point it at your own bucket first.** There is deliberately no default — S3
 bucket names are one global namespace, and a shipped default would have fresh
@@ -371,7 +382,10 @@ $EDITOR tools/umik.local.conf                            # set UMIK_S3_BUCKET
 <summary><b>Bucket + IAM setup</b> — one-time</summary>
 
 1. Bucket `YOUR-BUCKET`: **Block all public access** on, **versioning** on
-   (versioning is what makes the add-only design tamper-evident).
+   (versioning is what makes the add-only design tamper-evident). Object Lock
+   in compliance mode is a good fit here and costs nothing extra, because the
+   uploader never writes a key twice — so no locked, undeletable second
+   version of anything is ever created.
 2. IAM user, no console access, one access key, scoped to just this bucket —
    deliberately **no `s3:DeleteObject`**, so even a stolen laptop's key cannot
    erase the mirror:
@@ -386,46 +400,50 @@ $EDITOR tools/umik.local.conf                            # set UMIK_S3_BUCKET
      ] }
    ```
 
-   (`ListBucket`/`GetObject` let `aws s3 sync` skip what is already uploaded;
-   `PutObject` also covers `verify-s3`, whose checksum stamp is written as a
-   server-side copy.)
+   (`ListBucket`/`GetObject` are what let both tools read an object's stored
+   checksum back with `HeadObject` — that is how `umik upload` skips what is
+   already there and how `verify-s3` checks it. `verify-s3` needs no write
+   permission at all.)
 3. `brew install awscli`, `aws configure --profile umik`, then
    `aws s3 ls s3://YOUR-BUCKET/ --profile umik` to sanity-check.
 </details>
 
 ### Proving the bucket holds what you sealed
 
-Completeness is not correctness. `aws s3 sync` decides what to upload from size
-and mtime, and an S3 ETag is a multipart digest comparable to nothing — so "the
-mirror looks complete" never meant "the mirror is correct." That gap matters
-the moment you consider deleting the local archive.
+Completeness is not correctness. An S3 ETag is a multipart digest comparable to
+nothing, so "the mirror looks complete" never meant "the mirror is correct."
+That gap matters the moment you consider deleting the local archive.
 
 ```sh
-umik verify-s3                 # stamp what needs it, then verify everything
-umik verify-s3 --dry-run       # report what would be stamped
-umik verify-s3 --verify-only   # check what is already stamped
+umik verify-s3                 # read back every stored checksum and verify
 ```
 
-It asks S3 to copy each object onto itself with `--checksum-algorithm SHA256`.
-S3 reads its own stored bytes, computes a whole-object SHA-256 and stores it;
-the tool compares that against the `SHA256SUMS` seals. Because the hash comes
-from what the bucket actually holds, this is a real end-to-end check — **and
-the data never leaves AWS, so verifying hundreds of gigabytes costs API calls
-instead of egress.**
+The proof is really made at write time — S3 will not store bytes that do not
+hash to the seal `umik upload` hands it — and `verify-s3` is how you confirm,
+later and independently, that the bucket still holds exactly that. It reads
+each object's stored whole-object SHA-256 with `HeadObject` and diffs it
+against the `SHA256SUMS` seals. **The data never leaves AWS, so verifying
+hundreds of gigabytes costs API calls instead of egress**, and the run is
+strictly read-only: no writes, no new object versions, nothing to expire.
 
 ```
-==> VERIFIED (S3 bytes match the seal) : 1515
+==> VERIFIED (S3 bytes match the seal) : 2478
 ==> MISMATCHED                         : 0
-==> ALL 1515 OBJECT(S) VERIFIED against their seals
+==> ALL 2478 OBJECT(S) VERIFIED against their seals
 ```
 
-It exits non-zero on any mismatch and says not to delete the local copy. Run it
-after each upload: `umik upload` requests SHA-256 on transfer too, but
-multipart uploads yield a *composite* checksum (a hash of part hashes) that is
-**not** seal-comparable, so `verify-s3` is the authority.
+It exits non-zero on any mismatch and says not to delete the local copy. An
+object carrying no whole-object SHA-256 — none at all, or a *composite* one (a
+hash of part hashes, left by a multipart upload) — counts as a mismatch, since
+neither can be compared to a seal and neither can be repaired in place.
 
-> Stamping writes a new object version. On a versioned bucket the previous
-> versions linger — add a lifecycle rule expiring noncurrent versions.
+Both tools build the same local-file-to-S3-key map, from `tools/umik-lib.sh`.
+That is on purpose: if the uploader and the verifier disagreed about which file
+is which key, the disagreement would show up as a phantom gap, or as a key
+nobody ever checked.
+
+> `--verify-only` is still accepted and does nothing. It used to mean "skip the
+> stamping pass"; there is no longer a stamping pass to skip.
 
 ---
 
@@ -466,10 +484,10 @@ reached the Mac — that would require signing on the Pi itself.
 |---|---|
 | `umik download` | Seal every mounted medium into the archive, verify, clear the medium |
 | `umik download --upload` | ...and mirror to S3 afterwards |
-| `umik upload` | Mirror the archive to S3 (add-only, idempotent) |
+| `umik upload` | Write the archive into S3 (write-once, add-only, idempotent) |
 | `umik upload --dry-run` | Show what would upload, touch nothing |
 | `umik verify` | Re-verify the manifest hash chain (`--deep` re-hashes everything) |
-| `umik verify-s3` | Prove the bucket holds the sealed bytes (server-side, no egress) |
+| `umik verify-s3` | Prove the bucket holds the sealed bytes (read-only, no egress) |
 | `umik inject --unit umik1` | Re-provision a mounted card, keeping its console account |
 
 A collection, start to finish:
@@ -625,9 +643,12 @@ the other. Across both runs the Pi's timestamps matched the collecting Mac's
 clock to the second, so drift over a day and a half was under one second. 362
 files sealed, zero warnings.
 
-**The S3 mirror is provably correct (2026-08-18).** `umik verify-s3` stamped
-and checked all 1515 objects against their seals: 1515 verified, 0 mismatched.
-Previously only completeness had ever been checked, never content.
+**The S3 mirror is provably correct (2026-08-18).** `umik verify-s3` checked
+all 1515 objects against their seals: 1515 verified, 0 mismatched. Previously
+only completeness had ever been checked, never content. The uploader has since
+become write-once — the seal is now handed to S3 *as* the PUT's required
+checksum, so an object is proven correct the moment it lands and never has to
+be touched again.
 
 **Field-failed and pivoted from:** GPS→RTC disciplining. An outdoor boot got
 its fix but `hwclock --systohc` failed with its error discarded, so the DS3231
@@ -640,8 +661,10 @@ chrony, and wired NTP replaced GPS as the primary time source.
 Open:
 
 - [ ] GPG signature verification (needs a trusted keyring on the Mac).
-- [ ] Lifecycle rule to expire noncurrent S3 versions (needs admin credentials;
-      the uploader IAM user has no DeleteObject by design).
+- [ ] Lifecycle rule to expire the noncurrent S3 versions left by the old
+      stamping uploader (needs admin credentials; the uploader IAM user has no
+      DeleteObject by design). Nothing new creates them — every write is now a
+      first write.
 - [ ] `umik-viewer.py` reads a local directory only; browsing straight from S3
       would need a fetch step.
 - [ ] Optional field-power trim (powersave governor, Ethernet kill): ~15–20%
