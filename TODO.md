@@ -41,8 +41,8 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
 
 ## Field units
 
-- [ ] **Unit 2 has not reported since 2026-08-16.** Its RTC has not been
-      re-proven since. Collect its stick and check `time_source`/`rtc`.
+- [x] ~~Unit 2 has not reported since 2026-08-16.~~ Collected 2026-09-19:
+      five sessions (Sep 16-18), all `time_source: rtc`, `clock_trusted`.
 - [ ] **Unit 1's stick is still labelled TESLADRIVE.** Harmless (sessions are
       unit-stamped) but rename it when convenient.
 
