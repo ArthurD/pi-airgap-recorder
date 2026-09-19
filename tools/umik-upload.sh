@@ -178,11 +178,12 @@ put_one() { # <line number in $WORK/map>
     hex=${rest%%$'\t'*}
     path=${rest#*$'\t'}
 
-    [ -f "$path" ] || { printf 'FAIL\t%s\tlocal file is gone: %s\n' "$key" "$path"; return 0; }
     b64=$(umik_hex_to_b64 "$hex")
     [ -n "$b64" ] || { printf 'FAIL\t%s\tunreadable seal in SHA256SUMS: %s\n' "$key" "$hex"; return 0; }
-    ctype=$(umik_content_type "$path")
 
+    # Ask the bucket first. The local archive keeps only seals once a
+    # session is verified off-site (the audio lives in S3 and on the NAS),
+    # so a missing local file is only a problem for a key S3 does not hold.
     replace=0
     have=$(head_sha "$key")
     case "$have" in
@@ -200,6 +201,9 @@ put_one() { # <line number in $WORK/map>
             esac
             ;;
     esac
+
+    [ -f "$path" ] || { printf 'FAIL\t%s\tnot in S3 and local file is gone: %s\n' "$key" "$path"; return 0; }
+    ctype=$(umik_content_type "$path")
 
     if [ "$DRY" = 1 ]; then
         [ "$replace" -eq 1 ] && printf 'WOULD-REPLACE\t%s\n' "$key" || printf 'WOULD\t%s\n' "$key"
