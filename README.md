@@ -113,17 +113,25 @@ USB** within seconds, it's charge-only.
 | Mic | any USB audio capture device; miniDSP UMIK-1 and RODE NT1 5th Gen out of the box, swappable with no config change (see [below](#using-a-different-microphone)) |
 | RTC | [DS3231 plug-on module](https://www.amazon.com/dp/B08X4H3NBR) — **recommended** |
 | Time set | one wired-ethernet boot (NTP) or a GT-U7 / any NMEA-over-USB GPS |
-| Card | 128 GB ≈ 10 days of audio; anything ≥8 GB boots |
+| Card | 128 GB ≈ 10 days on the UMIK-1, ~2 on the RODE at 192 kHz float; anything ≥8 GB boots |
 | Base OS | Raspberry Pi OS Lite arm64, Trixie (2026-06-18) |
 
-**Storage budget.** 48 kHz / 24-bit / mono is 144 KB/s → 518 MB/hour →
-**12.4 GB/day**; a 128 GB card holds ~10 days. A mic that enumerates as
-2-channel doubles that, and one that negotiates 32-bit stereo — which a
-general-purpose USB mic may well do — quadruples it to 1.4 GB/hour, about
-2.5 days on the same card. The recorder logs the negotiated format's actual
-B/s and MB/hour on its `capture format` line, so the card's own log always
-says what that particular mic costs. Below 512 MB free the recorder stops
-cleanly rather than letting `arecord` crash-loop against a full disk.
+**Storage budget.** This is per-mic now, because the format and sample rate
+are negotiated per-mic (see [below](#using-a-different-microphone)):
+
+| Mic | Negotiated | Rate | 128 GB card |
+|---|---|---|---|
+| UMIK-1 | 48 kHz / 24-bit / mono | 144 KB/s → 518 MB/hour → **12.4 GB/day** | ~10 days |
+| RODE NT1, mono | 192 kHz / 32-bit float | 768 KB/s → 2.8 GB/hour → **66 GB/day** | **~2 days** |
+| RODE NT1, stereo | 192 kHz / 32-bit float | 1.5 MB/s → 5.5 GB/hour → **133 GB/day** | **~1 day** |
+
+The RODE is asked for maximum quality on purpose. If that is the wrong trade
+for your deployment, `UMIK_RATE=48000` brings it back to 691 MB/hour mono
+without touching anything else. The recorder logs the negotiated format's
+actual B/s and MB/hour on its `capture format` line, so the card's own log
+always says what that particular mic cost that particular session. Below
+512 MB free the recorder stops cleanly rather than letting `arecord`
+crash-loop against a full disk.
 
 ### Using a different microphone
 
@@ -132,6 +140,26 @@ UMIK-1 hardware revisions) and RODE (`19f7`, the NT1 5th Gen) — so either mic
 can be plugged in and recorded with no config change at all. Swap them freely;
 whichever one is attached wins, and every session records which it was (see
 [`session.json`](#chain-of-custody) below).
+
+Each known vendor carries its own **capture preference** — the order in which
+the probe asks the hardware for a format and a sample rate. The probe still
+decides; the table only sets what gets asked for first, so a mic that cannot
+do its first choice quietly lands on the next:
+
+| Vendor | Formats tried, in order | Rates tried, in order |
+|---|---|---|
+| `2752` miniDSP | `S24_3LE S32_LE S16_LE FLOAT_LE` | `48000` |
+| `19f7` RODE | `FLOAT_LE S32_LE S24_3LE S16_LE` | `192000 96000 48000` |
+| anything else | `S24_3LE S32_LE S16_LE FLOAT_LE` | `48000` |
+
+The UMIK-1's row is exactly what this recorder has always asked for, so its
+sessions stay byte-for-byte comparable with every one already in the archive.
+The RODE's row asks for the best the mic will give — 32-bit float, highest
+rate first — which is a deliberate quality-over-storage choice; the storage
+budget table above says what it costs, and `UMIK_RATE` is the knob if that is
+not the trade you want. The probe goes rate-outermost, then channel
+count, then format, so at the top rate it tries mono before stereo before
+dropping to the next rate down. Adding a vendor is one line in `mic_prefs()`.
 
 Nothing downstream is mic-specific — the format probe asks the hardware what it
 accepts, and the calibration gain reads `unknown` when the product string has
@@ -156,11 +184,14 @@ Two catches:
 * If you enabled the optional default-deny udev rule, add your vendor's ID
   there too, or the device is refused before ALSA ever sees it. `2752` and
   `19f7` are already in it.
-* The format probe tries `S24_3LE S32_LE S16_LE FLOAT_LE` in that order —
-  integer PCM first, so a mic that accepts both still negotiates integer. A
-  mic that only does 32-bit float records fine and `tools/repair-wav.sh`
-  handles it, but `tools/umik-viewer.py` decodes 16- and 24-bit integer PCM
-  only and will say so rather than render it.
+* `UMIK_FORMAT` and `UMIK_RATE` override the preference table above, and both
+  take a list (space- or comma-separated) or a single value. Whatever they
+  hold is tried in the order given.
+* Whatever gets negotiated is recorded in `session.json` under `format`, and
+  the whole toolchain follows it: `tools/repair-wav.sh` never looks at the
+  sample format at all, and `tools/umik-viewer.py` decodes 16/24/32-bit
+  integer PCM and 32/64-bit float at any rate, reading each file's own byte
+  rate rather than assuming 48 kHz.
 
 ---
 
@@ -641,9 +672,9 @@ Via `systemctl edit umik-record` (or the named unit), as `Environment=` lines:
 | `UMIK_VID` | `2752 19f7` (miniDSP, RODE). A space- or comma-separated list of vendor IDs, or `any` for the first USB capture device |
 | `UMIK_PID` | unset (any product from those vendors). Honoured only when `UMIK_VID` names exactly one vendor |
 | `UMIK_SEGMENT_SECONDS` | `600` |
-| `UMIK_RATE` | `48000` |
+| `UMIK_RATE` | per-vendor (`48000` miniDSP, `192000 96000 48000` RODE). A list or a single value; first that works |
 | `UMIK_CHANNELS` | `1` (falls back to `2`, then `1`) |
-| `UMIK_FORMAT` | `S24_3LE S32_LE S16_LE FLOAT_LE` (first that works; integer before float) |
+| `UMIK_FORMAT` | per-vendor (`S24_3LE S32_LE S16_LE FLOAT_LE` miniDSP, `FLOAT_LE S32_LE S24_3LE S16_LE` RODE). A list or a single value; first that works |
 | `UMIK_DATA_DIR` | unset (auto: stick if mounted, else SD) |
 | `UMIK_MIN_FREE_MB` | `512` |
 | `UMIK_LOG_INTERVAL` | `60` (heartbeat seconds) |

@@ -2,11 +2,13 @@
 # repair-wav.sh - repair WAV files truncated by a power cut.
 #
 # When power is pulled mid-segment, the audio samples are all on disk but the
-# RIFF/data size fields in the 44-byte header still say whatever arecord wrote
-# when it opened the file. Players then either refuse the file or stop early.
+# RIFF/data size fields in the header still say whatever arecord wrote when it
+# opened the file. Players then either refuse the file or stop early.
 #
 # Nothing is actually lost. This rewrites the two size fields to match the
-# bytes that are really there.
+# bytes that are really there. It walks the chunk list rather than assuming a
+# 44-byte header, and never looks at the sample format - so 16/24/32-bit
+# integer and 32-bit float, at any sample rate, are all repaired identically.
 #
 #     ./tools/repair-wav.sh path/to/recordings/000001_*/seg-*.wav
 #

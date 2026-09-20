@@ -31,47 +31,75 @@ import numpy as np
 # WAV access (header parsed for format only; sizes come from the filesystem)
 # --------------------------------------------------------------------------
 
+WAVE_FORMAT_PCM = 1
+WAVE_FORMAT_IEEE_FLOAT = 3
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+_TAG_NAME = {WAVE_FORMAT_PCM: "integer PCM", WAVE_FORMAT_IEEE_FLOAT: "IEEE float"}
+
+# (format tag, bytes per sample) -> numpy dtype. 24-bit integer is absent on
+# purpose: no numpy dtype is three bytes wide, so read_ch0 assembles it.
+_DTYPE = {(WAVE_FORMAT_PCM, 2): "<i2", (WAVE_FORMAT_PCM, 4): "<i4",
+          (WAVE_FORMAT_IEEE_FLOAT, 4): "<f4",
+          (WAVE_FORMAT_IEEE_FLOAT, 8): "<f8"}
+
+
+def parse_wav_header(path):
+    """(channels, rate, bits, tag, byte_rate, data_off) from a WAV header.
+
+    Deliberately format-agnostic: the session index needs a duration for every
+    segment, including ones the decoder below will refuse, so all the
+    validation lives in Wav and none of it lives here.
+    """
+    with open(path, "rb") as f:
+        head = f.read(8192)
+    if head[0:4] != b"RIFF" or head[8:12] != b"WAVE":
+        raise ValueError("not RIFF/WAVE")
+    off, fmt, data_off = 12, None, None
+    while off + 8 <= len(head):
+        cid, clen = struct.unpack_from("<4sI", head, off)
+        off += 8
+        if cid == b"fmt ":
+            tag, ch, rate, brate, _, bits = struct.unpack_from("<HHIIHH", head, off)
+            # WAVE_FORMAT_EXTENSIBLE keeps the real tag in the first two bytes
+            # of its 16-byte subformat GUID. alsa-utils never writes it - its
+            # WAV writer emits a plain 16-byte fmt chunk, tag 3 for FLOAT_LE
+            # and tag 1 for the integer formats, whatever the channel count -
+            # but recordings get re-encoded by other tools, so handle it.
+            if tag == WAVE_FORMAT_EXTENSIBLE and clen >= 40:
+                tag = struct.unpack_from("<H", head, off + 24)[0]
+            # A zero byte rate is legal-ish and some writers emit it; the
+            # arithmetic is the authority either way.
+            fmt = (ch, rate, bits, tag, brate or rate * ch * (bits // 8))
+        elif cid == b"data":
+            data_off = off
+            break
+        off += clen + (clen & 1)
+    if fmt is None or data_off is None:
+        raise ValueError("no fmt/data chunk in first 8KB")
+    return fmt + (data_off,)
+
+
 class Wav:
     def __init__(self, path):
         self.path = path
         size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            head = f.read(8192)
-        if head[0:4] != b"RIFF" or head[8:12] != b"WAVE":
-            raise ValueError("not RIFF/WAVE")
-        off, fmt, data_off = 12, None, None
-        while off + 8 <= len(head):
-            cid, clen = struct.unpack_from("<4sI", head, off)
-            off += 8
-            if cid == b"fmt ":
-                tag, ch, rate, _, _, bits = struct.unpack_from("<HHIIHH", head, off)
-                fmt = (ch, rate, bits, tag)
-            elif cid == b"data":
-                data_off = off
-                break
-            off += clen + (clen & 1)
-        if fmt is None or data_off is None:
-            raise ValueError("no fmt/data chunk in first 8KB")
-        self.channels, self.rate, self.bits, self.tag = fmt
+        (self.channels, self.rate, self.bits, self.tag,
+         self.byte_rate, self.data_off) = parse_wav_header(path)
         self.bps = self.bits // 8
-        # read_ch0 decodes signed integer PCM only. Say so explicitly: a mic
-        # negotiated to FLOAT_LE writes WAVE_FORMAT_IEEE_FLOAT (tag 3), and
-        # "unsupported sample width 32" would send you looking for the wrong
-        # bug. (tag 0xFFFE is WAVE_FORMAT_EXTENSIBLE, whose real format lives
-        # in the subformat GUID; arecord does not emit it for these formats.)
-        if self.tag != 1:
-            raise ValueError(f"unsupported WAVE format tag {self.tag} "
-                             f"({'32-bit float' if self.tag == 3 else 'not PCM'})"
-                             " - viewer decodes 16/24-bit integer PCM only")
-        if self.bps not in (2, 3):
-            raise ValueError(f"unsupported sample width {self.bits}")
+        # 16/24/32-bit integer and 32/64-bit float. The RODE records as
+        # FLOAT_LE (tag 3) by preference, the UMIK-1 as S24_3LE (tag 1), and
+        # both must open here or half the archive is unviewable.
+        self.dtype = _DTYPE.get((self.tag, self.bps))
+        if self.dtype is None and (self.tag, self.bps) != (WAVE_FORMAT_PCM, 3):
+            raise ValueError(
+                f"unsupported WAVE format: tag {self.tag} "
+                f"({_TAG_NAME.get(self.tag, 'unknown')}), {self.bits}-bit")
         self.frame = self.channels * self.bps
-        self.data_off = data_off
-        self.frames = max(0, (size - data_off) // self.frame)  # true, not header
+        self.frames = max(0, (size - self.data_off) // self.frame)  # true, not header
         self.duration = self.frames / self.rate
 
     def read_ch0(self, start_frame, n_frames):
-        """First channel as float32 in [-1,1)."""
+        """First channel as float32, nominally in [-1,1)."""
         n = max(0, min(n_frames, self.frames - start_frame))
         if n == 0:
             return np.zeros(0, np.float32)
@@ -79,15 +107,24 @@ class Wav:
             f.seek(self.data_off + start_frame * self.frame)
             raw = np.frombuffer(f.read(n * self.frame), np.uint8)
         n = len(raw) // self.frame
-        raw = raw[: n * self.frame].reshape(n, self.frame)
-        if self.bps == 3:
+        # Channel 0 is the first sample of each frame: reshape to frames and
+        # keep the leading bps bytes of each.
+        raw = raw[: n * self.frame].reshape(n, self.frame)[:, : self.bps]
+        if self.bps == 3 and self.tag == WAVE_FORMAT_PCM:
             v = (raw[:, 0].astype(np.int32) | (raw[:, 1].astype(np.int32) << 8)
                  | (raw[:, 2].astype(np.int32) << 16))
             v = np.where(v >= 1 << 23, v - (1 << 24), v)
             return (v / (1 << 23)).astype(np.float32)
-        v = (raw[:, 0].astype(np.int32) | (raw[:, 1].astype(np.int32) << 8))
-        v = np.where(v >= 1 << 15, v - (1 << 16), v)
-        return (v / (1 << 15)).astype(np.float32)
+        # That column slice is a strided view; .view() needs contiguous bytes.
+        v = np.ascontiguousarray(raw).view(self.dtype).reshape(-1)
+        if self.tag == WAVE_FORMAT_IEEE_FLOAT:
+            # Float samples are already ~[-1,1] and need no scaling. They also
+            # need sanitising: nothing in the format forbids NaN or inf, and a
+            # frame torn by a power cut can decode to either - one NaN turns a
+            # whole spectrogram blank through the percentile scaling.
+            return np.nan_to_num(v.astype(np.float32), nan=0.0,
+                                 posinf=1.0, neginf=-1.0)
+        return (v / float(1 << (self.bits - 1))).astype(np.float32)
 
 # --------------------------------------------------------------------------
 # Spectrogram -> PNG (PIL if present, else a minimal pure-zlib PNG writer)
@@ -225,6 +262,19 @@ def build_index(root):
                 meta = json.load(f)
         except (OSError, ValueError):
             pass
+        # Durations need this session's bytes/sec, which stopped being a
+        # constant the moment a 192 kHz float mic joined the fleet: that is 8x
+        # a 48k/24-bit mono segment, so a hardcoded rate mislabels every clip
+        # by a factor of eight. One session is one arecord invocation, so
+        # every segment in it shares a format - parse the first header that
+        # opens and reuse its geometry for the rest, one read per session.
+        brate = hdr_off = 0
+        for name in segs:
+            try:
+                *_, brate, hdr_off = parse_wav_header(os.path.join(sdir, name))
+                break
+            except (OSError, ValueError, struct.error):
+                brate = hdr_off = 0
         seglist = []
         for name in segs:
             p = os.path.join(sdir, name)
@@ -236,7 +286,8 @@ def build_index(root):
                 "name": name,
                 "rel": os.path.relpath(p, root),
                 "bytes": size,
-                "dur": round(max(0, size - 44) / (48000 * 6), 1),  # display only
+                # display only; 0 when the header would not parse
+                "dur": round(max(0, size - hdr_off) / brate, 1) if brate else 0,
             })
         collections.setdefault(coll, []).append({
             "name": os.path.basename(sdir),

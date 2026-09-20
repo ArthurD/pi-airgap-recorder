@@ -56,6 +56,33 @@ mic_label() { # <vvvv> <product> <manufacturer>
     esac
 }
 
+# Per-vendor capture preference: what to ASK the hardware for, best first.
+# This does not decide anything - the probe still asks the device what it will
+# actually accept - it only sets the ORDER in which we ask, so a mic that
+# cannot do its first choice quietly lands on the next. Two lines out:
+# preferred formats, then preferred sample rates. UMIK_FORMAT and UMIK_RATE
+# override either list. Adding a mic is one case arm, same as mic_label().
+mic_prefs() { # <vvvv> -> line 1: formats, line 2: rates
+    case "$1" in
+        # miniDSP: byte-for-byte what this recorder has always asked for. A
+        # measurement mic is calibrated at one rate, and every UMIK-1 session
+        # in the archive so far is 48k/24-bit integer - leave it alone so old
+        # and new recordings stay directly comparable.
+        2752) printf 'S24_3LE S32_LE S16_LE FLOAT_LE\n48000\n' ;;
+        # RODE: capture at the best the mic will give, float first and the
+        # highest rate first. That is a deliberate quality-over-storage
+        # choice, and it is not a small one: mono 32-bit float at 192 kHz is
+        # 768 KB/s - ~2.8 GB/hour, ~66 GB/day, and double all of it if the mic
+        # enumerates as stereo. A 128GB card is then under two days, not ten.
+        # The rate list IS the knob: drop 192000 here, or set UMIK_RATE, and
+        # the cost falls with it.
+        19f7) printf 'FLOAT_LE S32_LE S24_3LE S16_LE\n192000 96000 48000\n' ;;
+        # Anything else: the conservative default. An unknown mic is not worth
+        # filling a card over before someone has decided it should be.
+        *)    printf 'S24_3LE S32_LE S16_LE FLOAT_LE\n48000\n' ;;
+    esac
+}
+
 # Storage: a USB drive mounted at /data/usb by umik-usb-detect wins, so
 # recordings can be pulled, copied anywhere, and the stick put back. No
 # stick -> the SD card. UMIK_DATA_DIR overrides both.
@@ -106,7 +133,10 @@ applog() {
 trap 'rc=$?; [ "$rc" -eq 0 ] || applog "ABNORMAL EXIT status=${rc}"' EXIT
 
 applog "=== service start: storage=${STORAGE} data=${DATA_DIR} ==="
-RATE=${UMIK_RATE:-48000}
+# RATE is NOT set here any more: it is whatever the probe negotiates from the
+# mic's preference list (see mic_prefs), so that a 192 kHz-capable mic is not
+# pinned to 48k by a default written for a different one. UMIK_RATE still
+# overrides, and still accepts a single value.
 CHANNELS=${UMIK_CHANNELS:-1}
 SEGMENT=${UMIK_SEGMENT_SECONDS:-600}
 WAIT_SECS=${UMIK_WAIT_SECONDS:-60}
@@ -234,44 +264,57 @@ applog "found ${MIC} - ${USBID} on ALSA card ${CARD} (\"${PRODUCT}\", gain ${GAI
 # arecord error: "Channels count non available" vs "Permission denied" name
 # completely different bugs, and without this the journal is blind.
 #
-# FLOAT_LE is probed LAST on purpose. Some class-compliant mics (the RODE NT1
-# 5th Gen among them) will happily hand over 32-bit float, but the integer
-# formats come first so a device that accepts both still negotiates integer
-# PCM - the UMIK-1's behaviour is unchanged, and tools/umik-viewer.py only
-# decodes 16- and 24-bit integer PCM.
+# The order comes from mic_prefs: rate outermost, then channel count, then
+# format. So at the mic's best rate we try mono before stereo before falling
+# to the next rate down - a mono recording at 192k beats a stereo one at 48k
+# for a measurement mic, and it is half the bytes either way. First
+# combination the hardware accepts wins.
 DEV="hw:${CARD},0"
-PROBE_FORMATS="${UMIK_FORMAT:-S24_3LE S32_LE S16_LE FLOAT_LE}"
-applog "probing ${DEV}: formats ${PROBE_FORMATS} x ${CHANNELS}/2/1 ch at ${RATE} Hz"
+PREFS=$(mic_prefs "$VENDOR_ID")
+# Env overrides win, and both now take a list - a bare "UMIK_RATE=96000" is
+# just a one-element list, so the old single-value usage keeps working.
+PROBE_FORMATS=$(printf '%s' "${UMIK_FORMAT:-$(printf '%s\n' "$PREFS" | sed -n 1p)}" | tr ',' ' ')
+PROBE_RATES=$(printf '%s' "${UMIK_RATE:-$(printf '%s\n' "$PREFS" | sed -n 2p)}" | tr ',' ' ')
+# Snapshot the wanted channel count: the loop below reassigns CHANNELS on
+# success, and the FATAL line must still report what we asked for.
+WANT_CHANNELS=$CHANNELS
+
+applog "capture preference for ${MIC}: formats ${PROBE_FORMATS}, rates ${PROBE_RATES}"
+applog "probing ${DEV}: rates ${PROBE_RATES} x ${WANT_CHANNELS}/2/1 ch x formats ${PROBE_FORMATS}"
 FORMAT=""
+RATE=""
 PROBE_ERR=""
 PROBE_ERRS=""
-for c in $CHANNELS 2 1; do
-    for f in $PROBE_FORMATS; do
-        if PROBE_ERR=$(arecord -D "$DEV" -f "$f" -r "$RATE" -c "$c" \
-                       -d 1 -t raw 2>&1 >/dev/null </dev/null); then
-            FORMAT="$f"
-            CHANNELS="$c"
-            break 2
-        fi
-        # Keep every combo's error, not just the last: which combos failed
-        # with WHICH error is the whole diagnosis (busy vs no-such-device
-        # vs bad format are entirely different problems).
-        PROBE_ERRS="${PROBE_ERRS}[${f}/${c}ch] $(printf '%s' "$PROBE_ERR" | tr '\n' ' ' | cut -c1-120)  "
+for r in $PROBE_RATES; do
+    for c in $WANT_CHANNELS 2 1; do
+        for f in $PROBE_FORMATS; do
+            if PROBE_ERR=$(arecord -D "$DEV" -f "$f" -r "$r" -c "$c" \
+                           -d 1 -t raw 2>&1 >/dev/null </dev/null); then
+                FORMAT="$f"
+                RATE="$r"
+                CHANNELS="$c"
+                break 3
+            fi
+            # Keep every combo's error, not just the last: which combos
+            # failed with WHICH error is the whole diagnosis (busy vs
+            # no-such-device vs bad format are entirely different problems).
+            PROBE_ERRS="${PROBE_ERRS}[${f}/${c}ch/${r}Hz] $(printf '%s' "$PROBE_ERR" | tr '\n' ' ' | cut -c1-120)  "
+        done
     done
 done
 if [ -z "$FORMAT" ]; then
-    applog "FATAL: no working format at ${RATE} Hz (tried ${PROBE_FORMATS} x ${CHANNELS}/2/1 ch)"
+    applog "FATAL: no working capture settings (tried formats ${PROBE_FORMATS} x ${WANT_CHANNELS}/2/1 ch x rates ${PROBE_RATES} Hz)"
     applog "probe errors: $(printf '%s' "$PROBE_ERRS" | cut -c1-700)"
     case "$PROBE_ERRS" in *usy*)
         applog "hint: 'busy' means something else holds the mic (leftover arecord? two recorder instances?)" ;;
     esac
     exit 1
 fi
-# What this mic actually costs in disk, at the moment the format is settled.
-# The negotiated format is the thing that decides it, and a swap-in mic can
-# quadruple the burn without anyone noticing: 48k/24-bit mono is 518 MB/hour,
-# the same rate in 32-bit stereo is 1.4 GB/hour. Put the number in the card's
-# own log so the answer travels with the recordings.
+# What this mic actually costs in disk, at the moment the format and rate are
+# settled. Both are negotiated, so a swap-in mic can change the burn by an
+# order of magnitude without anyone noticing: 48k/24-bit mono is 518 MB/hour,
+# 192k/32-bit float mono is 2.8 GB/hour, and stereo doubles either. Put the
+# number in the card's own log so the answer travels with the recordings.
 case "$FORMAT" in
     S16_LE|S16_BE|U16_LE|U16_BE)                   SAMPLE_BYTES=2 ;;
     S24_3LE|S24_3BE|U24_3LE|U24_3BE)               SAMPLE_BYTES=3 ;;
@@ -284,6 +327,17 @@ BYTES_PER_SEC=$((SAMPLE_BYTES * CHANNELS * RATE))
 # on a disk you can actually buy quotes its capacity.
 MB_PER_HOUR=$((BYTES_PER_SEC * 3600 / 1000000))
 applog "capture format ${FORMAT} @ ${RATE} Hz, ${CHANNELS} ch, ${SEGMENT}s segments (${BYTES_PER_SEC} B/s, ~${MB_PER_HOUR} MB/hour)"
+
+# A WAV data chunk is a 32-bit byte count, so a segment cannot exceed 4 GiB
+# and arecord stops the file at 2 GiB. At the shipped 600s that is not close
+# (192k float stereo = 922MB), but UMIK_SEGMENT_SECONDS is a knob and the
+# rate is now negotiated, so the two can now multiply into a truncated
+# segment where before they could not. Warn rather than refuse: a short
+# recording is still a recording, and the rotation is what caps it.
+SEG_MB=$((BYTES_PER_SEC * SEGMENT / 1000000))
+if [ "$BYTES_PER_SEC" -gt 0 ] && [ "$((BYTES_PER_SEC * SEGMENT))" -gt 2147483647 ]; then
+    applog "WARNING: a ${SEGMENT}s segment at this format is ~${SEG_MB}MB - over WAV's 2GiB limit; arecord will cut it short. Lower UMIK_SEGMENT_SECONDS."
+fi
 
 # --- free space guard -------------------------------------------------------
 # A 128GB card holds ~10 days of 48k/24-bit mono. When it fills, stop
