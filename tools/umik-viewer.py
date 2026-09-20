@@ -44,16 +44,25 @@ class Wav:
             cid, clen = struct.unpack_from("<4sI", head, off)
             off += 8
             if cid == b"fmt ":
-                _, ch, rate, _, _, bits = struct.unpack_from("<HHIIHH", head, off)
-                fmt = (ch, rate, bits)
+                tag, ch, rate, _, _, bits = struct.unpack_from("<HHIIHH", head, off)
+                fmt = (ch, rate, bits, tag)
             elif cid == b"data":
                 data_off = off
                 break
             off += clen + (clen & 1)
         if fmt is None or data_off is None:
             raise ValueError("no fmt/data chunk in first 8KB")
-        self.channels, self.rate, self.bits = fmt
+        self.channels, self.rate, self.bits, self.tag = fmt
         self.bps = self.bits // 8
+        # read_ch0 decodes signed integer PCM only. Say so explicitly: a mic
+        # negotiated to FLOAT_LE writes WAVE_FORMAT_IEEE_FLOAT (tag 3), and
+        # "unsupported sample width 32" would send you looking for the wrong
+        # bug. (tag 0xFFFE is WAVE_FORMAT_EXTENSIBLE, whose real format lives
+        # in the subformat GUID; arecord does not emit it for these formats.)
+        if self.tag != 1:
+            raise ValueError(f"unsupported WAVE format tag {self.tag} "
+                             f"({'32-bit float' if self.tag == 3 else 'not PCM'})"
+                             " - viewer decodes 16/24-bit integer PCM only")
         if self.bps not in (2, 3):
             raise ValueError(f"unsupported sample width {self.bits}")
         self.frame = self.channels * self.bps

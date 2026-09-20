@@ -41,6 +41,13 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
 
 ## Field units
 
+- [ ] **Re-inject both cards** to pick up the two-mic recorder (UMIK-1 +
+      RODE NT1 5th Gen whitelisted, `device.mic` in session.json). Needs each
+      unit's SD card on the Mac: `umik inject --reuse-credentials`. Until
+      then a unit will FATAL on the RODE.
+- [ ] **Viewer duration display** hardcodes 24-bit stereo (6 bytes/frame) in
+      the session index; wrong for a stereo/32-bit mic. Cosmetic.
+
 - [x] ~~Unit 2 has not reported since 2026-08-16.~~ Collected 2026-09-19:
       five sessions (Sep 16-18), all `time_source: rtc`, `clock_trusted`.
 - [ ] **Unit 1's stick is still labelled TESLADRIVE.** Harmless (sessions are

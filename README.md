@@ -110,7 +110,7 @@ USB** within seconds, it's charge-only.
 | | |
 |---|---|
 | Board | Raspberry Pi 4B |
-| Mic | any USB audio capture device; miniDSP UMIK-1 out of the box (see [below](#using-a-different-microphone)) |
+| Mic | any USB audio capture device; miniDSP UMIK-1 and RODE NT1 5th Gen out of the box, swappable with no config change (see [below](#using-a-different-microphone)) |
 | RTC | [DS3231 plug-on module](https://www.amazon.com/dp/B08X4H3NBR) — **recommended** |
 | Time set | one wired-ethernet boot (NTP) or a GT-U7 / any NMEA-over-USB GPS |
 | Card | 128 GB ≈ 10 days of audio; anything ≥8 GB boots |
@@ -118,26 +118,49 @@ USB** within seconds, it's charge-only.
 
 **Storage budget.** 48 kHz / 24-bit / mono is 144 KB/s → 518 MB/hour →
 **12.4 GB/day**; a 128 GB card holds ~10 days. A mic that enumerates as
-2-channel doubles that. Below 512 MB free the recorder stops cleanly rather
-than letting `arecord` crash-loop against a full disk.
+2-channel doubles that, and one that negotiates 32-bit stereo — which a
+general-purpose USB mic may well do — quadruples it to 1.4 GB/hour, about
+2.5 days on the same card. The recorder logs the negotiated format's actual
+B/s and MB/hour on its `capture format` line, so the card's own log always
+says what that particular mic costs. Below 512 MB free the recorder stops
+cleanly rather than letting `arecord` crash-loop against a full disk.
 
 ### Using a different microphone
 
-Out of the box the recorder matches the miniDSP USB vendor ID (`2752`),
-accepting either UMIK-1 hardware revision. Nothing downstream is
-miniDSP-specific — the format probe asks the hardware what it accepts, and the
-calibration gain reads `unknown` when the product string has none — so the
-vendor is a knob:
+Out of the box the recorder matches two USB vendor IDs — miniDSP (`2752`, both
+UMIK-1 hardware revisions) and RODE (`19f7`, the NT1 5th Gen) — so either mic
+can be plugged in and recorded with no config change at all. Swap them freely;
+whichever one is attached wins, and every session records which it was (see
+[`session.json`](#chain-of-custody) below).
+
+Nothing downstream is mic-specific — the format probe asks the hardware what it
+accepts, and the calibration gain reads `unknown` when the product string has
+none — so the vendor list is a knob:
 
 ```sh
-sudo systemctl edit umik-record     # then add, under [Service]:
-# Environment=UMIK_VID=any          # first USB audio capture device found
-# Environment=UMIK_VID=046d         # or pin a specific vendor (lsusb)
+sudo systemctl edit umik-record        # then add, under [Service]:
+# Environment=UMIK_VID="2752 19f7"     # the shipped default
+# Environment=UMIK_VID="2752 19f7 046d"  # add a third (lsusb for the ID)
+# Environment=UMIK_VID=046d            # or pin exactly one vendor
+# Environment=UMIK_VID=any             # first USB audio capture device found
 ```
 
+Space- or comma-separated, either works. `UMIK_PID` narrows the match to a
+single product, but only when `UMIK_VID` names exactly one vendor — a product
+ID is unique only within a vendor, so pairing it with a list is meaningless and
+the recorder ignores it with a warning in the log.
+
 `/proc/asound` only lists sound cards, so even `any` cannot select a keyboard.
-One catch: if you enabled the optional default-deny udev rule, add your
-vendor's ID there too, or the device is refused before ALSA sees it.
+Two catches:
+
+* If you enabled the optional default-deny udev rule, add your vendor's ID
+  there too, or the device is refused before ALSA ever sees it. `2752` and
+  `19f7` are already in it.
+* The format probe tries `S24_3LE S32_LE S16_LE FLOAT_LE` in that order —
+  integer PCM first, so a mic that accepts both still negotiates integer. A
+  mic that only does 32-bit float records fine and `tools/repair-wav.sh`
+  handles it, but `tools/umik-viewer.py` decodes 16- and 24-bit integer PCM
+  only and will say so rather than render it.
 
 ---
 
@@ -300,7 +323,7 @@ session counters are untouched.
 ```
 /data/recordings/
   umik1_000001_20260728T161500Z/
-    session.json               device, gain, format, clock trust, GPS fix
+    session.json               mic, device, gain, format, clock trust, GPS fix
     seg-20260728-161500.wav    10-minute segments
 ```
 
@@ -519,9 +542,28 @@ to any archived byte breaks the chain.
   "clock_trusted": true,
   "time_source": "rtc",
   "rtc": { "present": true, "trusted": true, "note": "clock set from disciplined RTC" },
+  "device": {
+    "usb_id": "2752:0007",
+    "vendor_id": "2752",
+    "product_id": "0007",
+    "mic": "miniDSP UMIK-1",
+    "product": "Umik-1  Gain:18dB",
+    "manufacturer": "miniDSP",
+    "serial": "unknown",
+    "calibration_gain_db": "18",
+    "alsa_card": 1
+  },
   "format": { "encoding": "S24_3LE", "sample_rate": 48000, "channels": 1 }
 }
 ```
+
+The `device` block is how a session proves which microphone made it, which
+matters once more than one mic is in rotation: `mic` is the friendly label
+(`miniDSP UMIK-1`, `RODE NT1 5th Gen`), `vendor_id` / `product_id` are the two
+halves of `usb_id`, and `product` / `manufacturer` / `serial` are the USB
+device's own strings, sanitised, or `unknown` when the device does not publish
+them. `calibration_gain_db` is parsed out of the UMIK-1's product string and
+reads `unknown` for any mic that does not embed one.
 
 ---
 
@@ -596,12 +638,12 @@ Via `systemctl edit umik-record` (or the named unit), as `Environment=` lines:
 
 | Variable | Default |
 |---|---|
-| `UMIK_VID` | `2752` (miniDSP). Any vendor ID, or `any` for the first USB capture device |
-| `UMIK_PID` | unset (any product from that vendor) |
+| `UMIK_VID` | `2752 19f7` (miniDSP, RODE). A space- or comma-separated list of vendor IDs, or `any` for the first USB capture device |
+| `UMIK_PID` | unset (any product from those vendors). Honoured only when `UMIK_VID` names exactly one vendor |
 | `UMIK_SEGMENT_SECONDS` | `600` |
 | `UMIK_RATE` | `48000` |
 | `UMIK_CHANNELS` | `1` (falls back to `2`, then `1`) |
-| `UMIK_FORMAT` | `S24_3LE S32_LE S16_LE` (first that works) |
+| `UMIK_FORMAT` | `S24_3LE S32_LE S16_LE FLOAT_LE` (first that works; integer before float) |
 | `UMIK_DATA_DIR` | unset (auto: stick if mounted, else SD) |
 | `UMIK_MIN_FREE_MB` | `512` |
 | `UMIK_LOG_INTERVAL` | `60` (heartbeat seconds) |
