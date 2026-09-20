@@ -41,10 +41,10 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
 
 ## Field units
 
-- [ ] **Re-inject both cards** to pick up the two-mic recorder (UMIK-1 +
-      RODE NT1 5th Gen whitelisted, `device.mic` in session.json). Needs each
-      unit's SD card on the Mac: `umik inject --reuse-credentials`. Until
-      then a unit will FATAL on the RODE.
+- [ ] **Re-inject unit 1's card** to pick up the two-mic recorder (UMIK-1 +
+      RODE NT1 5th Gen whitelisted, `device.mic` in session.json). Needs the
+      SD card on the Mac: `umik inject` (reuses credentials). Unit 2 was
+      done 2026-09-20. Until then unit 1 will FATAL on the RODE.
 - [ ] **Viewer duration display** hardcodes 24-bit stereo (6 bytes/frame) in
       the session index; wrong for a stereo/32-bit mic. Cosmetic.
 
