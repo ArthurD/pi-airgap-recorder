@@ -15,3 +15,9 @@ UMIK_AWS_PROFILE=umik
 
 # Where sealed recordings are archived on this Mac.
 #UMIK_ARCHIVE="$HOME/UMIK-Archive"
+
+# Optional, for the successor instructions PDF (tools/recovery/build-pdf.sh):
+# UMIK_OWNER="Your Name"                       # defaults to git user.name
+# UMIK_NAS_LOCATION="Where the local copy is"   # one or two plain sentences
+# UMIK_ROOT_LOGIN_LOCATION="Where the AWS root login is kept"
+# UMIK_REPO_URL="https://github.com/you/repo"  # defaults to the git remote

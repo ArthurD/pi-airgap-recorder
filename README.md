@@ -313,7 +313,7 @@ build/     runs on the Mac      fetch → verify → decompress → flash → in
 boot/      lands on the card    firstrun.sh + payload/ (services, scripts, config)
 tools/     host-side utilities  umik · umik-ingest.sh · umik-upload.sh ·
                                 umik-verify-s3.sh · umik-lib.sh · umik-viewer.py ·
-                                repair-wav.sh
+                                repair-wav.sh · recovery/ (successor kit)
 ```
 
 ```sh
@@ -498,6 +498,35 @@ nobody ever checked.
 
 > `--verify-only` is still accepted and does nothing. It used to mean "skip the
 > stamping pass"; there is no longer a stamping pass to skip.
+
+### If something happens to you
+
+An off-site archive nobody else can reach is not a backup. `tools/recovery/`
+is a kit for whoever has to retrieve the recordings without you:
+
+```sh
+aws login --profile admin                                  # root/admin session
+./tools/recovery/create-recovery-user.sh --profile admin   # read-only IAM user + key
+./tools/recovery/build-pdf.sh \
+    --credentials ~/UMIK-Archive/recovery/umik-recovery-credentials.txt
+```
+
+`create-recovery-user.sh` makes an IAM user that can list, read and restore
+from the bucket and is explicitly denied every write, delete and retention
+action; it writes the console password and access key to a `chmod 600` file
+and self-tests both the read and the deny. `build-pdf.sh` fills
+`instructions.md` from the live bucket (counts, size, dates, storage classes,
+costs) and renders a plain-language PDF: where the copies are, how to browse
+in the S3 console, how to download everything with one `aws s3 sync`, what to
+do if the archive has been moved to a Glacier tier, and why the AWS bill must
+keep being paid. With `--credentials` the PDF contains the key and password:
+print it, and store it like a key. Without it, the credentials page has blanks
+to fill in by hand. `umik-recover.sh` is the one-command downloader the PDF
+points at (inventory, disk check, bulk Glacier restore, resumable sync,
+`SHA256SUMS` verification); it is copied beside the PDF and printed in its
+last appendix. Set `UMIK_NAS_LOCATION` and `UMIK_ROOT_LOGIN_LOCATION` in
+`umik.local.conf` so the document can say where the local copy and the root
+login live.
 
 ---
 
