@@ -9,7 +9,7 @@
 # location, where the root login is kept), and optionally the credentials file
 # written by create-recovery-user.sh, then renders Markdown -> HTML (pandoc) ->
 # PDF (headless Chrome). The helper script umik-recover.sh is copied next to
-# the PDF and also printed in its last appendix.
+# the PDF.
 #
 #   ./tools/recovery/build-pdf.sh                          # blanks on the credentials page
 #   ./tools/recovery/build-pdf.sh --credentials ~/UMIK-Archive/recovery/umik-recovery-credentials.txt

@@ -20,6 +20,9 @@ website, download a few, or download all of them with one command. Nothing in
 that storage can be deleted by anyone for at least five years, not even by
 me, so there is no rush and nothing you can break.
 
+**Everything is in ordinary, immediately available storage.** There is no
+"retrieval request" or waiting period; files download the moment you ask.
+
 **The one urgent thing.** The Amazon account has to keep being paid, or the
 files will eventually be deleted. It costs roughly **${{MONTHLY_COST}} a month**.
 See the section "Keeping the archive alive". Do that before anything
@@ -106,9 +109,6 @@ file at a time, so it is not the way to fetch everything (that is Option 3).
    lands in your Downloads folder like any other download. Each file is about
    85 MB.
 
-If instead of downloading you see a message about the file being "archived" or
-in "Glacier", read "If the files are in cold storage" below.
-
 This login can only **read**. It cannot delete or change anything, so click
 around freely.
 
@@ -167,13 +167,13 @@ cause is a typo in the key; run `aws configure` again.
 On a **Mac**:
 
 ```
-aws s3 sync s3://{{BUCKET}} ~/UMIK-Recordings --force-glacier-transfer
+aws s3 sync s3://{{BUCKET}} ~/UMIK-Recordings
 ```
 
 On **Windows**:
 
 ```
-aws s3 sync s3://{{BUCKET}} %USERPROFILE%\UMIK-Recordings --force-glacier-transfer
+aws s3 sync s3://{{BUCKET}} %USERPROFILE%\UMIK-Recordings
 ```
 
 A folder called **UMIK-Recordings** appears in your home folder and fills up.
@@ -187,44 +187,9 @@ Files that are already complete are skipped.
 ## Step 6 (optional, Mac only): the helper script
 
 A file called **`umik-recover.sh`** is stored alongside this document. It does
-Steps 4 and 5 for you and then checks every file's fingerprint, and it handles
-the cold-storage case below automatically. To use it, drag the file into a
-Terminal window, type a space, then the bucket name, and press Enter:
-
-```
-/path/to/umik-recover.sh --bucket {{BUCKET}}
-```
-
-It explains what it is doing as it goes. A copy is printed at the very end of
-this document in case the file is lost, but retyping it is a job for a
-technical helper.
-
-# If the files are in "cold storage"
-
-To save money, I may at some point have moved the archive into Amazon's cheaper
-"Glacier" storage tiers. If so, downloading takes one extra step. You will
-know because the website shows files as **"Glacier Flexible Retrieval"** or
-**"Glacier Deep Archive"**, or because a download fails with an error mentioning
-**InvalidObjectState** or **Glacier**.
-
-(A tier called "Glacier Instant Retrieval" does **not** need this step. Files in
-it download normally.)
-
-What to do: ask Amazon to bring the files back. Amazon then takes up to 12
-hours (Flexible Retrieval) or up to 48 hours (Deep Archive), after which the
-files download normally for the next 30 days.
-
-- **Easiest:** run the helper script from Option 3, Step 6. It asks Amazon to
-  restore everything, tells you to come back tomorrow, and finishes the job
-  when you run it again.
-- **By hand, one file at a time, on the website:** open the file in the S3
-  website, click **Initiate restore**, choose **Bulk** retrieval and 30 days.
-  This is fine for a handful of files.
-- **By hand, for everything:** the command for a technical helper is in
-  Appendix A.
-
-Restoring is free at the Bulk speed. Faster speeds cost more; there is no
-reason to use them.
+Steps 4 and 5 for you and then checks every file's fingerprint. Drag the file
+into a Terminal window, type a space, then `--bucket {{BUCKET}}`, and press
+Enter. It explains what it is doing as it goes.
 
 # Keeping the archive alive {#alive}
 
@@ -340,7 +305,10 @@ aws s3 sync s3://{{BUCKET}} ./UMIK-Recordings --force-glacier-transfer
 find ./UMIK-Recordings -name SHA256SUMS -execdir sha256sum -c --quiet SHA256SUMS \;
 ```
 
-**Bulk restore from GLACIER or DEEP_ARCHIVE** (skip for GLACIER_IR):
+**If a lifecycle rule has since moved objects to GLACIER or DEEP_ARCHIVE**
+(GLACIER_IR needs nothing), a plain GET fails with `InvalidObjectState`.
+Bulk-restore first (free; 12 h for Glacier, 48 h for Deep Archive), then sync
+with `--force-glacier-transfer`. `umik-recover.sh` does this automatically.
 
 ```
 aws s3api list-objects-v2 --bucket {{BUCKET}} \
@@ -351,24 +319,11 @@ aws s3api list-objects-v2 --bucket {{BUCKET}} \
 ```
 
 Check progress with `aws s3api head-object --bucket {{BUCKET}} --key <key>` and
-look for `"Restore": "ongoing-request=\"false\""`. Then re-run the sync with
-`--force-glacier-transfer`.
+look for `"Restore": "ongoing-request=\"false\""`.
 
 **Cost.** Storage about ${{MONTHLY_COST}}/month at STANDARD rates; egress about
-${{EGRESS_COST}} for one full download. Bulk restores are free; Standard and
-Expedited tiers are not.
+${{EGRESS_COST}} for one full download.
 
 **Software.** {{REPO_URL}} (the `umik` tool: `umik verify-s3` re-proves the
-bucket against the seals read-only; `tools/recovery/` holds the script below
+bucket against the seals read-only; `tools/recovery/` holds `umik-recover.sh`
 and the source of this document).
-
-<div class="pagebreak"></div>
-
-# Appendix B: The helper script
-
-This is the full text of `umik-recover.sh`, for a technical helper to retype
-or re-create if the digital copy is lost. It needs only `bash` and the AWS CLI.
-
-```bash
-{{SCRIPT}}
-```
