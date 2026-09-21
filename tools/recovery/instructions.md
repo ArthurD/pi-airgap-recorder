@@ -246,7 +246,7 @@ the bucket and nothing else.
 | Console password | {{CONSOLE_PASSWORD}} |
 | Access Key ID | {{ACCESS_KEY_ID}} |
 | Secret Access Key | {{SECRET_ACCESS_KEY}} |
-| Region | {{REGION}} |
+| Region | {{REGION_CODE}} |
 | Bucket | {{BUCKET_CODE}} |
 
 Type the key and secret exactly; they are case-sensitive. There are no spaces.

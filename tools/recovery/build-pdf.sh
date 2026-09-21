@@ -106,7 +106,6 @@ BLANK='<span class="blank"></span>'
 mono_or_blank() { if [ -n "$1" ]; then printf '<code>%s</code>' "$1"; else printf '%s' "$BLANK"; fi; }
 USERNAME=$(mono_or_blank "$USERNAME"); CONSOLE_PASSWORD=$(mono_or_blank "$CONSOLE_PASSWORD")
 ACCESS_KEY_ID=$(mono_or_blank "$ACCESS_KEY_ID"); SECRET_ACCESS_KEY=$(mono_or_blank "$SECRET_ACCESS_KEY")
-REGION="<code>$REGION</code>"
 : "${ACCOUNT_ID:=$BLANK}"
 [ -n "$CONSOLE_URL" ] || { case "$ACCOUNT_ID" in *span*) CONSOLE_URL="https://console.aws.amazon.com/ (then Account ID: $BLANK)";; *) CONSOLE_URL="https://$ACCOUNT_ID.signin.aws.amazon.com/console";; esac; }
 [ -n "$NAS" ] || NAS="(no network-drive location was configured when this was printed; write it here: $BLANK)"
@@ -114,7 +113,7 @@ REGION="<code>$REGION</code>"
 
 # ---- substitute
 export BUILD_DATE; BUILD_DATE=$(date +"%B %-d, %Y")
-export BUCKET_CODE="<code>$BUCKET</code>"
+export BUCKET_CODE="<code>$BUCKET</code>" REGION_CODE="<code>$REGION</code>"
 # shellcheck disable=SC2090  # some of these hold HTML on purpose
 export OWNER BUCKET REGION REPO NAS ROOT_LOC OBJECT_COUNT WAV_COUNT TOTAL_GB SESSION_COUNT DATE_RANGE \
        STORAGE_CLASSES MONTHLY_COST EGRESS_COST DISK_NEEDED_GB ACCOUNT_ID CONSOLE_URL USERNAME \

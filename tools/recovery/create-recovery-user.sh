@@ -253,7 +253,7 @@ done
 [ "$ok" -eq 1 ] || die "the new key never became usable - check it in the IAM console"
 
 who=$(key_aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null)
-say "self-test: the key signs in as $who"
+say "self-test: the key signs in as ${who:-(arn not returned; carrying on)}"
 
 if key_aws s3api list-objects-v2 --bucket "$BUCKET" --max-keys 1 >/dev/null 2>"$WORK/read.err"; then
     say "self-test: the key CAN read s3://$BUCKET - good"
@@ -265,8 +265,10 @@ fi
 
 # The bucket carries Object Lock, so even a successful write would be an
 # undeletable object - which is exactly why the Deny has to stop it first.
+# (--body must be a real file; the CLI rejects /dev/null before sending anything.)
+: > "$WORK/empty"
 if key_aws s3api put-object --bucket "$BUCKET" --key recovery-selftest/should-fail \
-       --body /dev/null >/dev/null 2>"$WORK/write.err"; then
+       --body "$WORK/empty" >/dev/null 2>"$WORK/write.err"; then
     echo >&2
     echo "!! !! THE RECOVERY KEY WAS ABLE TO WRITE TO THE BUCKET. !!" >&2
     echo "!! The Deny statement is not working. This key must not be handed out." >&2
