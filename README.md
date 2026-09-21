@@ -523,8 +523,7 @@ keep being paid. With `--credentials` the PDF contains the key and password:
 print it, and store it like a key. Without it, the credentials page has blanks
 to fill in by hand. `umik-recover.sh` is the one-command downloader the PDF
 points at (inventory, disk check, bulk Glacier restore, resumable sync,
-`SHA256SUMS` verification); it is copied beside the PDF and printed in its
-last appendix. Set `UMIK_NAS_LOCATION` and `UMIK_ROOT_LOGIN_LOCATION` in
+`SHA256SUMS` verification); it is copied beside the PDF. Set `UMIK_NAS_LOCATION` and `UMIK_ROOT_LOGIN_LOCATION` in
 `umik.local.conf` so the document can say where the local copy and the root
 login live.
 
