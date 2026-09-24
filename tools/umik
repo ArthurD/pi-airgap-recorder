@@ -1,6 +1,13 @@
 #!/bin/bash
 # umik - one-word driver for the things you do at the Mac.
 #
+#   umik process    the whole collection loop in one go, legs overlapped:
+#                   seal + verify, then AT THE SAME TIME clear+eject the
+#                   medium, upload+verify S3, and copy+re-hash to the NAS
+#                   (UMIK_NAS_DIR); local audio is deleted only once BOTH
+#                   off-box copies verified. `--keep-local` never deletes;
+#                   `--nas <dir>` overrides the NAS folder. This is what
+#                   "process the stick" means.
 #   umik download   for every mounted UMIK medium (USB stick or card):
 #                   seal all new recordings + logs into ~/UMIK-Archive,
 #                   verify the seals, then CLEAR the verified recordings
@@ -83,6 +90,10 @@ case "${1:-}" in
             "$TOOLS_DIR/umik-upload.sh" || failed=$((failed + 1))
         fi
         [ "$failed" -eq 0 ] || exit 1
+        ;;
+    process)
+        shift
+        exec "$TOOLS_DIR/umik-process.sh" "$@"
         ;;
     upload)
         shift

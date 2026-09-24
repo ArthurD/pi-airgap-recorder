@@ -13,8 +13,20 @@ UMIK_S3_BUCKET=your-umik-recordings-bucket
 # AWS CLI profile holding the uploader key (aws configure --profile umik).
 UMIK_AWS_PROFILE=umik
 
+# Where `umik process` keeps the quick-access copy: the folder that holds
+# recordings/<unit>/<session>/. Several candidates may be listed separated by
+# ':' (a network share's mount point tends to move); the first that exists
+# wins. Unset, or none mounted: the NAS leg is skipped and local audio stays.
+#UMIK_NAS_DIR="$HOME/mnt/nas/Umik Recordings:/Volumes/Network-Share/Umik Recordings"
+
 # Where sealed recordings are archived on this Mac.
 #UMIK_ARCHIVE="$HOME/UMIK-Archive"
+
+# How many files umik-ingest.sh seals (and verifies, and prunes) at once
+# (default 4). The ingest itself reads the environment only; `umik process`
+# passes this setting through, `umik download` does not - export it there:
+# UMIK_INGEST_JOBS=8 umik download
+#UMIK_INGEST_JOBS=4
 
 # Optional, for the successor instructions PDF (tools/recovery/build-pdf.sh):
 # UMIK_OWNER="Your Name"                       # defaults to git user.name

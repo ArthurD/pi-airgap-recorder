@@ -14,12 +14,24 @@
 #
 # Entirely offline - no network is touched, ever.
 #
+# Speed, without loosening any of that: files are sealed by a pool of workers
+# (UMIK_INGEST_JOBS, default 4) that only ever write to <name>.part alongside
+# the archive copy, and a single serial pass then promotes each .part to its
+# final name, in the exact order a one-at-a-time run would have used. So the
+# SHA256SUMS lines and the manifest chain are identical either way, and no
+# half-written file ever exists under a final name. Hashing prefers
+# /usr/bin/openssl (about five times faster than shasum here) and falls back to
+# shasum; the hashes, and the files holding them, are unchanged.
+#
 #   ./tools/umik-ingest.sh                     ingest /Volumes/UMIKDATA now
 #   ./tools/umik-ingest.sh /Volumes/MYSTICK    ingest a specific volume
 #   ./tools/umik-ingest.sh --install-agent     auto-ingest whenever mounted
 #   ./tools/umik-ingest.sh --uninstall-agent
 #   ./tools/umik-ingest.sh --verify            check the manifest hash chain
 #   ./tools/umik-ingest.sh --verify --deep     ...and re-hash every sealed file
+#   ./tools/umik-ingest.sh --check-sums <dir>...  re-hash the files listed in
+#                                              each dir's SHA256SUMS (any copy
+#                                              of a sealed session, e.g. on a NAS)
 #   ./tools/umik-ingest.sh --prune-verified [vol]  free card space: delete
 #                                              source files whose sealed copy
 #                                              re-verifies, never anything else
@@ -35,7 +47,15 @@
 #
 # The last segment of every session has a stale WAV header (power cut by
 # design). The sealed original is kept byte-exact; a playable derivative
-# <name>.repaired.wav is generated, sealed, and recorded separately.
+# <name>.repaired.wav is generated, sealed, and recorded separately. Whether a
+# derivative is needed at all is decided by `repair-wav.sh --check`, which only
+# reads the header - the copy is made (an APFS clone when it can be) solely for
+# the files that really do need one.
+#
+# Environment: UMIK_ARCHIVE (default ~/UMIK-Archive), UMIK_INGEST_JOBS
+# (default 4). Both are read from the environment only; this script
+# deliberately sources no config file, so an unattended agent run behaves
+# exactly like a hand-run one.
 
 set -uo pipefail
 
@@ -46,8 +66,14 @@ PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
 TOOLS_DIR=$(cd "$(dirname "$0")" && pwd)
 REPAIR="$TOOLS_DIR/repair-wav.sh"
 SHASUM=/usr/bin/shasum
+OPENSSL=/usr/bin/openssl
+HASHER=shasum
+
+JOBS="${UMIK_INGEST_JOBS:-4}"
+case "$JOBS" in ''|*[!0-9]*|0) JOBS=4 ;; esac
 
 AGENT_MODE=0
+WORKDIR=
 
 say()  { echo "==> $*"; }
 note() { # log a line to the run history and to stdout
@@ -61,8 +87,53 @@ notify() { # best-effort macOS notification; silent when unavailable
         >/dev/null 2>&1 || true
 }
 
-sha_of()      { "$SHASUM" -a 256 "$1" | awk '{print $1}'; }
-sha_of_text() { printf '%s' "$1" | "$SHASUM" -a 256 | awk '{print $1}'; }
+make_workdir() { # scratch for the work lists and result markers
+    WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/umik-ingest.XXXXXX") \
+        || die "cannot create a scratch directory"
+}
+
+# The one parallel pattern used here. Workers are handed a LINE NUMBER and look
+# the record up themselves: BSD xargs caps an assembled -I command line at 255
+# bytes, and two archive paths blow past it. Every worker must also exit 0 -
+# BSD xargs abandons the whole run on some non-zero child exits (the same trap
+# that once cut an upload short at 866 of 1515 objects, see umik-upload.sh).
+run_parallel() { # <worker function> <record count>
+    [ "$2" -gt 0 ] || return 0
+    # shellcheck disable=SC2163  # the worker's NAME is the argument, on purpose
+    export -f "$1" sha_of sha_stdin
+    export HASHER SHASUM OPENSSL REPAIR WORKDIR
+    seq 1 "$2" | xargs -P "$JOBS" -I{} bash -c "$1"' "$@"' _ {}
+}
+
+# Same SHA-256, five times the throughput: LibreSSL's dgst runs about
+# 2500 MB/s here where the Perl shasum manages 500, and a 460 MB segment is
+# hashed twice per seal. Nothing about the OUTPUT changes - bare lowercase hex,
+# written into the same SHA256SUMS format third parties check with
+# `shasum -a 256 -c`. The probe is the empty-input digest, so a build of
+# openssl that cannot do the job is caught here rather than mid-ingest.
+pick_hasher() {
+    local probe
+    probe=$(printf '' | "$OPENSSL" dgst -sha256 -r 2>/dev/null | awk '{print $1}')
+    [ "$probe" = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ] \
+        && HASHER=openssl
+    return 0
+}
+
+sha_of() { # <file> -> bare lowercase hex
+    case "$HASHER" in
+        openssl) "$OPENSSL" dgst -sha256 -r "$1" ;;
+        *)       "$SHASUM" -a 256 "$1" ;;
+    esac | awk '{print $1}'
+}
+
+sha_stdin() { # hash of stdin -> bare lowercase hex
+    case "$HASHER" in
+        openssl) "$OPENSSL" dgst -sha256 -r ;;
+        *)       "$SHASUM" -a 256 ;;
+    esac | awk '{print $1}'
+}
+
+sha_of_text() { printf '%s' "$1" | sha_stdin; }
 
 # Archive under the UNIT that recorded the session (umik1, umik2, ...), not
 # the medium's volume label: both units' media carry the same label, and
@@ -103,51 +174,149 @@ verify_manifest() {
     say "manifest chain OK: $n seals, head $run"
 }
 
-verify_deep() {
-    local fails=0 sums dir
-    for sums in "$ARCHIVE"/recordings/*/*/SHA256SUMS "$ARCHIVE"/logs/*/SHA256SUMS; do
-        [ -f "$sums" ] || continue
-        dir=$(dirname "$sums")
-        if (cd "$dir" && "$SHASUM" -a 256 -c SHA256SUMS >/dev/null 2>&1); then
+# Every sealed byte is re-read. The hashing runs $JOBS wide across the whole
+# archive - it is entirely disk-and-CPU bound - but the reporting stays exactly
+# as it was: one OK/FAIL line per directory, in directory order.
+verify_worker() { # <line number in $WORKDIR/list>  prints dir<TAB>name<TAB>result
+    local line dir name want have
+    line=$(sed -n "${1}p" "$WORKDIR/list")
+    dir=${line%%$'\t'*}
+    want=${line##*$'\t'}
+    line=${line#*$'\t'}
+    name=${line%%$'\t'*}
+    have=$(sha_of "$dir/$name" 2>/dev/null)
+    if [ -n "$have" ] && [ "$have" = "$want" ]; then
+        printf '%s\t%s\tOK\n' "$dir" "$name"
+    else
+        printf '%s\t%s\tFAILED\n' "$dir" "$name"
+    fi
+    return 0
+}
+
+# With no arguments: every sealed directory in the archive. With arguments:
+# exactly those directories (each holding a SHA256SUMS) - which is how a copy
+# of the archive somewhere else, a NAS say, is checked against the same seals.
+verify_deep() { # [dir ...]
+    local fails=0 sums dir total bad
+    make_workdir
+    trap 'rm -rf "$WORKDIR"' EXIT
+
+    : > "$WORKDIR/dirs"
+    if [ $# -gt 0 ]; then
+        for dir in "$@"; do
+            dir=${dir%/}
+            [ -f "$dir/SHA256SUMS" ] || die "no SHA256SUMS in $dir"
+            printf '%s\n' "$dir" >> "$WORKDIR/dirs"
+        done
+    else
+        for sums in "$ARCHIVE"/recordings/*/*/SHA256SUMS "$ARCHIVE"/logs/*/SHA256SUMS; do
+            [ -f "$sums" ] && dirname "$sums" >> "$WORKDIR/dirs"
+        done
+    fi
+
+    : > "$WORKDIR/list"
+    while IFS= read -r dir; do
+        awk -v d="$dir" '{h=$1; sub(/^[0-9a-f]+  /, ""); print d"\t"$0"\t"h}' "$dir/SHA256SUMS" \
+            >> "$WORKDIR/list"
+    done < "$WORKDIR/dirs"
+    total=$(wc -l < "$WORKDIR/list" | tr -d ' ')
+    say "re-hashing $total sealed file(s), $JOBS at a time ($HASHER)"
+    run_parallel verify_worker "$total" > "$WORKDIR/out"
+
+    while IFS= read -r dir; do
+        bad=$(awk -F'\t' -v d="$dir" '$1 == d && $3 != "OK" { print $2 ": FAILED" }' "$WORKDIR/out")
+        if [ -z "$bad" ]; then
             say "OK   ${dir#"$ARCHIVE"/}"
         else
             echo "FAIL ${dir#"$ARCHIVE"/} - a sealed file no longer matches its checksum" >&2
-            (cd "$dir" && "$SHASUM" -a 256 -c SHA256SUMS 2>&1 | grep -v ': OK$' >&2) || true
+            printf '%s\n' "$bad" >&2
             fails=$((fails + 1))
         fi
-    done
+    done < "$WORKDIR/dirs"
     [ "$fails" -eq 0 ] || die "$fails director(ies) failed deep verification"
     say "deep verification OK: every sealed byte matches its seal"
 }
 
 # --- sealing -----------------------------------------------------------------
 
+# Recording a seal - the publishable checksum line and the manifest link - is
+# always serial, and always from a file already sitting under its final name.
+seal_record() { # <file> <vol> <relpath> <bytes> <sha256>
+    printf '%s  %s\n' "$5" "$(basename "$1")" >> "$(dirname "$1")/SHA256SUMS"
+    manifest_append "$2" "$3" "$4" "$5"
+}
+
 seal_stream() { # <src> <dst> <vol> <relpath>  hash-while-copying, then verify
     local src=$1 dst=$2 vol=$3 rel=$4 bytes hsrc hdst
     bytes=$(stat -f%z "$src") || return 1
-    hsrc=$(tee "$dst" < "$src" | "$SHASUM" -a 256 | awk '{print $1}')
+    hsrc=$(tee "$dst" < "$src" | sha_stdin)
     hdst=$(sha_of "$dst")
     if [ -z "$hsrc" ] || [ "$hsrc" != "$hdst" ]; then
         rm -f "$dst"
         note "ERROR: copy verification FAILED for $rel (src $hsrc dst $hdst) - copy discarded"
         return 1
     fi
-    printf '%s  %s\n' "$hsrc" "$(basename "$dst")" >> "$(dirname "$dst")/SHA256SUMS"
-    manifest_append "$vol" "$rel" "$bytes" "$hsrc"
+    seal_record "$dst" "$vol" "$rel" "$bytes" "$hsrc"
     return 0
 }
 
-seal_local() { # <file> <vol> <relpath>  seal a locally generated derivative
-    local f=$1 vol=$2 rel=$3 h
-    h=$(sha_of "$f")
-    printf '%s  %s\n' "$h" "$(basename "$f")" >> "$(dirname "$f")/SHA256SUMS"
-    manifest_append "$vol" "$rel" "$(stat -f%z "$f")" "$h"
+# The parallel half of a seal. It runs in a bare `bash -c`, with none of this
+# script's shell options, several at a time, and it deliberately cannot do any
+# damage: it writes <dst>.part and a marker saying how that went, and never
+# touches SHA256SUMS, the manifest, or any final name. Always exits 0.
+seal_worker() { # <line number in $WORKDIR/jobs>
+    local line src dst rel bytes hsrc hdst rep rc
+    line=$(sed -n "${1}p" "$WORKDIR/jobs")
+    src=${line%%$'\t'*}
+    rel=${line##*$'\t'}
+    line=${line#*$'\t'}
+    dst=${line%%$'\t'*}
+
+    rm -f "$dst.part" "$dst.part.ok" "$dst.fail"
+    if [ ! -r "$src" ]; then
+        printf 'cannot read %s on the medium - nothing sealed\n' "$rel" > "$dst.fail"
+        return 0
+    fi
+    bytes=$(stat -f%z "$src") || bytes=
+    hsrc=$(tee "$dst.part" < "$src" | sha_stdin)
+    hdst=$(sha_of "$dst.part" 2>/dev/null)
+    if [ -z "$hsrc" ] || [ -z "$bytes" ] || [ "$hsrc" != "$hdst" ]; then
+        rm -f "$dst.part"
+        printf 'copy verification FAILED for %s (src %s dst %s) - copy discarded\n' \
+            "$rel" "$hsrc" "$hdst" > "$dst.fail"
+        return 0
+    fi
+    printf '%s\t%s\n' "$bytes" "$hsrc" > "$dst.part.ok"
+
+    # Playable derivative for power-cut tails. --check reads the header and
+    # nothing else, so the 460 MB copy happens only for the handful of files
+    # that genuinely need one (exit 1; 0 is a good header, 2 is not a WAV).
+    case "$dst" in
+        *.repaired.wav) return 0 ;;
+        *.wav) ;;
+        *) return 0 ;;
+    esac
+    rep="${dst%.wav}.repaired.wav"
+    [ ! -e "$rep" ] || return 0
+    [ -x "$REPAIR" ] || return 0
+    rm -f "$rep.part" "$rep.part.ok" "$rep.fail"
+    "$REPAIR" --check "$dst.part" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 1 ] || return 0
+    if ! cp -c "$dst.part" "$rep.part" 2>/dev/null && ! cp "$dst.part" "$rep.part"; then
+        rm -f "$rep.part"
+        printf 'could not copy %s to make its repaired derivative\n' "$rel" > "$rep.fail"
+        return 0
+    fi
+    "$REPAIR" --in-place "$rep.part" >/dev/null 2>&1 || true
+    printf '%s\t%s\n' "$(stat -f%z "$rep.part")" "$(sha_of "$rep.part")" > "$rep.part.ok"
+    return 0
 }
 
 # --- ingest ------------------------------------------------------------------
 
 ingest() {
-    local SRC=$1 vol unit sdir sname dest base src dst rel rep
+    local SRC=$1 vol unit sdir sname dest base src dst rel rep bytes hsrc total
     local new=0 skipped=0 warned=0 repaired=0
 
     if [ ! -d "$SRC/recordings" ]; then
@@ -162,10 +331,15 @@ ingest() {
         note "another ingest is running (or crashed leaving $ARCHIVE/.lock) - exiting"
         exit 0
     fi
-    trap 'rmdir "$ARCHIVE/.lock" 2>/dev/null' EXIT
+    make_workdir
+    trap 'rmdir "$ARCHIVE/.lock" 2>/dev/null; rm -rf "$WORKDIR"' EXIT
 
     note "ingest start: $SRC -> $ARCHIVE (volume '$vol')"
 
+    # Phase A (serial): walk the medium in directory order and settle
+    # everything that is already sealed, leaving a work list that holds only
+    # new seals - in the order a one-file-at-a-time run would have done them.
+    : > "$WORKDIR/jobs"
     for sdir in "$SRC"/recordings/*/; do
         [ -d "$sdir" ] || continue
         sname=$(basename "$sdir")
@@ -192,33 +366,56 @@ ingest() {
                 continue
             fi
 
-            if seal_stream "$src" "$dst" "$vol" "$rel"; then
-                note "sealed $rel ($(stat -f%z "$dst") bytes)"
-                new=$((new + 1))
-            else
-                warned=$((warned + 1))
-                continue
-            fi
-
-            # Playable derivative for power-cut tails, sealed separately.
-            case "$base" in
-                *.repaired.wav) ;;
-                *.wav)
-                    rep="${dst%.wav}.repaired.wav"
-                    if [ ! -e "$rep" ] && [ -x "$REPAIR" ]; then
-                        cp "$dst" "$rep"
-                        "$REPAIR" --in-place "$rep" >/dev/null 2>&1 || true
-                        if cmp -s "$dst" "$rep"; then
-                            rm -f "$rep"    # header was already correct
-                        else
-                            seal_local "$rep" "$vol" "recordings/$unit/$sname/$(basename "$rep")"
-                            note "sealed $(basename "$rep") (repaired header derivative)"
-                            repaired=$((repaired + 1))
-                        fi
-                    fi ;;
-            esac
+            printf '%s\t%s\t%s\t%s\n' "$src" "$dst" "$vol" "$rel" >> "$WORKDIR/jobs"
         done
     done
+
+    # Phase B (parallel): read the medium, copy, and verify - into .part files
+    # and result markers only. Nothing here is a seal yet.
+    total=$(wc -l < "$WORKDIR/jobs" | tr -d ' ')
+    [ "$total" -eq 0 ] || note "sealing $total new file(s), $JOBS at a time ($HASHER)"
+    run_parallel seal_worker "$total"
+
+    # Phase C (serial, Phase A order): promote each verified .part to its final
+    # name and record the seal. Same order, same lines, same log as a serial
+    # run - and a file that never got here never existed under its real name.
+    # Fresh names for the record's fields ($vol and friends are still needed
+    # after this loop, and `read` empties whatever it was given at EOF). The
+    # source path has done its job in Phase B and is dropped here.
+    while IFS=$'\t' read -r _ dst jvol rel; do
+        if [ -f "$dst.part.ok" ]; then
+            IFS=$'\t' read -r bytes hsrc < "$dst.part.ok"
+            rm -f "$dst.part.ok"
+            mv "$dst.part" "$dst"
+            seal_record "$dst" "$jvol" "$rel" "$bytes" "$hsrc"
+            note "sealed $rel ($bytes bytes)"
+            new=$((new + 1))
+        else
+            if [ -f "$dst.fail" ]; then
+                note "ERROR: $(cat "$dst.fail")"
+            else
+                note "ERROR: $rel was never sealed - its worker did not finish"
+            fi
+            rm -f "$dst.part" "$dst.fail"
+            warned=$((warned + 1))
+            continue
+        fi
+
+        # Playable derivative for power-cut tails, sealed separately.
+        rep="${dst%.wav}.repaired.wav"
+        if [ -f "$rep.part.ok" ]; then
+            IFS=$'\t' read -r bytes hsrc < "$rep.part.ok"
+            rm -f "$rep.part.ok"
+            mv "$rep.part" "$rep"
+            seal_record "$rep" "$jvol" "${rel%.wav}.repaired.wav" "$bytes" "$hsrc"
+            note "sealed $(basename "$rep") (repaired header derivative)"
+            repaired=$((repaired + 1))
+        elif [ -f "$rep.fail" ]; then
+            note "ERROR: $(cat "$rep.fail")"
+            rm -f "$rep.part" "$rep.fail"
+            warned=$((warned + 1))
+        fi
+    done < "$WORKDIR/jobs"
 
     # Snapshot the card's activity/diag logs - they are evidence too. Skipped
     # when an identical byte-for-byte snapshot was already sealed.
@@ -259,30 +456,71 @@ ingest() {
 # Free card space: delete a source file ONLY after its sealed copy re-verifies
 # against the recorded checksum. Anything unsealed or mismatched stays put.
 
+# Hashing only - this worker deletes nothing and writes nothing but its own
+# "this one re-verified" marker. Always exits 0.
+prune_worker() { # <line number in $WORKDIR/cand>
+    local line dst want have
+    line=$(sed -n "${1}p" "$WORKDIR/cand")
+    line=${line#*$'\t'}
+    dst=${line%%$'\t'*}
+    line=${line#*$'\t'}
+    want=${line%%$'\t'*}
+    [ "$want" != - ] || return 0
+    [ -f "$dst" ] || return 0
+    have=$(sha_of "$dst" 2>/dev/null)
+    [ -n "$have" ] && [ "$have" = "$want" ] && : > "$WORKDIR/ok.$1"
+    return 0
+}
+
 prune_verified() {
-    local SRC=$1 vol unit sdir sname dest base src dst want have removed=0 kept=0
+    local SRC=$1 vol unit sdir sname dest base src dst want label total n=0 removed=0 kept=0
     [ -d "$SRC/recordings" ] || die "$SRC has no recordings/ directory"
     vol=$(basename "$SRC" | tr -cd 'A-Za-z0-9._-')
+    make_workdir
+    trap 'rm -rf "$WORKDIR"' EXIT
+
+    # Pass 1: list every candidate, in the order the messages have always come
+    # out. A file with no seal line gets an empty hash and is never verified.
+    : > "$WORKDIR/cand"
+    : > "$WORKDIR/sessions"
     for sdir in "$SRC"/recordings/*/; do
         [ -d "$sdir" ] || continue
         sname=$(basename "$sdir")
         unit=$(session_unit "$sdir" "$vol")
         dest="$ARCHIVE/recordings/$unit/$sname"
+        printf '%s\n' "$sdir" >> "$WORKDIR/sessions"
         for src in "$sdir"*; do
             [ -f "$src" ] || continue
             base=$(basename "$src")
             case "$base" in .*|._*) continue ;; esac
             dst="$dest/$base"
             want=$(grep -F "  $base" "$dest/SHA256SUMS" 2>/dev/null | awk 'NR==1{print $1}')
-            if [ -n "$want" ] && [ -f "$dst" ] && have=$(sha_of "$dst") && [ "$have" = "$want" ]; then
-                rm "$src" && removed=$((removed + 1))
-            else
-                kept=$((kept + 1))
-                echo "KEEP $sname/$base - no verified seal in the archive" >&2
-            fi
+            # A dash, never an empty field: tab is IFS whitespace, so `read`
+            # would collapse two tabs into one and shift every later column.
+            [ -n "$want" ] || want=-
+            printf '%s\t%s\t%s\t%s\n' "$src" "$dst" "$want" "$sname/$base" >> "$WORKDIR/cand"
         done
-        rmdir "$sdir" 2>/dev/null || true   # only removes emptied sessions
     done
+
+    # Pass 2: re-hash the archive copies, $JOBS at a time.
+    total=$(wc -l < "$WORKDIR/cand" | tr -d ' ')
+    run_parallel prune_worker "$total"
+
+    # Pass 3: delete, serially, only what pass 2 proved. Any doubt - no marker,
+    # an unreadable archive copy, a missing seal line - keeps the source file.
+    while IFS=$'\t' read -r src dst want label; do
+        n=$((n + 1))
+        if [ -f "$WORKDIR/ok.$n" ]; then
+            rm "$src" && removed=$((removed + 1))
+        else
+            kept=$((kept + 1))
+            echo "KEEP $label - no verified seal in the archive" >&2
+        fi
+    done < "$WORKDIR/cand"
+
+    while IFS= read -r sdir; do
+        rmdir "$sdir" 2>/dev/null || true   # only removes emptied sessions
+    done < "$WORKDIR/sessions"
     say "pruned $removed verified file(s) from $SRC, kept $kept"
 }
 
@@ -327,17 +565,24 @@ uninstall_agent() {
 
 # --- main --------------------------------------------------------------------
 
+pick_hasher
+
 case "${1:-}" in
     --install-agent)   install_agent ;;
     --uninstall-agent) uninstall_agent ;;
     --verify)
         verify_manifest
-        [ "${2:-}" = "--deep" ] && verify_deep
+        if [ "${2:-}" = "--deep" ]; then verify_deep; fi
+        ;;
+    --check-sums)
+        shift
+        [ $# -gt 0 ] || die "usage: umik-ingest.sh --check-sums <dir> [dir ...]"
+        verify_deep "$@"
         ;;
     --prune-verified)  prune_verified "${2:-$SRC_DEFAULT}" ;;
     --agent)           AGENT_MODE=1; ingest "$SRC_DEFAULT" ;;
     --help|-h)
-        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)                 ingest "${1:-$SRC_DEFAULT}" ;;
 esac
