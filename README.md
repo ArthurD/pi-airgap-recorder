@@ -391,7 +391,9 @@ after its archived copy re-verifies by hash** — media go back empty,
 `umik process` is the same loop with the off-site legs folded in and run at
 the same time: seal + verify, then clear+eject the stick *while* the S3
 upload+verify and the NAS copy+re-hash (`UMIK_NAS_DIR`, see
-`umik.local.conf.example`) run alongside it. Local audio is deleted only once
+`umik.local.conf.example`; the path must sit on a mounted network share, and
+is re-checked before every write, so an unmounted mount point can never pass
+local disk off as the NAS) run alongside it. Local audio is deleted only once
 **both** off-box copies verified against the seals (`--keep-local` to never
 delete). Sealing itself runs `UMIK_INGEST_JOBS` files at a time (default 4),
 hashing with the system `openssl` — about 5× faster than `shasum` on Apple

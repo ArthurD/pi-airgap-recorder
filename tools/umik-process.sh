@@ -19,9 +19,11 @@
 # summary says so - nothing here ever guesses. Leg logs land in
 # $ARCHIVE/process/<utc-stamp>/.
 #
-# UMIK_NAS_DIR may list several candidates separated by ':' (the mount point
-# moves between ~/mnt/nas and /Volumes/... on this Mac); the first one that
-# exists wins.
+# UMIK_NAS_DIR may list several candidates separated by ':'; the first one
+# that is a directory ON A NETWORK MOUNT (smbfs/afpfs/nfs) wins. A candidate
+# that exists but sits on local disk - an unmounted mount point, a stale
+# symlink target - is rejected, and the check is repeated right before each
+# rsync: the NAS leg must never quietly copy onto this Mac and call it the NAS.
 
 set -uo pipefail
 
@@ -55,7 +57,7 @@ while [ $# -gt 0 ]; do
         --keep-local) KEEP_LOCAL=1 ;;
         --nas)        NAS_ARG=${2:-}; shift ;;
         --nas=*)      NAS_ARG=${1#--nas=} ;;
-        -h|--help)    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)           die "unknown option '$1' (see umik process --help)" ;;
         *)            MEDIA+=("${1%/}") ;;
     esac
@@ -73,12 +75,34 @@ if [ "${#MEDIA[@]}" -eq 0 ]; then
 fi
 [ "${#MEDIA[@]}" -gt 0 ] || die "no UMIK media mounted (looked for /Volumes/*/recordings)"
 
+# The filesystem type behind a path, as `mount` reports it (smbfs, apfs, ...).
+# macOS has no `df -T` / `stat -f %T`-for-fstype, so: df gives the mount point,
+# mount gives its type.
+fs_type_of() { # <path>
+    local mp
+    mp=$(df -P "$1" 2>/dev/null | awk 'NR==2{ $1=$2=$3=$4=$5=""; sub(/^ +/,""); print }')
+    [ -n "$mp" ] || return 1
+    mount | awk -v m="$mp" '
+        index($0, " on " m " (") { s=$0; sub(/.*\(/, "", s); sub(/[,)].*/, "", s); print s; exit }'
+}
+# A usable NAS directory: exists, and its (symlink-resolved) path lives on a
+# network filesystem. Prints the resolved path; fails otherwise.
+nas_dir_ok() { # <path>
+    local real t
+    [ -n "$1" ] && [ -d "$1" ] || return 1
+    real=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+    t=$(fs_type_of "$real") || return 1
+    case "$t" in smbfs|afpfs|nfs|webdav) printf '%s' "$real" ;; *) return 1 ;; esac
+}
+
 NAS=""
 # (bash 3.2 + set -u: never expand an array that may be empty)
 IFS=: read -ra cands <<< "$NAS_CANDIDATES"
 if [ "${#cands[@]}" -gt 0 ]; then
     for c in "${cands[@]}"; do
-        [ -n "$c" ] && [ -d "$c" ] && { NAS=$c; break; }
+        if NAS=$(nas_dir_ok "$c"); then break; fi
+        NAS=""
+        [ -n "$c" ] && [ -d "$c" ] && say "NAS candidate $c exists but is on local disk ($(fs_type_of "$c" || echo '?')) - ignored"
     done
 fi
 
@@ -165,6 +189,11 @@ leg_nas() {
     dirs=()
     for s in "${NEW[@]}"; do
         unit=$(basename "$(dirname "$s")"); sname=$(basename "$s")
+        # Re-check before every write: a share that dropped mid-run leaves a
+        # plain local directory behind, and rsync would happily fill it.
+        if ! nas_dir_ok "$NAS" >/dev/null; then
+            leg nas "$NAS is no longer a network mount - NAS leg FAILED, nothing written"; return 1
+        fi
         dst="$NAS/recordings/$unit/$sname"
         mkdir -p "$dst"
         # macOS rsync: no --info; owner/perms are the NAS's business.
@@ -175,6 +204,7 @@ leg_nas() {
         fi
     done
     [ "$rc" -eq 0 ] || return 1
+    nas_dir_ok "$NAS" >/dev/null || { leg nas "$NAS is no longer a network mount - NAS leg FAILED"; return 1; }
     leg nas "copied ${#dirs[@]} session(s), re-hashing them on the NAS"
     "$INGEST" --check-sums "${dirs[@]}" >> "$RUN/nas.log" 2>&1 \
         || { leg nas "NAS re-hash FAILED (see nas.log)"; return 1; }

@@ -14,10 +14,12 @@ UMIK_S3_BUCKET=your-umik-recordings-bucket
 UMIK_AWS_PROFILE=umik
 
 # Where `umik process` keeps the quick-access copy: the folder that holds
-# recordings/<unit>/<session>/. Several candidates may be listed separated by
-# ':' (a network share's mount point tends to move); the first that exists
-# wins. Unset, or none mounted: the NAS leg is skipped and local audio stays.
-#UMIK_NAS_DIR="$HOME/mnt/nas/Umik Recordings:/Volumes/Network-Share/Umik Recordings"
+# recordings/<unit>/<session>/, on a mounted network share. Several candidates
+# may be listed separated by ':'; the first that is a directory on a network
+# mount (smbfs/afpfs/nfs) wins - a path on local disk is never accepted, so an
+# unmounted mount point cannot masquerade as the NAS. Unset, or none mounted:
+# the NAS leg is skipped and local audio stays.
+#UMIK_NAS_DIR="/Volumes/Network-Share/Umik Recordings"
 
 # Where sealed recordings are archived on this Mac.
 #UMIK_ARCHIVE="$HOME/UMIK-Archive"
