@@ -50,7 +50,9 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
 - [x] ~~Unit 2 has not reported since 2026-08-16.~~ Collected 2026-09-19:
       five sessions (Sep 16-18), all `time_source: rtc`, `clock_trusted`.
 - [ ] **Unit 1's stick is still labelled TESLADRIVE.** Harmless (sessions are
-      unit-stamped) but rename it when convenient.
+      unit-stamped) but rename it when convenient. Rotation as of 2026-10-07:
+      three sticks (`TESLADRIVE` 256 GB, `UMIK2`, `UMIK3` 128 GB exFAT, added
+      2026-10-07) between the two units.
 
 ## Housekeeping
 

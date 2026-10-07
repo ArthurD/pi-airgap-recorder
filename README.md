@@ -368,6 +368,22 @@ path falls back and says so. Each location keeps its own session counter.
 `umik download` → eject, stick back, power on. Pulling power first means the
 stick is never yanked mid-write.
 
+**Preparing a stick:** none needed beyond a filesystem the Pi can mount —
+`umik-usb-detect` creates `recordings/` and `logs/` itself. exFAT is the
+sensible choice (no 4 GB file cap, no per-write `flush` mount option), with a
+label that names the stick, not a unit — sticks move between Pis and the
+archive files sessions by the unit stamped in `session.json`, never by the
+volume label:
+
+```bash
+diskutil eraseDisk ExFAT UMIK3 MBR /dev/diskN     # diskutil list → find N
+date -u +%s > /Volumes/UMIK3/umik-time-seed       # optional clock floor for the first boot
+```
+
+Three sticks (`UMIK2`, `UMIK3`, and unit 1's still-labelled `TESLADRIVE`)
+rotate between the two units: one in each Pi, one travelling or sitting in
+the Mac. A spare means the collection loop never waits on `umik process`.
+
 `umik download` seals every mounted medium, then clears each recording **only
 after its archived copy re-verifies by hash** — media go back empty,
 `~/UMIK-Archive` is the truth, and anything unverified stays put loudly.
