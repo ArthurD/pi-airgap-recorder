@@ -1,6 +1,7 @@
 #!/bin/sh
 # umik-record - continuous segmented capture from a USB measurement mic
-# (miniDSP UMIK-1 or RODE NT1 5th Gen out of the box; see UMIK_VID below).
+# (miniDSP UMIK-1, RODE NT1 5th Gen or Dodotronic Ultramic out of the box;
+# see UMIK_VID below).
 #
 # Design notes:
 #   * The UMIK-1's USB product string embeds its per-unit calibration gain
@@ -28,15 +29,43 @@ set -eu
 # Nothing below this line is mic-specific: the format probe asks the hardware
 # what it accepts, and the calibration gain simply reads "unknown" when the
 # product string has none. So the vendor is a knob, not a premise:
-#   UMIK_VID="2752 19f7"  the shipped default (miniDSP, RODE)
-#   UMIK_VID=<vvvv>       record only from this USB vendor's device
-#   UMIK_VID=any          record from the first USB audio capture device found
-UMIK_VID=${UMIK_VID:-"2752 19f7"}
+#   UMIK_VID="2752 19f7 0869"  the shipped default (miniDSP, RODE, Dodotronic)
+#   UMIK_VID=<vvvv>            record only from this USB vendor's device
+#   UMIK_VID=any               record from the first USB audio capture device found
+#
+# 0869 for Dodotronic is second-hand: it is what a sibling model (Ultramic
+# 192K, 0869:0308) enumerates as, it is not in the public usb.ids database,
+# and the 250K itself had not been plugged into one of these units when this
+# was written. Hence UMIK_MATCH_NAME below, as a belt to these braces.
+UMIK_VID=${UMIK_VID:-"2752 19f7 0869"}
 # Narrows the match to one product. Only honoured when UMIK_VID names exactly
 # ONE vendor: a product ID is unique only within a vendor, so pairing it with a
 # list (or with "any") would mean something different for each entry. Ignored,
 # loudly, otherwise.
 UMIK_PID=${UMIK_PID:-}
+# Fallback match on the device's own USB strings: a sound card whose vendor ID
+# is NOT in UMIK_VID is still taken if its USB product or manufacturer string
+# contains any of these (case-sensitive substrings, space- or comma-separated).
+# It exists for the Ultramic, whose vendor ID above is an inference, so that a
+# 250K that turns out to enumerate under some other ID still gets recorded on
+# its first deployment rather than costing one. Not consulted under
+# UMIK_VID=any (which already takes everything) or when UMIK_PID is set (a
+# product pin is an exact ask, and a name match would quietly widen it).
+# "${VAR-default}", not ":-": an explicitly EMPTY UMIK_MATCH_NAME= is how you
+# switch the fallback off, and ":-" would put the default straight back.
+UMIK_MATCH_NAME=${UMIK_MATCH_NAME-"UltraMic Ultramic Dodotronic"}
+
+# Is this the Dodotronic Ultramic? By vendor, or - for the same reason as
+# UMIK_MATCH_NAME - by its USB strings. Deliberately a fixed pattern, NOT
+# UMIK_MATCH_NAME: that knob decides which devices get recorded, this decides
+# what one of them is called and asked for, and emptying the knob must not
+# turn a recognised Ultramic back into an anonymous 48k device.
+is_ultramic() { # <vvvv> <product> <manufacturer>
+    [ "$1" = 0869 ] && return 0
+    case "$2" in *[Uu]ltra[Mm]ic*|*Dodotronic*) return 0 ;; esac
+    case "$3" in *[Uu]ltra[Mm]ic*|*Dodotronic*) return 0 ;; esac
+    return 1
+}
 
 # Friendly mic label for the log line and session.json. Purely cosmetic - an
 # unrecognised vendor just gets its own USB strings - so adding a mic here is
@@ -49,7 +78,16 @@ mic_label() { # <vvvv> <product> <manufacturer>
                   RODE*|Rode*|rode*) printf '%s' "$2" ;;
                   *)                 printf 'RODE %s' "$2" ;;
               esac ;;
-        *)    case "$3" in                      # "<manufacturer> <product>"
+        0869) case "$2" in                      # Dodotronic: Ultramic 250K & kin
+                  unknown|'')        printf 'Dodotronic Ultramic' ;;
+                  Dodotronic*|DODOTRONIC*|dodotronic*) printf '%s' "$2" ;;
+                  *)                 printf 'Dodotronic %s' "$2" ;;
+              esac ;;
+        *)    if is_ultramic "$1" "$2" "$3"; then   # an Ultramic under another ID
+                  mic_label 0869 "$2" "$3"
+                  return 0
+              fi
+              case "$3" in                      # "<manufacturer> <product>"
                   unknown|'') printf '%s' "$2" ;;
                   *)          printf '%s %s' "$3" "$2" ;;
               esac ;;
@@ -62,7 +100,9 @@ mic_label() { # <vvvv> <product> <manufacturer>
 # cannot do its first choice quietly lands on the next. Two lines out:
 # preferred formats, then preferred sample rates. UMIK_FORMAT and UMIK_RATE
 # override either list. Adding a mic is one case arm, same as mic_label().
-mic_prefs() { # <vvvv> -> line 1: formats, line 2: rates
+# The USB strings ride along so that a mic recognised by name rather than by
+# vendor (see is_ultramic) still gets its own preference, not the default.
+mic_prefs() { # <vvvv> <product> <manufacturer> -> line 1: formats, line 2: rates
     case "$1" in
         # miniDSP: byte-for-byte what this recorder has always asked for. A
         # measurement mic is calibrated at one rate, and every UMIK-1 session
@@ -77,9 +117,25 @@ mic_prefs() { # <vvvv> -> line 1: formats, line 2: rates
         # The rate list IS the knob: drop 192000 here, or set UMIK_RATE, and
         # the cost falls with it.
         19f7) printf 'FLOAT_LE S32_LE S24_3LE S16_LE\n192000 96000 48000\n' ;;
+        # Dodotronic Ultramic: an ultrasonic MEMS mic, and the reason it is in
+        # the kit at all is the band ABOVE 24 kHz - so ask for the top rate
+        # first, same quality-over-storage call as the RODE. The 250K does
+        # exactly one thing, 16-bit at 250 kHz (0-125 kHz); the rest of the
+        # rate list is its siblings in the same family (384K, 200K, 192K)
+        # and a graceful floor. S16_LE only: it is a 16-bit device, and
+        # listing S24/S32/FLOAT would just be three refused probes per rate
+        # and channel count before the one that works. The cost: mono 16-bit
+        # at 250 kHz is 500 KB/s - ~1.8 GB/hour, ~43 GB/day, so a 128GB card
+        # is ~2.9 days. Same knob as the RODE: trim the list or set UMIK_RATE.
+        0869) printf 'S16_LE\n250000 384000 200000 192000 96000 48000\n' ;;
         # Anything else: the conservative default. An unknown mic is not worth
-        # filling a card over before someone has decided it should be.
-        *)    printf 'S24_3LE S32_LE S16_LE FLOAT_LE\n48000\n' ;;
+        # filling a card over before someone has decided it should be - unless
+        # its USB strings say it is an Ultramic under an unexpected vendor ID.
+        *)    if is_ultramic "$1" "$2" "$3"; then
+                  mic_prefs 0869 "$2" "$3"
+              else
+                  printf 'S24_3LE S32_LE S16_LE FLOAT_LE\n48000\n'
+              fi ;;
     esac
 }
 
@@ -147,6 +203,7 @@ WAIT_SECS=${UMIK_WAIT_SECONDS:-60}
 # same, because getting that silently wrong presents as an unexplained FATAL
 # an hour into a field deployment.
 VID_LIST=$(printf '%s' "$UMIK_VID" | tr ',' ' ')
+NAME_LIST=$(printf '%s' "$UMIK_MATCH_NAME" | tr ',' ' ')
 VID_COUNT=0
 for v in $VID_LIST; do VID_COUNT=$((VID_COUNT + 1)); done
 
@@ -172,17 +229,42 @@ id_matches() {
     return 1
 }
 
-# Echoes "<card-index> <usbid>" for the FIRST sound card matching ANY listed
-# vendor. With one mic plugged in, that is the mic, whichever one it is. With
-# two, the lower ALSA card index wins - arbitrary but deterministic, and
-# session.json says which one it picked.
+# The UMIK_MATCH_NAME fallback for a card id_matches() turned down. Echoes
+# which string hit - "product" or "manufacturer" - for the "found" log line.
+# Off under UMIK_VID=any (id_matches took everything already) and under a
+# UMIK_PID pin, which is an exact ask that a name match must not widen.
+name_matches() { # <product> <manufacturer>
+    [ "$UMIK_VID" != "any" ] && [ -z "$UMIK_PID" ] || return 1
+    for n in $NAME_LIST; do
+        case "$1" in *"$n"*) echo product; return 0 ;; esac
+        case "$2" in *"$n"*) echo manufacturer; return 0 ;; esac
+    done
+    return 1
+}
+
+# Echoes "<card-index> <usbid> <rule>" for the FIRST sound card matching ANY
+# listed vendor, or failing that whose USB strings match UMIK_MATCH_NAME.
+# <rule> (vendor, any, product or manufacturer) says which test let it in,
+# so the log can say why a device was taken. With one mic plugged in, that is
+# the mic, whichever one it is. With two, the lower ALSA card index wins -
+# arbitrary but deterministic, and session.json says which one it picked.
+#
+# find_usb_strings is defined below this; that is fine in sh, which only
+# needs a function to exist by the time it is CALLED, not when it is parsed.
 find_card() {
     for u in /proc/asound/card*/usbid; do
         [ -r "$u" ] || continue
         _id=$(cat "$u")
-        id_matches "$_id" || continue
         c=${u%/usbid}
-        echo "${c##*/card} ${_id}"
+        if id_matches "$_id"; then
+            _rule=vendor
+            [ "$UMIK_VID" = "any" ] && _rule=any
+        else
+            _strs=$(find_usb_strings "$_id" 2>/dev/null || true)
+            _rule=$(name_matches "$(printf '%s\n' "$_strs" | sed -n 1p)" \
+                                 "$(printf '%s\n' "$_strs" | sed -n 2p)") || continue
+        fi
+        echo "${c##*/card} ${_id} ${_rule}"
         return 0
     done
     return 1
@@ -224,19 +306,28 @@ while ! FOUND=$(find_card); do
         if [ "$UMIK_VID" = "any" ]; then
             applog "FATAL: no USB audio capture device after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port?"
         else
-            applog "FATAL: no device from USB vendor(s) ${VID_LIST} after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port? (set UMIK_VID=any to accept any USB mic)"
+            _also=""
+            [ -n "$NAME_LIST" ] && [ -z "$UMIK_PID" ] && \
+                _also=" or USB product/manufacturer string matching ${NAME_LIST}"
+            applog "FATAL: no device from USB vendor(s) ${VID_LIST}${_also} after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port? (set UMIK_VID=any to accept any USB mic)"
         fi
+        # Name each card's USB product string too: with the name fallback in
+        # play, "saw 1234:5678" alone cannot say why it was not taken.
         for u in /proc/asound/card*/usbid; do
-            [ -r "$u" ] && applog "  saw sound device: $(cat "$u")"
+            [ -r "$u" ] || continue
+            _id=$(cat "$u")
+            applog "  saw sound device: ${_id} (\"$(find_usb_strings "$_id" 2>/dev/null | sed -n 1p)\")"
         done
-        log "(the UMIK cable is USB-C at the mic, USB-A at the Pi; the Pi's USB-C is power-only)"
+        log "(the UMIK cable is USB-C at the mic, USB-A at the Pi; the Ultramic's is mini-USB B at the mic; the Pi's USB-C is power-only)"
         exit 1
     fi
     sleep 1
     elapsed=$((elapsed + 1))
 done
-CARD=${FOUND% *}
+CARD=${FOUND%% *}
 USBID=${FOUND#* }
+MATCH_RULE=${USBID#* }
+USBID=${USBID%% *}
 VENDOR_ID=${USBID%:*}
 PRODUCT_ID=${USBID#*:}
 
@@ -250,11 +341,23 @@ SERIAL=$(printf '%s\n' "$USB_STRINGS" | sed -n 3p)
 
 MIC=$(mic_label "$VENDOR_ID" "$PRODUCT" "$MANUFACTURER")
 
+# Why this device was taken, for the "found" line. A name-matched device is
+# by definition one whose vendor ID nobody listed - worth knowing at a glance,
+# and the ID it actually reports belongs in UMIK_VID (and the udev rule).
+case "$MATCH_RULE" in
+    vendor)       MATCH_NOTE="matched by vendor ${VENDOR_ID}"
+                  [ -n "$UMIK_PID" ] && MATCH_NOTE="matched by vendor:product ${USBID}" ;;
+    any)          MATCH_NOTE="matched by UMIK_VID=any" ;;
+    product)      MATCH_NOTE="matched by product string \"${PRODUCT}\"" ;;
+    manufacturer) MATCH_NOTE="matched by manufacturer string \"${MANUFACTURER}\"" ;;
+    *)            MATCH_NOTE="matched by ${MATCH_RULE}" ;;
+esac
+
 # Pull the calibration gain out of the product string if it is there.
 GAIN=$(printf '%s' "$PRODUCT" | sed -n 's/.*[Gg]ain:*[[:space:]]*\([0-9.]*\)[[:space:]]*dB.*/\1/p')
 [ -n "$GAIN" ] || GAIN="unknown"
 
-applog "found ${MIC} - ${USBID} on ALSA card ${CARD} (\"${PRODUCT}\", gain ${GAIN} dB)"
+applog "found ${MIC} - ${USBID} on ALSA card ${CARD} (\"${PRODUCT}\", gain ${GAIN} dB, ${MATCH_NOTE})"
 
 # --- pick a working sample format -----------------------------------------
 
@@ -270,7 +373,7 @@ applog "found ${MIC} - ${USBID} on ALSA card ${CARD} (\"${PRODUCT}\", gain ${GAI
 # for a measurement mic, and it is half the bytes either way. First
 # combination the hardware accepts wins.
 DEV="hw:${CARD},0"
-PREFS=$(mic_prefs "$VENDOR_ID")
+PREFS=$(mic_prefs "$VENDOR_ID" "$PRODUCT" "$MANUFACTURER")
 # Env overrides win, and both now take a list - a bare "UMIK_RATE=96000" is
 # just a one-element list, so the old single-value usage keeps working.
 PROBE_FORMATS=$(printf '%s' "${UMIK_FORMAT:-$(printf '%s\n' "$PREFS" | sed -n 1p)}" | tr ',' ' ')
@@ -326,6 +429,9 @@ BYTES_PER_SEC=$((SAMPLE_BYTES * CHANNELS * RATE))
 # Decimal MB, matching how the README quotes the storage budget and how df
 # on a disk you can actually buy quotes its capacity.
 MB_PER_HOUR=$((BYTES_PER_SEC * 3600 / 1000000))
+# The band actually captured (Nyquist), stamped into session.json so a reader
+# sees "0-125 kHz" vs "0-24 kHz" without doing the arithmetic.
+BANDWIDTH_HZ=$((RATE / 2))
 applog "capture format ${FORMAT} @ ${RATE} Hz, ${CHANNELS} ch, ${SEGMENT}s segments (${BYTES_PER_SEC} B/s, ~${MB_PER_HOUR} MB/hour)"
 
 # A WAV data chunk is a 32-bit byte count, so a segment cannot exceed 4 GiB
@@ -475,6 +581,7 @@ cat > "${SESSION_DIR}/session.json" <<EOF
   "format": {
     "encoding": "${FORMAT}",
     "sample_rate": ${RATE},
+    "bandwidth_hz": ${BANDWIDTH_HZ},
     "channels": ${CHANNELS}
   },
   "segment_seconds": ${SEGMENT}

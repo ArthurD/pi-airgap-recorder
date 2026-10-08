@@ -19,10 +19,10 @@ ENV{DEVTYPE}!="usb_device", GOTO="umik_usb_end"
 # Exempt hubs (class 09), including the internal root hubs.
 ATTR{bDeviceClass}=="09", GOTO="umik_usb_end"
 
-# Allow the mics umik-record matches by default: miniDSP (2752, UMIK-1) and
-# RODE (19f7, NT1 5th Gen). Both are listed so the two can be swapped in the
-# field without editing anything - keep this list and umik-record's UMIK_VID
-# default in step.
+# Allow the mics umik-record matches by default: miniDSP (2752, UMIK-1),
+# RODE (19f7, NT1 5th Gen) and Dodotronic (0869, Ultramic). All are listed so
+# they can be swapped in the field without editing anything - keep this list
+# and umik-record's UMIK_VID default in step.
 #
 # Matching the vendor rather than a specific product ID is deliberate: the
 # UMIK-1 exists in mini-USB and USB-C hardware revisions which do not
@@ -34,6 +34,10 @@ ATTR{bDeviceClass}=="09", GOTO="umik_usb_end"
 # vendor ID here too (`lsusb` to find it).
 ATTR{idVendor}=="2752", GOTO="umik_usb_end"
 ATTR{idVendor}=="19f7", GOTO="umik_usb_end"
+# Dodotronic Ultramic. 0869 is inferred from a sibling model and unconfirmed
+# for the 250K; umik-record's UMIK_MATCH_NAME product-string fallback cannot
+# be expressed here, so if lsusb shows a different vendor ID, add it by hand.
+ATTR{idVendor}=="0869", GOTO="umik_usb_end"
 
 # Allow the optional GPS time-source module (umik-gps-time). GT-U7 boards
 # enumerate either as u-blox native USB or behind a common serial bridge:

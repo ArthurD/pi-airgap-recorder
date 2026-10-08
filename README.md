@@ -110,10 +110,10 @@ USB** within seconds, it's charge-only.
 | | |
 |---|---|
 | Board | Raspberry Pi 4B |
-| Mic | any USB audio capture device; miniDSP UMIK-1 and RODE NT1 5th Gen out of the box, swappable with no config change (see [below](#using-a-different-microphone)) |
+| Mic | any USB audio capture device; miniDSP UMIK-1, RODE NT1 5th Gen and Dodotronic Ultramic 250K out of the box, swappable with no config change (see [below](#using-a-different-microphone)) |
 | RTC | [DS3231 plug-on module](https://www.amazon.com/dp/B08X4H3NBR) — **recommended** |
 | Time set | one wired-ethernet boot (NTP) or a GT-U7 / any NMEA-over-USB GPS |
-| Card | 128 GB ≈ 10 days on the UMIK-1, ~2 on the RODE at 192 kHz float; anything ≥8 GB boots |
+| Card | 128 GB ≈ 10 days on the UMIK-1, ~2 on the RODE at 192 kHz float, ~2.9 on the Ultramic at 250 kHz; anything ≥8 GB boots |
 | Base OS | Raspberry Pi OS Lite arm64, Trixie (2026-06-18) |
 
 **Storage budget.** This is per-mic now, because the format and sample rate
@@ -124,6 +124,7 @@ are negotiated per-mic (see [below](#using-a-different-microphone)):
 | UMIK-1 | 48 kHz / 24-bit / mono | 144 KB/s → 518 MB/hour → **12.4 GB/day** | ~10 days |
 | RODE NT1, mono | 192 kHz / 32-bit float | 768 KB/s → 2.8 GB/hour → **66 GB/day** | **~2 days** |
 | RODE NT1, stereo | 192 kHz / 32-bit float | 1.5 MB/s → 5.5 GB/hour → **133 GB/day** | **~1 day** |
+| Dodotronic Ultramic 250K | 250 kHz / 16-bit / mono | 500 KB/s → 1.8 GB/hour → **43 GB/day** | **~2.9 days** |
 
 The RODE is asked for maximum quality on purpose. If that is the wrong trade
 for your deployment, `UMIK_RATE=48000` brings it back to 691 MB/hour mono
@@ -135,9 +136,10 @@ crash-loop against a full disk.
 
 ### Using a different microphone
 
-Out of the box the recorder matches two USB vendor IDs — miniDSP (`2752`, both
-UMIK-1 hardware revisions) and RODE (`19f7`, the NT1 5th Gen) — so either mic
-can be plugged in and recorded with no config change at all. Swap them freely;
+Out of the box the recorder matches three USB vendor IDs — miniDSP (`2752`,
+both UMIK-1 hardware revisions), RODE (`19f7`, the NT1 5th Gen), and
+Dodotronic (`0869`, the Ultramic) — so any of them can be plugged in and
+recorded with no config change at all. Swap them freely;
 whichever one is attached wins, and every session records which it was (see
 [`session.json`](#chain-of-custody) below).
 
@@ -150,6 +152,7 @@ do its first choice quietly lands on the next:
 |---|---|---|
 | `2752` miniDSP | `S24_3LE S32_LE S16_LE FLOAT_LE` | `48000` |
 | `19f7` RODE | `FLOAT_LE S32_LE S24_3LE S16_LE` | `192000 96000 48000` |
+| `0869` Dodotronic | `S16_LE` | `250000 384000 200000 192000 96000 48000` |
 | anything else | `S24_3LE S32_LE S16_LE FLOAT_LE` | `48000` |
 
 The UMIK-1's row is exactly what this recorder has always asked for, so its
@@ -161,14 +164,31 @@ not the trade you want. The probe goes rate-outermost, then channel
 count, then format, so at the top rate it tries mono before stereo before
 dropping to the next rate down. Adding a vendor is one line in `mic_prefs()`.
 
+**The Dodotronic Ultramic 250K** is an ultrasonic MEMS mic: fixed 250 kHz,
+16-bit, mono (it captures 0–125 kHz), so its row asks for exactly that, with
+its siblings' rates behind it. It is here for sounds that may start out
+ultrasonic and land somewhere near the audible range after bouncing around a
+room, so the full band matters. It needs a **mini-USB B** to USB-A cable (not
+the UMIK's USB-C one). Gain is three hardware levels on DIP switches inside the
+tube; there is no software control, so `session.json` cannot record which one
+was set. Write it down. Its vendor ID, `0869`, comes from a sibling model and
+is not yet confirmed on a 250K, so the recorder also takes any sound card whose
+USB product or manufacturer string contains `UltraMic`, `Ultramic`, or
+`Dodotronic` (`UMIK_MATCH_NAME`), and the `found` line in the card log says
+which rule matched. After its first boot, the card's `logs/diag-latest.log`
+(written by `umik-diag`) shows what it really enumerates as: every USB
+device's `VID:PID` and product string, plus the mic's own list of formats and
+rates; `lsusb` says the same on any Linux box. If the ID differs, put it in
+`UMIK_VID` (and in the udev rule, if you enabled that).
+
 Nothing downstream is mic-specific — the format probe asks the hardware what it
 accepts, and the calibration gain reads `unknown` when the product string has
 none — so the vendor list is a knob:
 
 ```sh
 sudo systemctl edit umik-record        # then add, under [Service]:
-# Environment=UMIK_VID="2752 19f7"     # the shipped default
-# Environment=UMIK_VID="2752 19f7 046d"  # add a third (lsusb for the ID)
+# Environment=UMIK_VID="2752 19f7 0869"       # the shipped default
+# Environment=UMIK_VID="2752 19f7 0869 046d"  # add another (lsusb for the ID)
 # Environment=UMIK_VID=046d            # or pin exactly one vendor
 # Environment=UMIK_VID=any             # first USB audio capture device found
 ```
@@ -182,8 +202,9 @@ the recorder ignores it with a warning in the log.
 Two catches:
 
 * If you enabled the optional default-deny udev rule, add your vendor's ID
-  there too, or the device is refused before ALSA ever sees it. `2752` and
-  `19f7` are already in it.
+  there too, or the device is refused before ALSA ever sees it. `2752`,
+  `19f7`, and `0869` are already in it; the product-string fallback cannot be
+  expressed there, so an Ultramic under any other ID must be added by hand.
 * `UMIK_FORMAT` and `UMIK_RATE` override the preference table above, and both
   take a list (space- or comma-separated) or a single value. Whatever they
   hold is tried in the order given.
@@ -191,7 +212,12 @@ Two catches:
   the whole toolchain follows it: `tools/repair-wav.sh` never looks at the
   sample format at all, and `tools/umik-viewer.py` decodes 16/24/32-bit
   integer PCM and 32/64-bit float at any rate, reading each file's own byte
-  rate rather than assuming 48 kHz.
+  rate rather than assuming 48 kHz. Its frequency axis is labelled with the
+  file's real Nyquist (24 kHz, 96 kHz, 125 kHz). Above 96 kHz, which browsers
+  do not reliably play, it plays the audible band (low-passed and decimated to
+  ≤50 kHz) by default, or a ×10 time expansion: the native samples at a tenth
+  of the rate, so 20–125 kHz comes out as 2–12.5 kHz, ten times slower. The
+  playhead stays in recording seconds either way.
 
 ---
 
@@ -641,7 +667,7 @@ to any archived byte breaks the chain.
     "calibration_gain_db": "18",
     "alsa_card": 1
   },
-  "format": { "encoding": "S24_3LE", "sample_rate": 48000, "channels": 1 }
+  "format": { "encoding": "S24_3LE", "sample_rate": 48000, "bandwidth_hz": 24000, "channels": 1 }
 }
 ```
 
@@ -651,7 +677,9 @@ matters once more than one mic is in rotation: `mic` is the friendly label
 halves of `usb_id`, and `product` / `manufacturer` / `serial` are the USB
 device's own strings, sanitised, or `unknown` when the device does not publish
 them. `calibration_gain_db` is parsed out of the UMIK-1's product string and
-reads `unknown` for any mic that does not embed one.
+reads `unknown` for any mic that does not embed one. Under `format`,
+`bandwidth_hz` is the captured band's upper edge (half the sample rate):
+24000 for the UMIK-1, 96000 for the RODE at 192 kHz, 125000 for the Ultramic.
 
 ---
 
@@ -726,12 +754,13 @@ Via `systemctl edit umik-record` (or the named unit), as `Environment=` lines:
 
 | Variable | Default |
 |---|---|
-| `UMIK_VID` | `2752 19f7` (miniDSP, RODE). A space- or comma-separated list of vendor IDs, or `any` for the first USB capture device |
+| `UMIK_VID` | `2752 19f7 0869` (miniDSP, RODE, Dodotronic). A space- or comma-separated list of vendor IDs, or `any` for the first USB capture device |
 | `UMIK_PID` | unset (any product from those vendors). Honoured only when `UMIK_VID` names exactly one vendor |
+| `UMIK_MATCH_NAME` | `UltraMic Ultramic Dodotronic`. Also take a card from an unlisted vendor whose USB product or manufacturer string contains one of these (case-sensitive). Set it empty to disable; ignored under `UMIK_VID=any` or a `UMIK_PID` pin |
 | `UMIK_SEGMENT_SECONDS` | `600` |
-| `UMIK_RATE` | per-vendor (`48000` miniDSP, `192000 96000 48000` RODE). A list or a single value; first that works |
+| `UMIK_RATE` | per-vendor (`48000` miniDSP, `192000 96000 48000` RODE, `250000 384000 200000 192000 96000 48000` Dodotronic). A list or a single value; first that works |
 | `UMIK_CHANNELS` | `1` (falls back to `2`, then `1`) |
-| `UMIK_FORMAT` | per-vendor (`S24_3LE S32_LE S16_LE FLOAT_LE` miniDSP, `FLOAT_LE S32_LE S24_3LE S16_LE` RODE). A list or a single value; first that works |
+| `UMIK_FORMAT` | per-vendor (`S24_3LE S32_LE S16_LE FLOAT_LE` miniDSP, `FLOAT_LE S32_LE S24_3LE S16_LE` RODE, `S16_LE` Dodotronic). A list or a single value; first that works |
 | `UMIK_DATA_DIR` | unset (auto: stick if mounted, else SD) |
 | `UMIK_MIN_FREE_MB` | `512` |
 | `UMIK_LOG_INTERVAL` | `60` (heartbeat seconds) |

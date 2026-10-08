@@ -15,7 +15,9 @@ with makeup gain applied BEFORE quantisation - a UMIK-1 in a quiet room
 sits at -70 dBFS, and boosting after a 16-bit truncation would amplify
 quantisation noise instead of signal. Durations are derived from actual
 file sizes, never from the WAV header, so power-cut tail segments with
-stale headers play fine untouched.
+stale headers play fine untouched. Files above 96 kHz (the Ultramic records
+at 250 kHz) play either low-passed and decimated to the audible band, or
+time-expanded x10 so the ultrasonic band itself becomes audible.
 
 UI: pick session -> segment; wheel-zoom the spectrogram around the cursor;
 drag the window (or its edge handles) on the full-clip overview strip;
@@ -268,13 +270,17 @@ def build_index(root):
         # by a factor of eight. One session is one arecord invocation, so
         # every segment in it shares a format - parse the first header that
         # opens and reuse its geometry for the rest, one read per session.
-        brate = hdr_off = 0
+        # The sample rate rides along for the page: its frequency axis is
+        # 0..Nyquist, which is 24 kHz for a UMIK-1 and 125 kHz for an
+        # Ultramic, and only the header knows which this session is.
+        srate = brate = hdr_off = 0
         for name in segs:
             try:
-                *_, brate, hdr_off = parse_wav_header(os.path.join(sdir, name))
+                _, srate, _, _, brate, hdr_off = parse_wav_header(
+                    os.path.join(sdir, name))
                 break
             except (OSError, ValueError, struct.error):
-                brate = hdr_off = 0
+                srate = brate = hdr_off = 0
         seglist = []
         for name in segs:
             p = os.path.join(sdir, name)
@@ -292,6 +298,7 @@ def build_index(root):
         collections.setdefault(coll, []).append({
             "name": os.path.basename(sdir),
             "meta": meta,
+            "rate": srate,
             "segments": seglist,
         })
     for sessions in collections.values():
@@ -303,27 +310,95 @@ def build_index(root):
 # with HTTP Range support so the <audio> element can seek.
 # --------------------------------------------------------------------------
 
-def audio16_total(wav):
-    return 44 + wav.frames * 2
+# Browsers are only reliably happy playing WAV up to ~96 kHz, and a 250 kHz
+# Ultramic file is mostly band nobody can hear anyway. Above this, playback
+# is one of two derived streams of the same file:
+#   audible  low-pass + integer decimation to <= 50 kHz (250k/5, 384k/8):
+#            what a person in the room would have heard.
+#   slow     the native samples untouched, header rate / 10 - the bat-
+#            detector "time expansion" trick: 20-125 kHz becomes 2-12.5 kHz,
+#            audible, at a tenth of the speed. Same bytes, different header.
+PLAY_NATIVE_MAX = 96000
+AUDIBLE_MAX = 50000
+SLOW_FACTOR = 10
 
-def audio16_header(wav):
-    n = wav.frames * 2
+def play_geometry(wav, mode=""):
+    """(decimation factor, header rate) of this file's playback stream."""
+    if wav.rate <= PLAY_NATIVE_MAX:
+        return 1, wav.rate
+    if mode == "slow":
+        return 1, max(1, wav.rate // SLOW_FACTOR)
+    # Smallest factor that lands at or under AUDIBLE_MAX AND divides the rate:
+    # a fractional output rate would be rounded in the header and the audio
+    # would drift against the spectrogram over a 10-minute segment.
+    k = -(-wav.rate // AUDIBLE_MAX)
+    while wav.rate % k:
+        k += 1
+    return k, wav.rate // k
+
+_FIR = {}
+
+def _lowpass(k):
+    """Anti-alias FIR for decimation by k: Blackman-windowed sinc, 32k+1
+    taps, cutoff at 0.9 of the output Nyquist (22.5 kHz at 50k out). A plain
+    k-sample box average is NOT enough here - its first sidelobe sits only
+    ~12 dB down, so a 40 kHz tone at 250k/5 would fold back to an audible
+    10 kHz ghost. This one is ~70 dB down in the stopband."""
+    h = _FIR.get(k)
+    if h is None:
+        n = 32 * k + 1
+        m = np.arange(n) - (n - 1) / 2
+        fc = 0.45 / k                       # cycles/sample at the source rate
+        h = 2 * fc * np.sinc(2 * fc * m) * np.blackman(n)
+        h = (h / h.sum()).astype(np.float32)
+        _FIR[k] = h
+    return h
+
+def _decimated(wav, s0, s1, k):
+    """Output samples [s0, s1) of the k-times decimated first channel.
+
+    Output sample j is the filter centred on source frame j*k, computed from
+    absolute positions (zero beyond either end of the file), so any byte
+    range yields exactly the samples the whole stream would have - Range
+    requests and seeks splice seamlessly whatever their alignment."""
+    h = _lowpass(k)
+    m = s1 - s0
+    lo = s0 * k - len(h) // 2
+    n = (m - 1) * k + len(h)
+    pre = max(0, -lo)
+    x = wav.read_ch0(lo + pre, n - pre)
+    x = np.pad(x, (pre, n - pre - len(x)))
+    # Polyphase by hand: one strided multiply-add per tap, m samples each,
+    # instead of materialising an m x taps window matrix.
+    y = np.zeros(m, np.float32)
+    for i, c in enumerate(h):
+        y += c * x[i:i + (m - 1) * k + 1:k]
+    return y
+
+def audio16_total(wav, k=1):
+    return 44 + (wav.frames // k) * 2
+
+def audio16_header(wav, k=1, rate=None):
+    n = (wav.frames // k) * 2
+    rate = rate or wav.rate
     return struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + n, b"WAVE",
-                       b"fmt ", 16, 1, 1, wav.rate, wav.rate * 2, 2, 16,
+                       b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16,
                        b"data", n)
 
-def audio16_bytes(wav, start, end, gain):
-    """Output bytes [start, end) of the virtual mono-16 WAV."""
+def audio16_bytes(wav, start, end, gain, k=1, rate=None):
+    """Output bytes [start, end) of the virtual mono-16 WAV, decimated by
+    k (1 = native samples) and labelled with header rate `rate`."""
     out = []
     if start < 44:
-        out.append(audio16_header(wav)[start:min(end, 44)])
+        out.append(audio16_header(wav, k, rate)[start:min(end, 44)])
         start = 44
     if start >= end:
         return b"".join(out)
     s0 = (start - 44) // 2
-    s1 = min(wav.frames, (end - 44 + 1) // 2)
+    s1 = min(wav.frames // k, (end - 44 + 1) // 2)
     if s1 > s0:
-        x = wav.read_ch0(s0, s1 - s0) * gain
+        x = (wav.read_ch0(s0, s1 - s0) if k == 1
+             else _decimated(wav, s0, s1, k)) * gain
         pcm = np.clip(x * 32767.0, -32768, 32767).astype("<i2").tobytes()
         a = start - (44 + s0 * 2)
         b = end - (44 + s0 * 2)
@@ -391,7 +466,8 @@ class Handler(BaseHTTPRequestHandler):
                 p = self._resolve(q["f"][0])
                 wav = Wav(p)
                 gain = 10 ** (float(q.get("boost", ["0"])[0]) / 20)
-                total = audio16_total(wav)
+                k, orate = play_geometry(wav, q.get("mode", [""])[0])
+                total = audio16_total(wav, k)
                 # Satisfy the WHOLE requested range and stream it in chunks;
                 # Chrome aborts the connection once its buffer is full.
                 a, b = 0, total
@@ -417,7 +493,8 @@ class Handler(BaseHTTPRequestHandler):
                     pos = a
                     while pos < b:
                         nxt = min(pos + (1 << 20), b)
-                        self.wfile.write(audio16_bytes(wav, pos, nxt, gain))
+                        self.wfile.write(audio16_bytes(wav, pos, nxt, gain,
+                                                       k, orate))
                         pos = nxt
                 except (BrokenPipeError, ConnectionResetError):
                     self.close_connection = True
@@ -507,7 +584,7 @@ kbd{background:var(--chip);border-radius:4px;padding:0 5px;font-size:11px}
     <div id="loading">computing spectrogram&hellip;</div>
   </div>
   <div id="axis"><span id="t0">0:00</span>
-    <span class="dim" id="mid">24 kHz &uarr; &nbsp; 0 Hz &darr;</span>
+    <span class="dim" id="mid">&ndash; kHz &uarr; &nbsp; 0 Hz &darr;</span>
     <span id="t1">10:00</span></div>
   <div id="ovwrap">
     <img id="ov" alt="">
@@ -520,6 +597,10 @@ kbd{background:var(--chip);border-radius:4px;padding:0 5px;font-size:11px}
     <label>boost <select id="boost">
       <option>0</option><option>12</option><option selected>24</option>
       <option>36</option><option>48</option></select> dB</label>
+    <label id="playmode" style="display:none">play <select id="mode">
+      <option value="" selected>audible band</option>
+      <option value="slow">&times;10 slow (time expansion)</option>
+      </select></label>
     <label>gain <input type="range" id="gain" min="0" max="30" value="0"
       step="1" style="width:110px"> <span id="gainlbl">+0</span> dB</label>
   </div>
@@ -531,6 +612,12 @@ let dur=600;                       // current segment length (s)
 let view={a:0,b:600};              // requested visible range
 let loadedView={a:0,b:600};        // range of the image currently displayed
 let refetchTimer=null;
+let rate=0, NYQ='? kHz';           // session sample rate; axis top = rate/2
+// Time expansion: in x10 slow mode the <audio> element's clock runs 10x the
+// recording's, so every audio.currentTime is divided by tx on the way out
+// and multiplied on the way in - the playhead and the spectrogram stay in
+// source seconds throughout.
+let tx=1;
 const MINVIEW=0.5;
 const $=id=>document.getElementById(id);
 const audio=$('audio'), spec=$('spec'), ph=$('playhead');
@@ -553,6 +640,10 @@ function segTime(n){const m=n.match(/seg-(\d{8})-(\d{2})(\d{2})(\d{2})/);
   return m? m[2]+':'+m[3]+':'+m[4] : n;}
 function mmss(s){s=Math.max(0,s);
   return (s/60|0)+':'+String(s%60|0).padStart(2,'0');}
+function nyqLabel(r){return r? +(r/2000).toFixed(2)+' kHz' : '? kHz';}
+function audioURL(g){
+  return '/audio16?f='+encodeURIComponent(g.rel)+'&boost='+$('boost').value
+    +(rate>96000? '&mode='+$('mode').value : '');}
 function curSeg(){
   const s=IDX&&IDX.collections[cur.c]&&IDX.collections[cur.c].sessions[cur.s];
   return s && s.segments[cur.g];}
@@ -597,9 +688,15 @@ function selSession(ci,si){
     b.onclick=()=>selSeg(gi); strip.appendChild(b);
   });
   const m=s.meta, dev=m.device||{};
+  rate=s.rate||(m.format&&m.format.sample_rate)||0;
+  NYQ=nyqLabel(rate);
+  $('playmode').style.display=rate>96000?'':'none';
+  tx=(rate>96000&&$('mode').value==='slow')?10:1;
+  $('mid').textContent=NYQ+' ↑  0 Hz ↓';
   $('meta').textContent=IDX.collections[ci].name+' / '+s.name
     +(m.storage?'  ·  storage: '+m.storage:'')
     +(dev.product?'  ·  '+dev.product:'')
+    +(rate?'  ·  '+(rate/1000)+' kHz':'')
     +(m.clock_trusted===false?'  ·  clock NOT trusted (ordering by counter)':'');
   selSeg(0);
 }
@@ -619,7 +716,7 @@ function selSeg(gi){
   spec.src=specURL(g,0,dur,1600,512);
   $('ov').src=specURL(g,0,dur,1600,120);
   audio.pause();
-  audio.src='/audio16?f='+encodeURIComponent(g.rel)+'&boost='+$('boost').value;
+  audio.src=audioURL(g);
   audio.load();
   ph.style.left='0'; ovph.style.left='0';
   syncOverlay();
@@ -721,14 +818,21 @@ ovwrap.addEventListener('dblclick',()=>{ view={a:0,b:dur}; applyView(true); });
 
 $('boost').onchange=()=>{const g=curSeg(); if(!g)return;
   const t=audio.currentTime,p=!audio.paused;
-  audio.src='/audio16?f='+encodeURIComponent(g.rel)+'&boost='+$('boost').value;
+  audio.src=audioURL(g);
   audio.load(); audio.currentTime=t; if(p) audio.play();};
+// Switching audible <-> slow is a different stream with a different clock:
+// carry the position across in source seconds, not element seconds.
+$('mode').onchange=()=>{const g=curSeg(); if(!g)return;
+  const t=audio.currentTime/tx,p=!audio.paused;
+  tx=$('mode').value==='slow'?10:1;
+  audio.src=audioURL(g);
+  audio.load(); audio.currentTime=t*tx; if(p) audio.play();};
 
 $('specwrap').onclick=e=>{
   const g=curSeg(); if(!g)return;
   const r=$('specwrap').getBoundingClientRect();
   const frac=(e.clientX-r.left)/r.width;
-  audio.currentTime=view.a+frac*(view.b-view.a);
+  audio.currentTime=(view.a+frac*(view.b-view.a))*tx;
   if(audio.paused) audio.play();
 };
 audio.onended=()=>{const s=IDX.collections[cur.c].sessions[cur.s];
@@ -737,13 +841,14 @@ audio.onplay=()=>{ensureGain(); if(actx.state==='suspended') actx.resume();};
 
 (function tick(){
   if(curSeg()){
-    const ct=audio.currentTime, vw=view.b-view.a;
+    const ct=audio.currentTime/tx, vw=view.b-view.a;
     const frac=(ct-view.a)/vw;
     if(frac>=0&&frac<=1){ph.style.display='block'; ph.style.left=(frac*100)+'%';}
     else ph.style.display='none';
     ovph.style.left=(ct/dur*100)+'%';
     $('mid').textContent='▶ '+mmss(ct)+'  ·  view '
-      +mmss(view.a)+'–'+mmss(view.b)+'  ·  24 kHz ↑  0 Hz ↓';
+      +mmss(view.a)+'–'+mmss(view.b)+'  ·  '+NYQ+' ↑  0 Hz ↓'
+      +(tx>1?'  ·  ×10 slow':'');
   }
   requestAnimationFrame(tick);})();
 

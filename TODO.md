@@ -44,8 +44,14 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
 - [x] ~~Re-inject both cards~~ with the two-mic recorder. Unit 2 and unit 1
       both done 2026-09-20; unit 2 field-verified same day (mic label,
       preference and burn-rate lines in the card log, new `device` keys).
-- [ ] **Viewer duration display** hardcodes 24-bit stereo (6 bytes/frame) in
-      the session index; wrong for a stereo/32-bit mic. Cosmetic.
+- [x] ~~Viewer duration display hardcodes 24-bit stereo.~~ Stale: the session
+      index reads each session's byte rate from its first WAV header, so any
+      format and rate (RODE float, Ultramic 250 kHz) gets the right duration.
+- [ ] **Confirm the Ultramic 250K's USB VID:PID and product string** on first
+      plug-in (`logs/diag-latest.log` from `umik-diag`, or `lsusb`). The
+      default matches vendor `0869` (inferred from the Ultramic 192K) plus the
+      product-string fallback `UltraMic`; pin the real ID in `UMIK_VID` and the
+      udev rule once known, and note which of the three DIP gain levels is set.
 
 - [x] ~~Unit 2 has not reported since 2026-08-16.~~ Collected 2026-09-19:
       five sessions (Sep 16-18), all `time_source: rtc`, `clock_trusted`.
