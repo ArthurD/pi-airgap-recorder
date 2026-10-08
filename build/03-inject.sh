@@ -200,7 +200,7 @@ cat <<EOF
 
   1. Eject:  diskutil eject <disk>
   2. Put the card in the Pi.
-  3. Plug the UMIK-1 into a BLACK USB 2.0 port (not a blue 3.0 one).
+  3. Plug the mic into any USB-A port (black or blue; not the USB-C, no hub).
   4. Power on. The first boot provisions and then reboots itself
      (roughly 2-4 minutes). It does NOT need a network at any point.
   5. Recording starts automatically on the second boot.

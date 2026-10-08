@@ -61,7 +61,7 @@ diskutil list external physical                # find your card, e.g. /dev/disk4
 diskutil eject /dev/disk4
 ```
 
-Card into the Pi, mic into a **black USB 2.0 port**, power on. First boot
+Card into the Pi, mic into **any USB-A port**, power on. First boot
 provisions and reboots itself (~2–4 min); recording starts on the second boot
 and every boot after.
 
@@ -82,18 +82,20 @@ That is the whole loop. Everything below is detail and reasoning.
 
 ## Hardware
 
-**The mic goes in a black USB 2.0 port. Not the USB-C port, and no hub.**
+**The mic goes in any of the four USB-A ports, black or blue. Not the USB-C port, and no hub.**
 
 | Port | Device |
 |---|---|
-| black USB 2.0 | **microphone** (isochronous audio likes 2.0) |
-| black USB 2.0 | **GPS** (optional) |
-| blue USB 3.0 | **USB stick** — use the port *farthest* from the GPS |
+| any USB-A | **microphone** — black 2.0 by habit, blue 3.0 works the same |
+| any USB-A | **USB stick** — whichever fits; some boards space the blue pair too tightly |
+| any USB-A | **GPS** (optional) — keep it *farthest* from the stick |
 | USB-C | power in — nothing else works there |
 
 The Pi's USB-C is power-only, so the mic cannot go there. All four USB-A ports
 sit behind the same VL805 controller, so port choice matters less than folklore
-says; field captures through a black port verified bit-clean. USB 3.0 devices
+says; field captures through a black port verified bit-clean, and nothing in
+the software looks at which port a device is on. Unit 3 runs mic and stick off
+whatever fits. USB 3.0 devices
 radiate broadband noise around the GPS band (1.575 GHz), hence keeping a stick
 away from a GPS module.
 

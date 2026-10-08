@@ -304,12 +304,12 @@ elapsed=0
 while ! FOUND=$(find_card); do
     if [ "$elapsed" -ge "$WAIT_SECS" ]; then
         if [ "$UMIK_VID" = "any" ]; then
-            applog "FATAL: no USB audio capture device after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port?"
+            applog "FATAL: no USB audio capture device after ${WAIT_SECS}s - is the mic in one of the four USB-A ports (any colour - NOT the USB-C, and no hub)?"
         else
             _also=""
             [ -n "$NAME_LIST" ] && [ -z "$UMIK_PID" ] && \
                 _also=" or USB product/manufacturer string matching ${NAME_LIST}"
-            applog "FATAL: no device from USB vendor(s) ${VID_LIST}${_also} after ${WAIT_SECS}s - is the mic plugged into a BLACK USB 2.0 port? (set UMIK_VID=any to accept any USB mic)"
+            applog "FATAL: no device from USB vendor(s) ${VID_LIST}${_also} after ${WAIT_SECS}s - is the mic in one of the four USB-A ports (any colour - NOT the USB-C, and no hub)? (set UMIK_VID=any to accept any USB mic)"
         fi
         # Name each card's USB product string too: with the name fallback in
         # play, "saw 1234:5678" alone cannot say why it was not taken.
