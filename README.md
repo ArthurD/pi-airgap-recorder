@@ -173,11 +173,12 @@ ultrasonic and land somewhere near the audible range after bouncing around a
 room, so the full band matters. It needs a **mini-USB B** to USB-A cable (not
 the UMIK's USB-C one). Gain is three hardware levels on DIP switches inside the
 tube; there is no software control, so `session.json` cannot record which one
-was set. Write it down. Its vendor ID, `0869`, comes from a sibling model and
-is not yet confirmed on a 250K, so the recorder also takes any sound card whose
-USB product or manufacturer string contains `UltraMic`, `Ultramic`, or
-`Dodotronic` (`UMIK_MATCH_NAME`), and the `found` line in the card log says
-which rule matched. After its first boot, the card's `logs/diag-latest.log`
+was set. Write it down. Its vendor ID is `0869` (a 250K enumerates as
+`0869:0306`, product string "UltraMic 250K 16 bit r4" - field-confirmed). As a
+belt to those braces the recorder also takes any sound card whose USB product
+or manufacturer string contains `UltraMic`, `Ultramic`, or `Dodotronic`
+(`UMIK_MATCH_NAME`), and the `found` line in the card log says which rule
+matched. After its first boot, the card's `logs/diag-latest.log`
 (written by `umik-diag`) shows what it really enumerates as: every USB
 device's `VID:PID` and product string, plus the mic's own list of formats and
 rates; `lsusb` says the same on any Linux box. If the ID differs, put it in

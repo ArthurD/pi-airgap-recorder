@@ -33,10 +33,10 @@ set -eu
 #   UMIK_VID=<vvvv>            record only from this USB vendor's device
 #   UMIK_VID=any               record from the first USB audio capture device found
 #
-# 0869 for Dodotronic is second-hand: it is what a sibling model (Ultramic
-# 192K, 0869:0308) enumerates as, it is not in the public usb.ids database,
-# and the 250K itself had not been plugged into one of these units when this
-# was written. Hence UMIK_MATCH_NAME below, as a belt to these braces.
+# 0869 is Dodotronic (not in the public usb.ids database): a 250K enumerates
+# as 0869:0306, "UltraMic 250K 16 bit r4", field-confirmed 2026-10-08; the
+# 192K sibling is 0869:0308. UMIK_MATCH_NAME below stays as a belt to these
+# braces for any family member under an ID nobody has seen yet.
 UMIK_VID=${UMIK_VID:-"2752 19f7 0869"}
 # Narrows the match to one product. Only honoured when UMIK_VID names exactly
 # ONE vendor: a product ID is unique only within a vendor, so pairing it with a

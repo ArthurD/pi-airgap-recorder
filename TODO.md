@@ -47,11 +47,12 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
 - [x] ~~Viewer duration display hardcodes 24-bit stereo.~~ Stale: the session
       index reads each session's byte rate from its first WAV header, so any
       format and rate (RODE float, Ultramic 250 kHz) gets the right duration.
-- [ ] **Confirm the Ultramic 250K's USB VID:PID and product string** on first
-      plug-in (`logs/diag-latest.log` from `umik-diag`, or `lsusb`). The
-      default matches vendor `0869` (inferred from the Ultramic 192K) plus the
-      product-string fallback `UltraMic`; pin the real ID in `UMIK_VID` and the
-      udev rule once known, and note which of the three DIP gain levels is set.
+- [x] ~~Confirm the Ultramic 250K's USB VID:PID and product string.~~ Field-
+      confirmed on unit 2, 2026-10-08: `0869:0306`, product "UltraMic 250K 16
+      bit r4", matched by vendor, negotiated S16_LE @ 250000 mono (500 KB/s,
+      ~1.8 GB/h as budgeted); two sessions, clock trusted from the RTC. The
+      vendor default needed no change. Still open: note which of the three DIP
+      gain levels the mic is set to.
 
 - [x] ~~Unit 2 has not reported since 2026-08-16.~~ Collected 2026-09-19:
       five sessions (Sep 16-18), all `time_source: rtc`, `clock_trusted`.
