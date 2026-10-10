@@ -244,19 +244,26 @@ The dongle is **receive-only**: like the GPS it has no transmitter, so the
 air-gap holds and none of the four radio-silence layers changes.
 `umik-sdr.service` still `Requires=` the same radio check as the mic recorder.
 
-**What it does.** Each pass starts with `rtl_power`: a sweep of 87.5 MHz to
-1.75 GHz in 50 kHz bins, plus finer 10 kHz scans of the FM band and of
-420–480 MHz, three sweeps each. A signal is anything 12 dB over the local noise
-floor in every sweep, or 15 dB if it comes and goes. An FM station becomes one
-channel, and so does a wide transmitter (an LTE carrier, a Wi-Fi channel, a
-UHF TV channel) rather than the dozens of bins it covers; the phone uplink
-bands, your own phone's included, are never listened to. A channel seen in two
-or more scans stays in the rotation for 8 passes after it was last seen (2 if
-it was seen once), so an intermittent transmitter keeps getting visits. Up to
-120 channels (the strongest, when there are more) are then recorded in
-shuffled order, ~15 s each, with random gaps between channels and a random
-pause of up to 3 minutes between passes. The timing is randomised so the
-schedule can't be learned.
+**What it does.** Each pass starts with `rtl_power`: a sweep of 108 MHz to
+1.75 GHz in 50 kHz bins, plus finer 10 kHz scans of the FM band and of the VHF
+and UHF voice bands (136–174 and 400–520 MHz), three sweeps each. A signal is
+anything 10 dB over the local noise floor in every sweep, or 14 dB if it comes
+and goes. An FM station becomes one channel, and so does a wide transmitter (an
+LTE carrier, a Wi-Fi channel, a UHF TV channel) rather than the dozens of bins
+it covers; the phone uplink bands, your own phone's included, are never
+listened to. A channel seen in two or more scans stays in the rotation for 8
+passes after it was last seen (2 if it was seen once), so an intermittent
+transmitter keeps getting visits. Up to 120 channels (the strongest, when there
+are more) are then recorded in shuffled order, ~15 s each, with random gaps
+between channels and a random pause of up to 3 minutes between passes. The
+timing is randomised so the schedule can't be learned.
+
+**Two gains.** Measured with the SMArt v5 (2026-10-10): in the FM band a strong
+local station compresses the tuner above ~20 dB and its skirts read as signals,
+so the band gets 15.7 dB (`UMIK_SDR_GAIN_WIDE`). Everywhere else the 8-bit ADC
+is the limit, with ~2 LSB of noise at 25.4 dB (UHF); 37.2 dB (`UMIK_SDR_GAIN`)
+lifts weak carriers 3–5 dB, and nothing clips, even at 49.6. The main scan
+starts at 108 MHz, so the FM band is left to its own fine scan.
 
 **Storage budget.** IQ costs 2 bytes a sample (8-bit I and Q), whatever the
 signal:
@@ -267,11 +274,13 @@ signal:
 | FM broadcast (87.5–108 MHz) | 1.024 MS/s | 2 MB/s | **30 MB** |
 
 Only the FM band gets the wide rate: a station spreads over ±100 kHz, while a
-1 MHz slice of a 6 MHz TV channel or an LTE block buys nothing. With ~25 FM
-channels and ~45 others a pass (a pass takes ~25 minutes), that comes to about
-1.1 GB a pass, ~2.7 GB an hour, or **~27 GB a 10-hour night**; the number of
+1 MHz slice of a 6 MHz TV channel or an LTE block buys nothing. Measured on the
+Mac on 2026-10-10 with the defaults above: the scans take ~80 s, and one pass
+found ~90 channels after filtering, ~20 of them FM stations. At 15 s a clip
+plus the random gaps that is a pass of ~30 minutes and ~1.1 GB (20 × 30 MB +
+70 × 7.5 MB), so ~2.2 GB an hour, or **~22 GB a 10-hour night**; the number of
 FM stations in range moves it most, since each one is a 30 MB clip. A 128 GB
-stick holds 4–5 nights, a 256 GB one about 9. Below 512 MB free it stops
+stick holds 5 nights, a 256 GB one about 11. Below 512 MB free it stops
 cleanly, like the mic.
 
 **Sessions** sit beside the mic's, with their own counter
@@ -281,7 +290,7 @@ cleanly, like the mic.
 /data/usb/recordings/
   umik1-sdr_000003_20261010T230000Z/
     session.json                              unit, clock trust, dongle, every scan and capture setting
-    scan-p0001-main.csv.gz                    pass 1's raw rtl_power sweep, gzipped (also -fm, -uhf)
+    scan-p0001-main.csv.gz                    pass 1's raw rtl_power sweep, gzipped (also -fm, -vhf, -uhf)
     scan-p0001.json                           pass 1: every detection, and the channel plan
     clip-20261010-231502-104100k.sigmf-data   ~15 s of raw IQ at 104.1 MHz
     clip-20261010-231502-104100k.sigmf-meta   what that IQ is (SigMF metadata, JSON)
@@ -370,13 +379,13 @@ is idle, not trouble.
 
 | Variable | Default |
 |---|---|
-| `UMIK_SDR_GAIN` | `25.4` dB (R820T2 tuner gain). Fixed, so passes stay comparable; `auto` is allowed |
+| `UMIK_SDR_GAIN` / `UMIK_SDR_GAIN_WIDE` | `37.2` / `15.7` dB of R820T2 tuner gain (everything outside the FM band / the FM band's scan and channels; a scan reaching past 87.5–108 MHz takes `UMIK_SDR_GAIN`). Fixed, so passes stay comparable; `auto` is allowed |
 | `UMIK_SDR_PPM` | `0` (frequency correction; the SMArt's TCXO is 0.5 ppm) |
-| `UMIK_SDR_SCAN` | `87.5-1750:50`, the main scan: MHz range, then bin width in kHz |
-| `UMIK_SDR_FINE` | `87.5-108:10 420-480:10`, the finer scans (space-separated) |
+| `UMIK_SDR_SCAN` | `108-1750:50`, the main scan: MHz range, then bin width in kHz. It starts at 108 MHz, so the FM band is scanned only by its fine scan, at `UMIK_SDR_GAIN_WIDE` |
+| `UMIK_SDR_FINE` | `87.5-108:10 136-174:10 400-520:10`, the finer scans (space-separated): the FM band, and the VHF and UHF voice bands, where a 12.5 kHz voice channel loses ~5 dB in the main scan's 44 kHz bins |
 | `UMIK_SDR_SWEEPS` | `3` per scan |
-| `UMIK_SDR_THR` / `UMIK_SDR_THR_BURST` | `12` / `15` dB over the local floor, for a continuous / an intermittent signal |
-| `UMIK_SDR_EXCLUDE` | `698-716 777-787 824-849` MHz, never listened to: the LTE uplink bands 12/17, 13 and 5, where phones (yours too) transmit |
+| `UMIK_SDR_THR` / `UMIK_SDR_THR_BURST` | `10` / `14` dB over the local floor, for a continuous / an intermittent signal. rtl_power averages many FFTs into every bin, so 10 dB is never noise; lower only adds real but dull channels, which `UMIK_SDR_MAX_CHANNELS` caps |
+| `UMIK_SDR_EXCLUDE` | `698-716 777-787 824-849 960-1215` MHz, never listened to: the LTE uplink bands 12/17, 13 and 5, where phones (yours too) transmit, and the aviation DME/TACAN band, strong pulses that are never voice, with the SMArt v5's own strongest spur block (1004–1013 MHz) inside it |
 | `UMIK_SDR_DWELL` / `UMIK_SDR_JITTER` | `15` s / `0.3`: each clip is dwell × U(0.7, 1.3) |
 | `UMIK_SDR_GAP_MAX` / `UMIK_SDR_PASS_PAUSE_MAX` | `5` / `180` s of random idle, between channels / between passes |
 | `UMIK_SDR_REMEMBER_PASSES` / `UMIK_SDR_REMEMBER_ONCE` | `8` / `2` passes a channel stays after it was last seen (seen in ≥2 scans / in one) |

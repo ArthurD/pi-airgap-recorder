@@ -63,10 +63,19 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
 
 ## RTL-SDR (umik-sdr): first boot with the dongle
 
-Nothing below has run on a Pi yet. Build with `./build/05-fetch-sdr-debs.sh`,
+Nothing below has run on a Pi yet; the ticked items were verified on the Mac
+with the same dongle (2026-10-10). Build with `./build/05-fetch-sdr-debs.sh`,
 inject, and boot with the NESDR SMArt v5 attached; the answers are in
 `umik-firstrun.log`, `logs/diag-latest.log` (`--- sdr ---`) and `umik.log`.
 
+- [x] ~~rtl_power's CSV.~~ Verified on the Mac, 2026-10-10: 513 values a row,
+      512 bins a hop with the last one repeated; the bin width is the hop over
+      a power of two, at or under the width asked for; rtl_power hides the DC
+      bin itself, and its skirts stay under 6 dB.
+- [x] ~~rtl_sdr's output.~~ Verified on the Mac, 2026-10-10: 2 bytes a sample,
+      and exactly the bytes `-n` asks for.
+- [x] ~~ADC clipping.~~ None on the Mac at any gain, 49.6 dB included
+      (2026-10-10).
 - [ ] **Provisioning.** The firstrun SDR step shows three checksum `OK`s,
       `libusb-1.0-0 2:1.0.28-1 already installed ... skipped`, one `dpkg -i`
       of librtlsdr0 + rtl-sdr, and `SDR support ready`.
@@ -82,13 +91,16 @@ inject, and boot with the NESDR SMArt v5 attached; the answers are in
 - [ ] **DVB modules absent.** The `lsmod` line in `--- sdr ---` shows none of
       `dvb_usb_rtl28xxu rtl2832 rtl2830 rtl2832_sdr r820t`, and there is no
       `/dev/dvb`.
-- [ ] **Gain vs the strong local FM station.** At the fixed 25.4 dB, check the
-      FM-band clips for clipping (cu8 bytes piling up at 0 and 255) and the
-      main scan for that station's images elsewhere in the band. If either
-      shows, lower `UMIK_SDR_GAIN` and write down the value.
-- [ ] **A real clip is valid SigMF.** Confirm a real clip's `.sigmf-meta`
-      validates against the SigMF schema (python sigmf package on the Mac:
-      `pip install sigmf`, `sigmf.sigmffile.fromfile(...)`).
+- [ ] **Re-check the gain split once on the Pi.** 15.7 dB in the FM band, 37.2
+      elsewhere (`UMIK_SDR_GAIN_WIDE` / `UMIK_SDR_GAIN`), set from the Mac
+      measurements of 2026-10-10. With the antenna where it will live: no
+      station skirts among the FM scan's signals, and the `tuner gain on the
+      ... scan` lines in `umik.log` show the gains asked for.
+- [x] ~~A real clip is valid SigMF.~~ Verified on the Mac, 2026-10-10: 24 real
+      clips from two live passes validate with the python sigmf package
+      (`sigmf.sigmffile.fromfile(...).validate()`), 0 warnings; FM clips show
+      the 19 kHz stereo pilot after demodulation, so the offset tuning and the
+      sample layout are right.
 - [ ] **Green LED with the SDR alone.** Solid through the first scan, then
       blipping; confirm it does not drop back to solid between passes (the
       6-minute freshness window vs a real pass pause plus scan on the Pi).

@@ -103,7 +103,8 @@ class RtlPowerFormat(unittest.TestCase):
         self.assertEqual((cropped["hops"], cropped["bins"]), (743, 52))
 
     def test_shifted_sweep_keeps_the_grid(self):
-        for start, stop, khz in ((87.5, 1750, 50), (87.5, 108, 10), (420, 480, 10)):
+        for start, stop, khz in ((108, 1750, 50), (87.5, 108, 10), (136, 174, 10), (400, 520, 10),
+                                 (87.5, 1750, 50), (420, 480, 10)):
             sc = U.prepare_scan({"name": "t", "start_mhz": start, "stop_mhz": stop, "bin_khz": khz}, 0.0)
             lo, hi = U.sweep_range(sc, True)
             p2 = U.power_plan(lo, hi, sc["bin_hz"])
@@ -304,6 +305,9 @@ class Pass(unittest.TestCase):
         self.assertGreater(tv["width_khz"], 5000)
         self.assertEqual((fm[0]["iq_rate"], tv["iq_rate"]), (cfg.iq_rate_wide, cfg.iq_rate))
         self.assertEqual((cfg.iq_rate_wide, cfg.iq_rate), (1024000, 250000))
+        # ... and the FM band's gain with it
+        self.assertEqual((fm[0]["gain_db"], tv["gain_db"]), (cfg.gain_wide, cfg.gain))
+        self.assertEqual((cfg.gain_wide, cfg.gain), (15.7, 37.2))
         self.assertEqual(sorted(c["index"] for c in plan), [1, 2])
 
 
@@ -320,7 +324,15 @@ class Capture(unittest.TestCase):
               "Falling back to buffers in userspace\nReading samples in async mode...\n"
               "\nUser cancel, exiting...\n")
         self.assertEqual(U.judge_sdr(0, False, ok), "")
-        self.assertIn("PLL not locked", U.judge_sdr(0, False, ok + "[R82XX] PLL not locked!\n"))
+        # one PLL line per open is librtlsdr setting the sample rate before any
+        # frequency (every R820T run prints it); two means a tune really failed
+        pll = "[R82XX] PLL not locked!\n"
+        self.assertEqual(U.judge_sdr(0, False, pll + ok), "")
+        self.assertIn("PLL not locked", U.judge_sdr(0, False, pll + ok + pll))
+        # libusb on macOS prints this on every open; it only matters with a bad exit
+        kd = "Kernel driver is active, or device is claimed by second instance of librtlsdr.\n"
+        self.assertEqual(U.judge_sdr(0, False, kd + pll + ok), "")
+        self.assertIn("exit 1", U.judge_sdr(1, False, kd + "usb_claim_interface error -6\n"))
         self.assertIn("sample rate", U.judge_sdr(0, False, "WARNING: Failed to set sample rate.\n"))
         self.assertTrue(U.judge_sdr(1, False, "usb_claim_interface error -6\n"))
         self.assertTrue(U.judge_sdr(0, True, ""))
@@ -332,6 +344,24 @@ class Capture(unittest.TestCase):
         for mhz, width in ((87.4, 40.0), (108.1, 200.0), (162.55, 12.0), (915.0, 150.0),
                            (539.0, 6000.0), (744.0, 10000.0)):
             self.assertEqual(U.iq_rate_for(sig(mhz, width=width), 250000, 1024000), 250000, mhz)
+
+    def test_gain_rule(self):
+        # the FM band's gain goes where its wide rate goes: edges included, however wide
+        for mhz, width in ((87.5, 40.0), (104.1, 40.0), (108.0, 200.0)):
+            self.assertEqual(U.gain_for(sig(mhz, width=width), 37.2, 15.7), 15.7, mhz)
+        for mhz, width in ((87.4, 40.0), (108.1, 200.0), (162.55, 12.0), (915.0, 150.0),
+                           (539.0, 6000.0)):
+            self.assertEqual(U.gain_for(sig(mhz, width=width), 37.2, 15.7), 37.2, mhz)
+        self.assertEqual(U.gain_for(sig(104.1), 37.2, "auto"), "auto")
+        self.assertEqual(U.gain_for(sig(162.55), "auto", 15.7), "auto")
+
+    def test_scan_gain_rule(self):
+        # a scan takes the FM band's gain only if its whole range is in the band:
+        # one that straddles 108 MHz (the old 87.5-1750 main scan) takes the other
+        for spec in ("87.5-108:10", "fm=88-100:5"):
+            self.assertEqual(U.gain_for(U.parse_scan(spec), 37.2, 15.7), 15.7, spec)
+        for spec in ("108-1750:50", "87.5-1750:50", "87.4-108:10", "100-108.1:10", "136-174:10"):
+            self.assertEqual(U.gain_for(U.parse_scan(spec), 37.2, 15.7), 37.2, spec)
 
     def test_clip_base(self):
         t = calendar.timegm((2026, 10, 10, 23, 15, 2)) + 0.417
@@ -471,18 +501,39 @@ class Config(unittest.TestCase):
 
     def test_scans_and_exclusions(self):
         c = self.cfg([], {})
-        self.assertEqual([s["name"] for s in c.scans], ["main", "fm", "uhf"])
-        self.assertEqual(c.exclude, [(698.0, 716.0), (777.0, 787.0), (824.0, 849.0)])
+        self.assertEqual([(s["name"], s["start_mhz"], s["stop_mhz"], s["bin_khz"]) for s in c.scans],
+                         [("main", 108.0, 1750.0, 50.0), ("fm", 87.5, 108.0, 10.0),
+                          ("vhf", 136.0, 174.0, 10.0), ("uhf", 400.0, 520.0, 10.0)])
+        self.assertEqual((c.thr, c.thr_burst), (10.0, 14.0))
+        self.assertEqual(c.exclude, [(698.0, 716.0), (777.0, 787.0), (824.0, 849.0), (960.0, 1215.0)])
         c = self.cfg([], {"UMIK_SDR_FINE": "", "UMIK_SDR_EXCLUDE": ""})         # empty = off
         self.assertEqual(([s["name"] for s in c.scans], c.exclude), (["main"], []))
         c = self.cfg(["--fine", "ism=433-435:5", "902-928:10", "903-910:10"], {})
         self.assertEqual([s["name"] for s in c.scans], ["main", "ism", "uhf", "uhf2"])
         self.assertEqual(self.cfg([], {"UMIK_SDR_GAIN": "auto"}).gain, "auto")
 
+    def test_gains(self):
+        c = self.cfg([], {})
+        self.assertEqual((c.gain, c.gain_wide), (37.2, 15.7))
+        self.assertEqual([(s["name"], s["gain"]) for s in c.scans],
+                         [("main", 37.2), ("fm", 15.7), ("vhf", 37.2), ("uhf", 37.2)])
+        for env in ({"UMIK_SDR_GAIN_WIDE": "auto"}, {"UMIK_SDR_GAIN_WIDE": " Auto "}):
+            self.assertEqual(self.cfg([], env).gain_wide, "auto")
+        self.assertEqual(self.cfg([], {"UMIK_SDR_GAIN_WIDE": "7.7"}).gain_wide, 7.7)
+        self.assertEqual(self.cfg([], {"UMIK_SDR_GAIN_WIDE": ""}).gain_wide, 15.7)     # empty = default
+        self.assertEqual(self.cfg(["--gain-wide", "20.7"], {"UMIK_SDR_GAIN_WIDE": "auto"}).gain_wide, 20.7)
+        c = self.cfg(["--gain-wide", "auto"], {"UMIK_SDR_GAIN": "40.2"})
+        self.assertEqual((c.gain, c.gain_wide), (40.2, "auto"))
+        self.assertEqual([s["gain"] for s in c.scans], [40.2, "auto", 40.2, 40.2])
+        # a main scan that takes in the FM band straddles 108 MHz: the general gain
+        self.assertEqual(self.cfg(["--scan", "87.5-1750:50"], {}).scans[0]["gain"], 37.2)
+
     def test_bad_values_name_their_knob(self):
         for env, frag in (({"UMIK_SDR_IQ_RATE": "500000"}, "UMIK_SDR_IQ_RATE"),
                           ({"UMIK_SDR_SCAN": "87.5-1750"}, "UMIK_SDR_SCAN"),
                           ({"UMIK_SDR_SWEEPS": "two"}, "UMIK_SDR_SWEEPS"),
+                          ({"UMIK_SDR_GAIN_WIDE": "loud"}, "UMIK_SDR_GAIN_WIDE"),
+                          ({"UMIK_SDR_GAIN_WIDE": "61"}, "UMIK_SDR_GAIN_WIDE"),
                           ({"UMIK_VID": "27x2"}, "UMIK_VID")):
             with self.assertRaises(U.ConfigError) as cm:
                 self.cfg([], env)
@@ -521,7 +572,7 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual([n for n in names if n.endswith(".part")], [])
             self.assertTrue(all(os.path.isfile(os.path.join(sdir, n)) for n in names))    # flat
             for p in (1, 2):
-                for sc in ("main", "fm", "uhf"):
+                for sc in ("main", "fm", "vhf", "uhf"):
                     self.assertIn("scan-p%04d-%s.csv.gz" % (p, sc), names)
                 doc = read_json(os.path.join(sdir, "scan-p%04d.json" % p))
                 self.assertEqual(list(doc)[:3], ["pass", "started_utc", "started_mono"])
@@ -534,6 +585,9 @@ class EndToEnd(unittest.TestCase):
                         "software"):
                 self.assertIn(key, sj)
             self.assertEqual((sj["session"], sj["recorder"], sj["time_source"]), ("000001", "sdr", "none"))
+            self.assertEqual((sj["sdr"]["gain_db"], sj["sdr"]["gain_wide_db"]), (37.2, 15.7))
+            self.assertEqual([(s["name"], s["gain_db"]) for s in sj["sdr"]["scans"]],
+                             [("main", 37.2), ("fm", 15.7), ("vhf", 37.2), ("uhf", 37.2)])
             # tools/umik-lib.sh json_str reads these line by line
             for line in ('  "unit": "test",', '  "clock_trusted": false,', '  "time_source": "none",'):
                 self.assertIn(line, text.splitlines())
@@ -554,14 +608,16 @@ class EndToEnd(unittest.TestCase):
 
     def test_every_clip_is_a_sigmf_pair(self):
         """One whole pass, every channel: the pairs, their meta against their
-        data and their clips.jsonl line, and the rate rule through run_pass."""
+        data and their clips.jsonl line, and the rate and gain rules through
+        run_pass."""
         with tempfile.TemporaryDirectory() as tmp:
             rc, err = self.run_fake(tmp, "--passes", "1", "--max-channels", "120",
                                     "--dwell", "0.1", "--jitter", "0")
             self.assertEqual(rc, 0, err)
             sdir, _ = self.session_dir(tmp)
             names = sorted(os.listdir(sdir))
-            plan = read_json(os.path.join(sdir, "scan-p0001.json"))["channels"]
+            doc = read_json(os.path.join(sdir, "scan-p0001.json"))
+            plan = doc["channels"]
             clips = read_jsonl(os.path.join(sdir, "clips.jsonl"))
             self.assertGreater(len(plan), 10)
             self.assertEqual(len(clips), len(plan))
@@ -570,6 +626,12 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(ch["iq_rate"], 1024000 if U.in_fm(ch["freq_hz"]) else 250000, ch)
             self.assertTrue(any(U.in_fm(ch["freq_hz"]) for ch in plan))
             self.assertTrue(any(not U.in_fm(ch["freq_hz"]) and ch["width_khz"] > 1000 for ch in plan))
+            # ... and the FM band's gain with it; a scan gets it only if it lies wholly in the band
+            for ch in plan:
+                self.assertEqual(ch["gain_db"], 15.7 if U.in_fm(ch["freq_hz"]) else 37.2, ch)
+            self.assertTrue(any(400e6 <= ch["freq_hz"] <= 520e6 for ch in plan))
+            self.assertEqual([(m["name"], m["gain_db"]) for m in doc["scans"]],
+                             [("main", 37.2), ("fm", 15.7), ("vhf", 37.2), ("uhf", 37.2)])
             # two files per clip, and nothing else clip-shaped
             self.assertEqual(sorted(c["file"] for c in clips), [n for n in names if n.endswith(".sigmf-data")])
             self.assertEqual(sorted(c["meta"] for c in clips), [n for n in names if n.endswith(".sigmf-meta")])
@@ -589,6 +651,8 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(g["core:sha512"], hashlib.sha512(data).hexdigest())
                 self.assertNotIn("core:dataset", g)
                 self.assertEqual(g["core:sample_rate"], float(c["iq_rate"]))
+                # the gain it was captured at: the FM band's in the band, the other one elsewhere
+                self.assertEqual(g["umik:gain_db"], 15.7 if U.in_fm(c["freq_hz"]) else 37.2, c["freq_hz"])
                 # core:frequency is the tuned centre; the target sits offset_hz below it
                 self.assertEqual(caps, [{"core:sample_start": 0, "core:frequency": float(c["center_hz"]),
                                          "core:datetime": g["umik:started_iso"]}])

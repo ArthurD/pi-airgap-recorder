@@ -3,8 +3,9 @@
 # SMArt v5, or any RTL2832U stick on USB 0bda:2838 or 0bda:2832).
 #
 # Every pass, from service start until it is stopped:
-#   1. scan     rtl_power sweeps the main range (87.5-1750 MHz) and the fine
-#               ranges (FM band, 420-480 MHz), UMIK_SDR_SWEEPS times each;
+#   1. scan     rtl_power sweeps the main range (108-1750 MHz) and the fine
+#               ranges (FM band, 136-174 and 400-520 MHz), UMIK_SDR_SWEEPS
+#               times each;
 #   2. choose   signals standing clear of the local noise floor, clustered so
 #               that one transmitter is one channel, plus the channels
 #               remembered from recent passes; strongest first, capped;
@@ -27,6 +28,12 @@
 #   * Offset tuning. An RTL dongle has a spur at the exact centre of whatever
 #     it is tuned to, so we tune iq_rate/4 above the target; the target sits
 #     at baseband -iq_rate/4, well clear of it.
+#   * Two gains, split where the IQ rate splits (gain_for). In the FM band a
+#     strong station compresses the tuner above ~20 dB and its skirts read as
+#     signals; everywhere else the 8-bit ADC is the limit, and more gain lifts
+#     weak carriers out of its quantisation noise. Measured with the SMArt v5
+#     (2026-10-10): 15.7 dB for the FM band, 37.2 dB for the rest. The main
+#     scan starts at 108 MHz, so the FM band is only ever scanned at its gain.
 #   * Everything in the session directory is flat and either complete or a
 #     *.part. A clip's data is written as .part, its length checked against
 #     what we asked for, fsynced and renamed; then its meta, hashed from the
@@ -95,16 +102,27 @@ VERSION = "1.0"
 # UMIK_MATCH_NAME convention).
 TUNABLES = (
     ("data-dir",        "UMIK_DATA_DIR",            ""),
-    ("gain",            "UMIK_SDR_GAIN",            "25.4"),
+    ("gain",            "UMIK_SDR_GAIN",            "37.2"),
+    ("gain-wide",       "UMIK_SDR_GAIN_WIDE",       "15.7"),
     ("ppm",             "UMIK_SDR_PPM",             "0"),
-    ("scan",            "UMIK_SDR_SCAN",            "87.5-1750:50"),
-    ("fine",            "UMIK_SDR_FINE",            "87.5-108:10 420-480:10"),
+    # The main scan leaves the FM band to its fine scan, at UMIK_SDR_GAIN_WIDE.
+    # The other fine scans are the VHF and UHF voice bands: what we listen for
+    # is quiet speech, and a 12.5 kHz voice channel loses ~5 dB of SNR in the
+    # main scan's 44 kHz bins.
+    ("scan",            "UMIK_SDR_SCAN",            "108-1750:50"),
+    ("fine",            "UMIK_SDR_FINE",            "87.5-108:10 136-174:10 400-520:10"),
     ("sweeps",          "UMIK_SDR_SWEEPS",          "3"),
-    ("thr",             "UMIK_SDR_THR",             "12"),
-    ("thr-burst",       "UMIK_SDR_THR_BURST",       "15"),
+    # rtl_power averages dozens to hundreds of FFTs into every bin, so 10 dB
+    # over the floor is never noise. A lower threshold only costs more real
+    # but dull channels, and UMIK_SDR_MAX_CHANNELS caps those.
+    ("thr",             "UMIK_SDR_THR",             "10"),
+    ("thr-burst",       "UMIK_SDR_THR_BURST",       "14"),
     # LTE UPLINKS (bands 12/17, 13 and 5): phones transmitting, ours included.
-    # Bursty, everywhere, and never what we are listening for.
-    ("exclude",         "UMIK_SDR_EXCLUDE",         "698-716 777-787 824-849"),
+    # Bursty, everywhere, and never what we are listening for. Then 960-1215,
+    # aeronautical radionavigation (DME/TACAN pulses, SSR): strong, always
+    # there, never voice or a bug, and the SMArt v5's own strongest spur block
+    # (1004-1013 MHz, 53 dB over the floor with no antenna) sits inside it.
+    ("exclude",         "UMIK_SDR_EXCLUDE",         "698-716 777-787 824-849 960-1215"),
     ("dwell",           "UMIK_SDR_DWELL",           "15"),
     ("jitter",          "UMIK_SDR_JITTER",          "0.3"),
     ("gap-max",         "UMIK_SDR_GAP_MAX",         "5"),
@@ -123,11 +141,16 @@ TUNABLES = (
 EMPTY_MEANS_OFF = ("UMIK_SDR_FINE", "UMIK_SDR_EXCLUDE")
 LIST_FLAGS = ("fine", "exclude", "mic-vid")
 HELP_NOTES = {
-    "scan": "main scan, START-STOP:BIN in MHz-MHz:kHz",
+    "scan": "main scan, START-STOP:BIN in MHz-MHz:kHz; the default starts at 108 MHz, so the "
+            "FM band is scanned only by its fine scan, at --gain-wide",
     "fine": "fine scans, same form, space-separated; NAME=START-STOP:BIN names one",
     "exclude": "MHz ranges never listened to; the default is the LTE uplinks of bands "
-               "12/17, 13 and 5 (phones transmitting)",
-    "gain": "tuner gain in dB, or auto",
+               "12/17, 13 and 5 (phones transmitting) and 960-1215 (aviation DME/TACAN pulses, "
+               "and the dongle's own spur block at 1004-1013)",
+    "gain": "tuner gain in dB, or auto, for everything outside the FM band, and for any scan "
+            "not wholly inside it",
+    "gain-wide": "tuner gain in dB, or auto, for the FM band (87.5-108 MHz): its scans and its "
+                 "captures",
     "crop": "rtl_power -c, percent of each hop's edges discarded",
     "iq-rate": "IQ samples/s for every channel outside the FM band",
     "iq-rate-wide": "IQ samples/s for channels in the FM band (87.5-108 MHz) only; every "
@@ -331,6 +354,10 @@ def fmt_num(x):
     return x
 
 
+def gain_text(g):
+    return "auto" if g == "auto" else "%g dB" % g
+
+
 def last_line(text, width=160):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     return lines[-1][:width] if lines else "no output"
@@ -445,7 +472,7 @@ SCAN_RE = re.compile(r"^(?:([A-Za-z0-9]+)=)?(\d+(?:\.\d*)?)-(\d+(?:\.\d*)?):(\d+
 
 
 def parse_scan(spec):
-    """'87.5-1750:50' (MHz-MHz:kHz), optionally named: 'ism=433-435:5'."""
+    """'108-1750:50' (MHz-MHz:kHz), optionally named: 'ism=433-435:5'."""
     m = SCAN_RE.match(spec.strip())
     if not m:
         raise ValueError("want START-STOP:BIN as MHz-MHz:kHz, e.g. 87.5-108:10")
@@ -492,7 +519,9 @@ def make_config(raw, args):
         return v
 
     c.data_dir = val("data-dir")
-    c.gain = "auto" if val("gain").lower() == "auto" else number("gain", float, 0.0, 60.0)
+    for flag in ("gain", "gain-wide"):
+        g = "auto" if val(flag).lower() == "auto" else number(flag, float, 0.0, 60.0)
+        setattr(c, flag.replace("-", "_"), g)
     c.ppm = number("ppm", int, -500, 500)            # rtl_* take whole ppm only (atoi)
     c.sweeps = number("sweeps", int, 1, 50)
     c.thr = number("thr", float, 1.0, 100.0)
@@ -534,6 +563,7 @@ def make_config(raw, args):
         scans.append(sc)
     for sc in scans:
         sc["sweeps"] = c.sweeps
+        sc["gain"] = gain_for(sc, c.gain, c.gain_wide)
     c.scans = scans
 
     c.exclude = []
@@ -1303,15 +1333,35 @@ def iq_rate_for(ch, rate, rate_wide):
     return rate_wide if in_fm(ch["freq_hz"]) else rate
 
 
+def gain_for(x, gain, gain_wide):
+    """The tuner gain for x, a channel or a scan: UMIK_SDR_GAIN_WIDE in the
+    FM band, by iq_rate_for's test, and UMIK_SDR_GAIN everywhere else. A
+    channel is in the band when its frequency is (edges included, however
+    wide it measured); a scan only when its whole range is, so a scan that
+    straddles 108 MHz gets UMIK_SDR_GAIN. Measured with the SMArt v5 on
+    2026-10-10: in the FM band a strong station compresses the tuner above
+    ~20 dB (between 15.7 and 25.4 dB its margin over the fine scan's floor
+    fell from 40 dB to 32 and its skirts grew from 1 false signal to 3; in
+    IQ, 37.2 dB costs 6-7 dB of floor). Outside it, at 25.4 dB the 8-bit ADC
+    sees ~2 LSB of noise at UHF; 37.2 dB lifts weak carriers 3-5 dB, 49.6
+    adds nothing, and nothing clips at any gain."""
+    if "start_mhz" in x:
+        lo, hi = x["start_mhz"] * 1e6, x["stop_mhz"] * 1e6
+    else:
+        lo = hi = x["freq_hz"]
+    return gain_wide if in_fm(lo) and in_fm(hi) else gain
+
+
 def pass_plan(rotation, kept, p, cfg, rng):
     """One pass's listen plan: the rotation memory updated with what this
     pass's scans kept, capped (strongest first), shuffled, and each channel
-    given its IQ rate and its place in the order."""
+    given its IQ rate, its tuner gain and its place in the order."""
     rotation.update(kept, p)
     plan = rotation.plan(p, cfg.max_channels)
     rng.shuffle(plan)
     for i, ch in enumerate(plan, 1):
         ch["iq_rate"] = iq_rate_for(ch, cfg.iq_rate, cfg.iq_rate_wide)
+        ch["gain_db"] = fmt_num(gain_for(ch, cfg.gain, cfg.gain_wide))
         ch["index"] = i
     return plan
 
@@ -1434,7 +1484,9 @@ FAKE_EMITTERS = FAKE_FM + (
     (100.35, 3.0, 18.0, None, None),        # a lone narrow carrier between stations
     (146.52, 3.0, 30.0, None, None),        # 2 m simplex
     (162.55, 12.0, 25.0, None, None),       # NOAA weather
-    (315.0, 3.0, 13.0, (1,), None),         # weak and bursty: dropped
+    # (315.3, not 315.0: the main scan's plain sweeps mask 315.0 as a hop's
+    # first bin, and a burst seen by its only unmasked sweep reads as always on)
+    (315.3, 3.0, 13.0, (1,), None),         # weak and bursty: dropped
     (433.92, 3.0, 22.0, (0,), None),        # a strong burst: kept on SNR alone
     (462.5625, 3.0, 16.0, None, None),      # FRS, always on
     (506.0, 6000.0, 22.0, None, None),      # UHF TV channel 19 ...
@@ -1510,7 +1562,7 @@ class Recorder:
         self.pass_no = 0
         self.phase = "starting"
         self.last_hb = mono()
-        self.gain_logged = False
+        self.gain_logged = set()    # scans whose tuner gain line is in the log
         self.plan_warned = set()
         self.iq_block = None
 
@@ -1623,14 +1675,14 @@ class Recorder:
                 applog("WARNING: scan %s %g-%g MHz goes outside the R820T2's ~%g-%g MHz"
                        % (sc["name"], sc["start_mhz"], sc["stop_mhz"], lo, hi))
         applog("scans: " + "; ".join(
-            "%s %g-%g MHz in %d hops of %d x %.1f kHz bins" % (
-                sc["name"], sc["start_mhz"], sc["stop_mhz"], sc["plan"]["hops"],
-                sc["plan"]["bins"], sc["plan"]["step"] / 1e3) for sc in cfg.scans)
+            "%s %g-%g MHz in %d hops of %d x %.1f kHz bins, gain %s" % (
+                sc["name"], sc["start_mhz"], sc["stop_mhz"], sc["plan"]["hops"], sc["plan"]["bins"],
+                sc["plan"]["step"] / 1e3, gain_text(sc["gain"])) for sc in cfg.scans)
             + "; %d sweeps each, every other one a quarter hop off%s"
             % (cfg.sweeps, ", crop %g%%" % cfg.crop if cfg.crop else ""))
-        applog("captures: gain %s, ppm %d, %d/%d S/s, dwell %gs +-%d%%, gaps 0-%gs, pauses 0-%gs, "
-               "up to %d channels a pass; exclude %s" % (
-                   "auto" if cfg.gain == "auto" else "%g dB" % cfg.gain, cfg.ppm, cfg.iq_rate,
+        applog("captures: gain %s (FM band %s), ppm %d, %d/%d S/s, dwell %gs +-%d%%, gaps 0-%gs, "
+               "pauses 0-%gs, up to %d channels a pass; exclude %s" % (
+                   gain_text(cfg.gain), gain_text(cfg.gain_wide), cfg.ppm, cfg.iq_rate,
                    cfg.iq_rate_wide, cfg.dwell, round(cfg.jitter * 100), cfg.gap_max,
                    cfg.pass_pause_max, cfg.max_channels,
                    " ".join("%g-%g" % r for r in cfg.exclude) or "nothing"))
@@ -1696,13 +1748,14 @@ class Recorder:
             "storage": self.storage,
             "device": device,
             "sdr": {
-                "gain_db": fmt_num(cfg.gain), "ppm": cfg.ppm,
-                "iq_rate": cfg.iq_rate, "iq_rate_wide": cfg.iq_rate_wide,
+                "gain_db": fmt_num(cfg.gain), "gain_wide_db": fmt_num(cfg.gain_wide),
+                "ppm": cfg.ppm, "iq_rate": cfg.iq_rate, "iq_rate_wide": cfg.iq_rate_wide,
                 "dwell_s": fmt_num(cfg.dwell), "jitter": fmt_num(cfg.jitter),
                 "gap_max_s": fmt_num(cfg.gap_max), "pass_pause_max_s": fmt_num(cfg.pass_pause_max),
                 "scans": [{"name": sc["name"], "start_mhz": fmt_num(sc["start_mhz"]),
                            "stop_mhz": fmt_num(sc["stop_mhz"]), "bin_khz": fmt_num(sc["bin_khz"]),
-                           "sweeps": sc["sweeps"]} for sc in cfg.scans],
+                           "sweeps": sc["sweeps"], "gain_db": fmt_num(sc["gain"])}
+                          for sc in cfg.scans],
                 "thr_db": fmt_num(cfg.thr), "thr_burst_db": fmt_num(cfg.thr_burst),
                 "exclude_mhz": [[fmt_num(lo), fmt_num(hi)] for lo, hi in cfg.exclude],
                 "remember_passes": cfg.remember_passes, "remember_once": cfg.remember_once,
@@ -1829,7 +1882,8 @@ class Recorder:
             signals += sigs
             fl = [x for f in floors for x in f if x is not None]
             meta.append({"name": sc["name"], "file": os.path.basename(st["path"]),
-                         "sweeps": cfg.sweeps, "hops": sc["plan"]["hops"], "bins": sc["grid"]["n"],
+                         "sweeps": cfg.sweeps, "gain_db": fmt_num(sc["gain"]),
+                         "hops": sc["plan"]["hops"], "bins": sc["grid"]["n"],
                          "floor_db_median": round(statistics.median(fl), 1) if fl else None,
                          "seconds": round(st["seconds"], 1), "bin_hz": round(sc["plan"]["step"], 2)})
         return meta, signals
@@ -1842,8 +1896,9 @@ class Recorder:
         plan = power_plan(lo, hi, sc["bin_hz"], sc["crop"])
         argv = [self.tools.get("rtl_power", "rtl_power"), "-f", "%d:%d:%d" % (lo, hi, sc["bin_hz"]),
                 "-i", "1", "-1"]
-        if cfg.gain != "auto":
-            argv += ["-g", "%g" % cfg.gain]
+        gain = sc["gain"]
+        if gain != "auto":
+            argv += ["-g", "%g" % gain]
         argv += ["-p", str(cfg.ppm)]
         if cfg.crop:
             argv += ["-c", "%g%%" % cfg.crop]
@@ -1863,12 +1918,12 @@ class Recorder:
             rows = parse_power_csv(text)
             problem = self.judge_power(sc, plan, rc, timed_out, rows, err)
             if not problem:
-                if not self.gain_logged:
+                if sc["name"] not in self.gain_logged:
                     m = re.search(r"Tuner gain set to (.+?)\.?$", err, re.M)
                     if m:
-                        applog("tuner gain: %s (asked for %s)" % (
-                            m.group(1), "auto" if cfg.gain == "auto" else "%g dB" % cfg.gain))
-                    self.gain_logged = True
+                        applog("tuner gain on the %s scan: %s (asked for %s)" % (
+                            sc["name"], m.group(1), gain_text(gain)))
+                    self.gain_logged.add(sc["name"])
                 return text, rows, mono() - t0
             applog("WARNING: rtl_power %s sweep %d/%d failed: %s%s" % (
                 sc["name"], s + 1, cfg.sweeps, problem,
@@ -1900,7 +1955,7 @@ class Recorder:
 
     def capture(self, ch, p, n_plan):
         cfg = self.cfg
-        rate, f = ch["iq_rate"], ch["freq_hz"]
+        rate, f, gain = ch["iq_rate"], ch["freq_hz"], ch["gain_db"]
         offset = rate // 4
         center = f + offset
         dwell = cfg.dwell * self.rng.uniform(1 - cfg.jitter, 1 + cfg.jitter)
@@ -1921,7 +1976,7 @@ class Recorder:
         self.phase = "pass %d: clip %d/%d, %.4f MHz for %.1fs" % (p, ch["index"], n_plan, f / 1e6, n / float(rate))
         line = {"file": base + DATA_EXT, "meta": base + META_EXT,
                 "freq_hz": f, "center_hz": center, "offset_hz": offset, "iq_rate": rate,
-                "format": "cu8", "gain_db": fmt_num(cfg.gain), "started_utc": utc_stamp(t),
+                "format": "cu8", "gain_db": gain, "started_utc": utc_stamp(t),
                 "started_mono": round(mono(), 3), "clock_trusted": self.trusted,
                 "duration_s": round(n / float(rate), 3), "samples": n, "bytes": nbytes,
                 "pass": p, "index": ch["index"]}
@@ -1933,9 +1988,9 @@ class Recorder:
             problem = self.fake_capture(part, n, rate)
         else:
             argv = [self.tools["rtl_sdr"], "-f", str(center), "-s", str(rate)]
-            if cfg.gain != "auto":
+            if gain != "auto":
                 # rtl_sdr reads -g 0 as "auto"; 0.1 rounds to the tuner's 0.0 dB step
-                argv += ["-g", "%g" % (cfg.gain if cfg.gain > 0 else 0.1)]
+                argv += ["-g", "%g" % (gain if gain > 0 else 0.1)]
             argv += ["-p", str(cfg.ppm), "-n", str(n), part]
             rc, _, err, timed_out = self.run_child(argv, timeout=n / float(rate) + 20, want_stdout=False)
             problem = judge_sdr(rc, timed_out, err)
@@ -2019,6 +2074,16 @@ SDR_FAULTS = ("Failed to open", "Failed to set center freq", "Failed to set samp
               "Short write", "Library error", "No supported devices", "usb_claim_interface",
               "usb_open error", "Kernel driver is active")
 
+# Two of those are also printed by runs that then work (Mac, 2026-10-10,
+# librtlsdr 2.0.2, the Pi's version too). librtlsdr sets the sample rate, and
+# with it the R820T's bandwidth and PLL, before any centre frequency, so every
+# open prints ONE "[R82XX] PLL not locked!"; a second one is a real tune that
+# failed. "Kernel driver is active" is libusb on macOS, which cannot detach
+# kernel drivers and says so on every open; when the DVB driver really holds
+# the dongle the claim fails and rtl_sdr exits non-zero, which is reported.
+PLL_NOT_LOCKED = "PLL not locked"
+KERNEL_DRIVER = "Kernel driver is active"
+
 
 def judge_sdr(rc, timed_out, err):
     if timed_out:
@@ -2028,7 +2093,9 @@ def judge_sdr(rc, timed_out, err):
     bad = [l.strip() for l in err.splitlines() if any(s in l for s in SDR_FAULTS)]
     if rc != 0:
         return "rtl_sdr exit %d: %s" % (rc, bad[-1] if bad else last_line(err))
-    return bad[0] if bad else ""
+    pll = [l for l in bad if PLL_NOT_LOCKED in l]
+    real = [l for l in bad if KERNEL_DRIVER not in l and (PLL_NOT_LOCKED not in l or len(pll) > 1)]
+    return real[0] if real else ""
 
 
 def stop_child(p):
