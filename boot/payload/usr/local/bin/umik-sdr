@@ -269,13 +269,19 @@ class ConfigError(Exception):
 # --- small helpers ----------------------------------------------------------------
 
 def mono():
-    """Seconds since boot as /proc/uptime counts them (CLOCK_BOOTTIME; plain
-    time.monotonic() on the Mac). Clip spacing stays exact even while the wall
-    clock is untrusted."""
-    try:
-        return time.clock_gettime(time.CLOCK_BOOTTIME)
-    except (AttributeError, OSError):
-        return time.monotonic()
+    """Seconds since boot as /proc/uptime counts them: CLOCK_BOOTTIME on Linux,
+    CLOCK_UPTIME_RAW on a Mac. Clip spacing stays exact even while the wall
+    clock is untrusted. Not plain time.monotonic(): on macOS the system
+    python3 (3.9) counts that from the process start, so every run would
+    begin again at zero and no two sessions' clips could be spaced."""
+    for name in ("CLOCK_BOOTTIME", "CLOCK_UPTIME_RAW"):
+        clk = getattr(time, name, None)
+        if clk is not None:
+            try:
+                return time.clock_gettime(clk)
+            except OSError:
+                pass
+    return time.monotonic()
 
 
 def utc_stamp(t=None):
