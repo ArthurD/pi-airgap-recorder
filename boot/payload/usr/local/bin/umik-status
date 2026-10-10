@@ -5,14 +5,19 @@
 # channel. The vocabulary is deliberately tiny - readable from across a
 # room without a decoder card:
 #
-#   GREEN (ACT)  "is it recording?"
-#     off        box still booting (recorder not started yet)
-#     solid      recorder running but not writing yet (mic probe, session
-#                setup; suspicious if it stays solid for minutes)
-#     slow blip  recording - and the segment file is actually GROWING
-#                (checked on disk; a wedged recorder does not get this)
-#     fast blink trouble: recorder/radio-check failed, or the recorder
-#                stopped after having run (storage full lands here)
+#   GREEN (ACT)  "is it recording?"  - one answer for both recorders,
+#                umik-record (mic) and umik-sdr (RTL-SDR)
+#     off        box still booting (no recorder started yet)
+#     solid      a recorder running but not writing yet (mic probe, dongle
+#                wait, first SDR scan; suspicious if it stays solid for minutes)
+#     slow blip  recording - and verified on disk: a mic segment GROWING, or
+#                an SDR clip or scan finished in the last 6 minutes (a wedged
+#                recorder does not get this)
+#     fast blink trouble: a recorder or the radio-check failed, or every
+#                recorder stopped after having run (storage full lands here).
+#                A recorder that exited 79 ("not my device": the box carries
+#                the other recorder's device) is idle, not failed - it never
+#                trips this while the other one is running
 #
 #   RED (PWR)  "do I have real time?"   (power indication is repurposed;
 #     off        not determined yet (GPS/NTP sync still running)
@@ -92,24 +97,35 @@ SEEN_ACTIVE=0
 
 while :; do
     # ---- green: recording state -------------------------------------------
+    # Two recorders share this LED. Exit 79 leaves a unit inactive, NOT
+    # failed, so a recorder that found the other one's device instead of its
+    # own drops out of every test below on its own.
     if systemctl is-failed --quiet umik-record 2>/dev/null \
+       || systemctl is-failed --quiet umik-sdr 2>/dev/null \
        || systemctl is-failed --quiet umik-radio-check 2>/dev/null; then
         WANT_GREEN=fast
-    elif systemctl is-active --quiet umik-record 2>/dev/null; then
+    elif systemctl is-active --quiet umik-record 2>/dev/null \
+         || systemctl is-active --quiet umik-sdr 2>/dev/null; then
         SEEN_ACTIVE=1
-        # "Actually writing" means a segment file touched within the last
+        # "Actually writing" means a mic segment touched within the last
         # minute - arecord writes continuously, so the in-flight segment's
-        # mtime is always fresh on a healthy box.
+        # mtime is always fresh on a healthy box - or an SDR clip or scan
+        # finished within the last 6. umik-sdr writes in bursts: a clip
+        # every ~20s, but a pass pause (up to 3 min) plus the next scan can
+        # leave several minutes without a new file.
         if [ -n "$(find /data/usb/recordings /data/recordings \
                    -maxdepth 2 -name 'seg-*.wav' -mmin -1 -print 2>/dev/null \
-                   | head -1)" ]; then
+                   | head -1)" ] \
+           || [ -n "$(find /data/usb/recordings/*-sdr_* /data/recordings/*-sdr_* \
+                      -maxdepth 1 \( -name 'clip-*.cu8' -o -name 'scan-*' \) \
+                      -mmin -6 -print 2>/dev/null | head -1)" ]; then
             WANT_GREEN=blip
         else
             WANT_GREEN=on
         fi
     elif [ "$SEEN_ACTIVE" -eq 1 ]; then
-        # It ran and now it does not: a deliberate storage-full stop or a
-        # death systemd chose not to restart. Either way: come service me.
+        # Something ran and now nothing does: a deliberate storage-full stop
+        # or a death systemd chose not to restart. Either way: come service me.
         WANT_GREEN=fast
     else
         WANT_GREEN=off

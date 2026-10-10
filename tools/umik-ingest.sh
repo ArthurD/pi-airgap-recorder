@@ -351,6 +351,9 @@ ingest() {
             [ -f "$src" ] || continue
             base=$(basename "$src")
             case "$base" in .*|._*) continue ;; esac   # dotfiles, AppleDouble
+            # umik-sdr's clip in flight when the power went: an interrupted
+            # capture, not a recording. Never sealed (and so never pruned).
+            case "$base" in *.part) continue ;; esac
             dst="$dest/$base"
             rel="recordings/$unit/$sname/$base"
 
@@ -473,7 +476,7 @@ prune_worker() { # <line number in $WORKDIR/cand>
 }
 
 prune_verified() {
-    local SRC=$1 vol unit sdir sname dest base src dst want label total n=0 removed=0 kept=0
+    local SRC=$1 vol unit sdir sname dest base src dst want label total n=0 removed=0 kept=0 parts=0
     [ -d "$SRC/recordings" ] || die "$SRC has no recordings/ directory"
     vol=$(basename "$SRC" | tr -cd 'A-Za-z0-9._-')
     make_workdir
@@ -493,6 +496,9 @@ prune_verified() {
             [ -f "$src" ] || continue
             base=$(basename "$src")
             case "$base" in .*|._*) continue ;; esac
+            # An interrupted umik-sdr capture: never sealed, so never a
+            # candidate. Counted, so the medium's leftovers are not a mystery.
+            case "$base" in *.part) parts=$((parts + 1)); continue ;; esac
             dst="$dest/$base"
             want=$(grep -F "  $base" "$dest/SHA256SUMS" 2>/dev/null | awk 'NR==1{print $1}')
             # A dash, never an empty field: tab is IFS whitespace, so `read`
@@ -522,6 +528,7 @@ prune_verified() {
         rmdir "$sdir" 2>/dev/null || true   # only removes emptied sessions
     done < "$WORKDIR/sessions"
     say "pruned $removed verified file(s) from $SRC, kept $kept"
+    [ "$parts" -eq 0 ] || say "left $parts interrupted SDR capture(s) (*.part) on $SRC - unsealed, not recordings; umik-sdr removes them at its next start"
 }
 
 # --- launchd agent -----------------------------------------------------------

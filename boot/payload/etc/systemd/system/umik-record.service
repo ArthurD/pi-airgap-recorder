@@ -43,7 +43,11 @@ RestartSec=2
 RestartSteps=8
 RestartMaxDelaySec=60
 # 78 = deliberate "card is full" stop from umik-record; do not thrash-restart.
-RestartPreventExitStatus=78
+# 79 = "not my device": no mic after the wait, but an RTL-SDR is attached, so
+# this box is umik-sdr's. Counted as success AND not restarted, so the unit
+# ends inactive rather than failed and the green LED follows umik-sdr.
+SuccessExitStatus=79
+RestartPreventExitStatus=78 79
 User=recorder
 Group=recorder
 SupplementaryGroups=audio

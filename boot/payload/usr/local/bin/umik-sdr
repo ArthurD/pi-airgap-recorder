@@ -1,0 +1,1946 @@
+#!/usr/bin/python3
+# umik-sdr - scan-and-capture recorder for an RTL-SDR dongle (Nooelec NESDR
+# SMArt v5, or any RTL2832U stick on USB 0bda:2838 or 0bda:2832).
+#
+# Every pass, from service start until it is stopped:
+#   1. scan     rtl_power sweeps the main range (87.5-1750 MHz) and the fine
+#               ranges (FM band, 420-480 MHz), UMIK_SDR_SWEEPS times each;
+#   2. choose   signals standing clear of the local noise floor, clustered so
+#               that one transmitter is one channel, plus the channels
+#               remembered from recent passes; strongest first, capped;
+#   3. capture  each channel as raw IQ with rtl_sdr, in shuffled order, with
+#               a random gap before each one and a jittered dwell;
+#   4. pause    for a random while, then the next pass.
+# Nothing is demodulated here: the Pi records, the Mac analyses.
+#
+# Design notes:
+#   * IQ, not audio. Demodulating in the field means guessing what the
+#     transmitter is (AM? NBFM? data?) and throwing every other answer away.
+#     Raw IQ keeps them all, at 2 bytes per sample ("cu8", rtl_sdr's own
+#     format). The price is disk: ~31 MB per 15 s clip at the wide rate.
+#   * Offset tuning. An RTL dongle has a spur at the exact centre of whatever
+#     it is tuned to, so we tune iq_rate/4 above the target; the target sits
+#     at baseband -iq_rate/4, well clear of it.
+#   * Everything in the session directory is flat and either complete or a
+#     *.part. A clip is written as .part, its length checked against what we
+#     asked for, fsynced, renamed, and only then logged in clips.jsonl
+#     (appended and fsynced). Pull the power at any moment and the most you
+#     lose is the clip in flight; ingest ignores *.part.
+#   * One rtl_power run per sweep. rtl_power averages every sweep that fits
+#     into an integration interval into one row per hop, and we need the
+#     sweeps apart to tell an always-on carrier from a burst (occupancy).
+#     "-i 1 -1" reports after the first sweep that ends a second after the
+#     start: exactly one sweep of the ~600-hop main scan, at most a second's
+#     average of a short fine scan. Separate runs also let alternate sweeps
+#     start a quarter hop off (next note).
+#   * DC spur. Each rtl_power hop carries the dongle's DC spur in its centre
+#     bin, and its edge bins roll off. The centre bins are masked, and every
+#     other sweep is shifted by a quarter hop, so every frequency sits well
+#     inside a hop, unmasked, in some sweeps - and a spur that slips past the
+#     mask lands somewhere else every other sweep and fails the occupancy
+#     test. (Not half a hop: that puts the shifted centres, masked, exactly
+#     on the plain hops' edges, rolled off, and a carrier there loses both.)
+#   * The hops are not flat: the dongle's filters roll every hop's edges off,
+#     the same shape each time. Left in, a weak always-on carrier near a hop
+#     edge reads as intermittent and is thrown away. The shape is measured
+#     from each sweep's own hops and taken out (hop_profile), rather than
+#     cropped away with rtl_power's -c, which costs 25% more hops per sweep
+#     (UMIK_SDR_CROP is there if the hardware ever says otherwise).
+#   * The schedule is random - shuffled order, random gaps, jittered dwell,
+#     random pause between passes - so a transmitter cannot learn when it is
+#     being listened to and keep quiet then.
+#   * Never trust an rtl_* exit status alone. Both tools print most failures
+#     ("dropped samples", "Failed to set center freq", "PLL not locked") and
+#     still exit 0, and rtl_sdr can record forever (see capture_samples).
+#     Every run is judged by what it printed and how much data it produced.
+#   * Standard library only: the Pi OS Lite image has python3 and nothing
+#     else, and provisioning is offline.
+
+import argparse
+import bisect
+import errno
+import glob
+import gzip
+import json
+import math
+import os
+import random
+import re
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import time
+import traceback
+
+VERSION = "1.0"
+
+# --- tunables -----------------------------------------------------------------
+# (flag, environment variable, default). Set the variables with
+# `systemctl edit umik-sdr`; on the Mac use the flags. A flag beats the
+# environment, the environment beats the default. An EMPTY variable means
+# "default" - except for UMIK_SDR_FINE and UMIK_SDR_EXCLUDE, where empty is
+# how you switch the fine scans or the exclusions off (umik-record's
+# UMIK_MATCH_NAME convention).
+TUNABLES = (
+    ("data-dir",        "UMIK_DATA_DIR",            ""),
+    ("gain",            "UMIK_SDR_GAIN",            "25.4"),
+    ("ppm",             "UMIK_SDR_PPM",             "0"),
+    ("scan",            "UMIK_SDR_SCAN",            "87.5-1750:50"),
+    ("fine",            "UMIK_SDR_FINE",            "87.5-108:10 420-480:10"),
+    ("sweeps",          "UMIK_SDR_SWEEPS",          "3"),
+    ("thr",             "UMIK_SDR_THR",             "12"),
+    ("thr-burst",       "UMIK_SDR_THR_BURST",       "15"),
+    # LTE UPLINKS (bands 12/17, 13 and 5): phones transmitting, ours included.
+    # Bursty, everywhere, and never what we are listening for.
+    ("exclude",         "UMIK_SDR_EXCLUDE",         "698-716 777-787 824-849"),
+    ("dwell",           "UMIK_SDR_DWELL",           "15"),
+    ("jitter",          "UMIK_SDR_JITTER",          "0.3"),
+    ("gap-max",         "UMIK_SDR_GAP_MAX",         "5"),
+    ("pass-pause-max",  "UMIK_SDR_PASS_PAUSE_MAX",  "180"),
+    ("remember-passes", "UMIK_SDR_REMEMBER_PASSES", "8"),
+    ("remember-once",   "UMIK_SDR_REMEMBER_ONCE",   "2"),
+    ("iq-rate",         "UMIK_SDR_IQ_RATE",         "250000"),
+    ("iq-rate-wide",    "UMIK_SDR_IQ_RATE_WIDE",    "1024000"),
+    ("max-channels",    "UMIK_SDR_MAX_CHANNELS",    "120"),
+    ("crop",            "UMIK_SDR_CROP",            "0"),
+    ("min-free-mb",     "UMIK_MIN_FREE_MB",         "512"),
+    ("wait-seconds",    "UMIK_SDR_WAIT_SECONDS",    "30"),
+    ("log-interval",    "UMIK_LOG_INTERVAL",        "60"),
+    ("mic-vid",         "UMIK_VID",                 "2752 19f7 0869"),
+)
+EMPTY_MEANS_OFF = ("UMIK_SDR_FINE", "UMIK_SDR_EXCLUDE")
+LIST_FLAGS = ("fine", "exclude", "mic-vid")
+HELP_NOTES = {
+    "scan": "main scan, START-STOP:BIN in MHz-MHz:kHz",
+    "fine": "fine scans, same form, space-separated; NAME=START-STOP:BIN names one",
+    "exclude": "MHz ranges never listened to; the default is the LTE uplinks of bands "
+               "12/17, 13 and 5 (phones transmitting)",
+    "gain": "tuner gain in dB, or auto",
+    "crop": "rtl_power -c, percent of each hop's edges discarded",
+    "mic-vid": "USB vendor IDs that count as umik-record's microphone (exit 79)",
+}
+
+# --- hardware facts -----------------------------------------------------------
+
+RTL_IDS = ("0bda:2838", "0bda:2832")
+# What usb_str() keeps of a USB string: umik-record's `tr -cd`, for the same
+# reason - the strings come from the device and are untrusted.
+USB_STR_OK = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                       "0123456789 ._:()+-")
+# rtl_power's hop planner (src/rtl_power.c, identical in 2.0.2 and 2.0.3).
+# power_plan() reproduces it integer for integer, so the scan grid, the
+# timeouts and --fake all match what the real tool does.
+POWER_MAX_RATE = 2800000
+POWER_MIN_RATE = 1000000
+# rtl_sdr's default USB output block in bytes; see capture_samples().
+RTL_SDR_BLOCK = 16 * 16384
+# The only sample rates the RTL2832U takes (librtlsdr rtlsdr_set_sample_rate).
+# rtl_sdr merely WARNS when a rate is refused and records at the old one, so
+# a bad UMIK_SDR_IQ_RATE would silently mislabel every clip - refuse it here.
+RATE_OK = ((225001, 300000), (900001, 3200000))
+# The R820T2 tunes about 24-1766 MHz; outside that rtl_* print "PLL not locked".
+TUNER_MHZ = (24.0, 1766.0)
+
+# --- band plan ----------------------------------------------------------------
+# The US table from tinysa/bands.py, copied as data: (start MHz, stop MHz,
+# name, kind). The FIRST row containing a frequency wins, as there - so
+# 433.92 MHz reads "70 cm amateur". kind matters for clustering: 'cellular',
+# 'wifi' and UHF TV ('broadcast' above 400 MHz) are wide transmitters that
+# get one channel each.
+US_BANDS = (
+    (0.53, 1.71, "AM broadcast", "broadcast"),
+    (1.8, 30.0, "HF / shortwave / amateur", "other"),
+    (26.96, 27.41, "CB radio", "voice"),
+    (30.0, 50.0, "VHF-low business/public safety", "voice"),
+    (49.8, 49.9, "49 MHz baby monitor/cordless (legacy)", "voice"),
+    (54.0, 88.0, "VHF TV low (ch 2-6)", "broadcast"),
+    (88.0, 108.0, "FM broadcast", "broadcast"),
+    (108.0, 137.0, "Aviation", "other"),
+    (137.0, 138.0, "Weather satellite", "other"),
+    (144.0, 148.0, "2 m amateur", "voice"),
+    (148.0, 174.0, "VHF business/public safety/marine/NOAA", "voice"),
+    (174.0, 216.0, "VHF TV high (ch 7-13) / wireless mics", "broadcast"),
+    (216.0, 225.0, "216-225 misc (assistive listening, etc.)", "other"),
+    (225.0, 400.0, "Military aviation", "other"),
+    (400.0, 420.0, "Federal UHF", "voice"),
+    (420.0, 450.0, "70 cm amateur", "voice"),
+    (433.05, 434.79, "433 MHz ISM (keyfobs, sensors, cheap bugs)", "ism"),
+    (450.0, 470.0, "UHF business / FRS / GMRS", "voice"),
+    (470.0, 608.0, "UHF TV (ch 14-36) / wireless mics", "broadcast"),
+    (608.0, 614.0, "Ch 37 / wireless mic", "other"),
+    (614.0, 698.0, "600 MHz LTE (band 71)", "cellular"),
+    (698.0, 806.0, "700 MHz LTE (bands 12/13/14/17)", "cellular"),
+    (806.0, 869.0, "800 MHz public safety / SMR", "voice"),
+    (824.0, 894.0, "850 MHz cellular (band 5)", "cellular"),
+    (894.0, 902.0, "894-902 misc", "other"),
+    (902.0, 928.0, "915 MHz ISM (LoRa, Z-Wave, meters, cordless)", "ism"),
+    (929.0, 932.0, "Pagers", "other"),
+    (1240.0, 1300.0, "23 cm amateur / 1.2 GHz video", "voice"),
+    (1427.0, 1518.0, "1.4-1.5 GHz misc", "other"),
+    (1559.0, 1610.0, "GNSS (GPS L1 etc, receive-only)", "other"),
+    (1626.0, 1660.0, "Satphone uplink", "other"),
+    (1710.0, 1780.0, "AWS uplink (phones)", "cellular"),
+    (1850.0, 1915.0, "PCS uplink (phones)", "cellular"),
+    (1920.0, 1930.0, "DECT 6.0 cordless phones", "voice"),
+    (1930.0, 1995.0, "PCS downlink (towers)", "cellular"),
+    (2110.0, 2200.0, "AWS downlink (towers)", "cellular"),
+    (2300.0, 2360.0, "WCS band 30", "cellular"),
+    (2400.0, 2483.5, "2.4 GHz ISM: Wi-Fi/BT/Zigbee/cameras", "wifi"),
+    (2496.0, 2690.0, "2.5 GHz (band 41)", "cellular"),
+    (3550.0, 3700.0, "CBRS (band 48)", "cellular"),
+    (3700.0, 3980.0, "C-band 5G (n77)", "cellular"),
+    (5150.0, 5350.0, "5 GHz Wi-Fi (UNII-1/2A)", "wifi"),
+    (5470.0, 5725.0, "5 GHz Wi-Fi (UNII-2C)", "wifi"),
+    (5725.0, 5850.0, "5.8 GHz Wi-Fi / ISM (drones, FPV video)", "wifi"),
+    (5925.0, 7125.0, "Wi-Fi 6E", "wifi"),
+)
+
+# --- channel selection (tinysa/listen_monitor.py's behaviour) -------------------
+FM_LO_HZ, FM_HI_HZ = 87.5e6, 108.0e6
+# An FM station shows up in a 10 kHz scan as 2-4 lumps spread over its
+# +-100 kHz; they move every sweep and would each become a channel.
+FM_CLUSTER_KHZ = 100.0
+MERGE_KHZ = 25.0          # listen_monitor --merge-khz
+MEMORY_KHZ = 75.0         # rotation-memory radius outside the FM band (1.5 x 50 kHz bins)
+# One channel per wide TRANSMITTER: an LTE carrier, a Wi-Fi channel, a UHF TV
+# channel. Their lumps move every scan, and nothing audible hides inside them.
+KIND_CLUSTER_KHZ = {"cellular": 5000.0, "wifi": 11000.0}
+TV_CLUSTER_KHZ = 3000.0   # 'broadcast' above 400 MHz = UHF TV
+CONTINUOUS = 0.95         # occupancy that counts as always on
+WIDE_KHZ = 100.0          # wider than this -> UMIK_SDR_IQ_RATE_WIDE
+WIDTH_DB = 6.0            # a signal's width is measured this far below its peak
+DC_MASK_HZ = 10000.0      # masked either side of every hop centre (at least 1 bin)
+# Local floor = rolling median over ~2 MHz, but never more than 3 dB above the
+# 25th percentile over ~20 MHz. A TV channel or an LTE block wider than ~1 MHz
+# fills a 2 MHz window by itself, and a median would then call the signal the
+# floor; the wide percentile still sees the real floor around it.
+FLOOR_HZ = 2e6
+FLOOR_WIDE_HZ = 20e6
+FLOOR_WIDE_Q = 0.25
+FLOOR_WIDE_SLACK_DB = 3.0
+MEMORY_MAX = 5000         # rotation memory entries kept; the stalest go first
+
+# --- runtime ------------------------------------------------------------------
+TICK = 0.5                # seconds between stop/heartbeat checks while waiting
+POWER_RETRIES = 3         # an rtl_power sweep is tried 1 + this many times
+SDR_FAIL_LIMIT = 5        # consecutive failed captures before systemd gets us
+
+STOP = 0                  # the signal that asked us to stop, once one has
+LOG_FILE = None           # <medium>/logs/umik.log, once the data dir is known
+BOOT_ID = "unknown"
+
+
+class Exit(Exception):
+    """Leave with this status after logging these lines. Hints go to the
+    journal only, like umik-record's."""
+
+    def __init__(self, code, lines=(), hints=()):
+        Exception.__init__(self, code)
+        self.code = code
+        self.lines = [lines] if isinstance(lines, str) else list(lines)
+        self.hints = list(hints)
+
+
+class Stopped(Exception):
+    """SIGTERM or SIGINT: unwind, discard the .part, close the session."""
+
+
+class ConfigError(Exception):
+    pass
+
+
+# --- small helpers ----------------------------------------------------------------
+
+def mono():
+    """Seconds since boot as /proc/uptime counts them (CLOCK_BOOTTIME; plain
+    time.monotonic() on the Mac). Clip spacing stays exact even while the wall
+    clock is untrusted."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return time.monotonic()
+
+
+def utc_stamp(t=None):
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(t))
+
+
+def log(msg):
+    sys.stderr.write("umik-sdr: %s\n" % msg)
+    sys.stderr.flush()
+
+
+def applog(msg):
+    """The journal, plus a plain-text line in <medium>/logs/umik.log in
+    umik-record's format: journald is RAM-only on this box, and the file on
+    the medium is the record that travels with the recordings."""
+    log(msg)
+    if not LOG_FILE:
+        return
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        try:
+            if os.path.getsize(LOG_FILE) > 5242880:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+        except OSError:
+            pass
+        with open(LOG_FILE, "a") as fh:
+            fh.write("%s boot=%s up=%3ss umik-sdr: %s\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), BOOT_ID,
+                int(mono()), msg))
+    except OSError:
+        pass        # a log we cannot write must never stop the recording
+
+
+def fmt_num(x):
+    """25.4 stays 25.4, 50.0 becomes 50: session.json reads like the contract."""
+    if isinstance(x, float) and x.is_integer():
+        return int(x)
+    return x
+
+
+def last_line(text, width=160):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return lines[-1][:width] if lines else "no output"
+
+
+def fsync_path(path):
+    """fsync a file or a directory by name. Best effort: some filesystems
+    refuse it on directories, and that must not cost a clip."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_json(path, obj):
+    """Write-then-rename, fsynced: a power cut leaves the old file or the new
+    one, never half of one."""
+    tmp = path + ".part"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    fsync_path(os.path.dirname(path))
+
+
+def append_jsonl(path, obj):
+    with open(path, "a") as fh:
+        fh.write(json.dumps(obj) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def free_mb(path):
+    """Available MB as `df -Pm` reports them (MiB), like umik-record."""
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize // 1048576
+
+
+def on_signal(signum, frame):
+    # Only a flag: everything that waits polls it every TICK, and stopping the
+    # rtl_* child from inside a signal handler would race Popen's own
+    # bookkeeping.
+    global STOP
+    if not STOP:
+        STOP = signum
+
+
+# --- configuration ------------------------------------------------------------------
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="umik-sdr",
+        description="RTL-SDR scan-and-capture recorder for pi-airgap-recorder. "
+                    "Scans with rtl_power, captures raw IQ (cu8) with rtl_sdr, forever. "
+                    "Every tunable is an environment variable (for systemd) and a flag "
+                    "(for a terminal); a flag beats the variable.",
+        epilog="On a Mac: umik-sdr --data-dir /tmp/sdr --unit dev --trust-clock --passes 1 "
+               "[--fake]. Exit status: 0 stopped, 1 fatal, 78 storage full, "
+               "79 no dongle but a microphone (umik-record's box).")
+    for flag, env, default in TUNABLES:
+        kw = {"dest": flag.replace("-", "_"), "default": None,
+              "help": "%s%s (default: %s)" % (HELP_NOTES[flag] + "; " if flag in HELP_NOTES else "",
+                                             env, default if default else "auto")}
+        if flag in LIST_FLAGS:
+            kw["nargs"] = "*"
+            kw["metavar"] = "ITEM"
+        ap.add_argument("--" + flag, **kw)
+    ap.add_argument("--unit", help="unit name (default: /boot/firmware/umik-unit, else pi-<cpu serial>)")
+    ap.add_argument("--passes", type=int, default=0, help="stop after N passes (default: forever)")
+    ap.add_argument("--trust-clock", action="store_true",
+                    help="mark the host clock trusted (time_source \"host\"), for a Mac on NTP")
+    ap.add_argument("--rtl-dir", help="directory holding rtl_power, rtl_sdr, rtl_test (default: PATH)")
+    ap.add_argument("--fake", action="store_true",
+                    help="no hardware: synthetic scans and clips through the real file layout")
+    return ap
+
+
+def raw_settings(args, environ):
+    """flag > environment > default, as strings, with where each came from
+    (so an error can name the knob that is wrong)."""
+    out = {}
+    for flag, env, default in TUNABLES:
+        v = getattr(args, flag.replace("-", "_"))
+        if v is not None:
+            out[flag] = (" ".join(v) if isinstance(v, list) else v, "--" + flag)
+        elif env in environ and (environ[env].strip() or env in EMPTY_MEANS_OFF):
+            out[flag] = (environ[env], env)
+        else:
+            out[flag] = (default, env)
+    return out
+
+
+SCAN_RE = re.compile(r"^(?:([A-Za-z0-9]+)=)?(\d+(?:\.\d*)?)-(\d+(?:\.\d*)?):(\d+(?:\.\d*)?)$")
+
+
+def parse_scan(spec):
+    """'87.5-1750:50' (MHz-MHz:kHz), optionally named: 'ism=433-435:5'."""
+    m = SCAN_RE.match(spec.strip())
+    if not m:
+        raise ValueError("want START-STOP:BIN as MHz-MHz:kHz, e.g. 87.5-108:10")
+    name, a, b, c = m.group(1), float(m.group(2)), float(m.group(3)), float(m.group(4))
+    if b - a < 0.2:
+        raise ValueError("stop must be at least 0.2 MHz above start")
+    # rtl_power turns bins of 1 MHz or more into one RMS number per hop, with
+    # no centre bin to mask and nothing to cluster.
+    if not 0 < c < 1000:
+        raise ValueError("bin must be above 0 and below 1000 kHz")
+    return {"name": name.lower() if name else None, "start_mhz": a, "stop_mhz": b, "bin_khz": c}
+
+
+def auto_scan_name(sc):
+    if sc["start_mhz"] >= 87.0 and sc["stop_mhz"] <= 109.0:
+        return "fm"
+    mid = (sc["start_mhz"] + sc["stop_mhz"]) / 2
+    for top, name in ((30, "hf"), (300, "vhf"), (1000, "uhf")):
+        if mid < top:
+            return name
+    return "lband"
+
+
+def make_config(raw, args):
+    """Typed, validated settings. Anything wrong is a ConfigError naming the
+    variable or flag, because 'invalid literal for float()' an hour into a
+    deployment explains nothing."""
+    c = argparse.Namespace()
+
+    def val(flag):
+        return raw[flag][0].strip()
+
+    def bad(flag, why):
+        return ConfigError("%s=%r: %s" % (raw[flag][1], raw[flag][0], why))
+
+    def number(flag, kind=float, lo=None, hi=None):
+        try:
+            v = kind(val(flag))
+        except ValueError:
+            raise bad(flag, "not a %s" % ("number" if kind is float else "whole number"))
+        if (kind is float and not math.isfinite(v)) or \
+                (lo is not None and v < lo) or (hi is not None and v > hi):
+            raise bad(flag, "out of range (%s to %s)" % (lo, hi))
+        return v
+
+    c.data_dir = val("data-dir")
+    c.gain = "auto" if val("gain").lower() == "auto" else number("gain", float, 0.0, 60.0)
+    c.ppm = number("ppm", int, -500, 500)            # rtl_* take whole ppm only (atoi)
+    c.sweeps = number("sweeps", int, 1, 50)
+    c.thr = number("thr", float, 1.0, 100.0)
+    c.thr_burst = number("thr-burst", float, 1.0, 100.0)
+    c.dwell = number("dwell", float, 0.1, 3600.0)
+    c.jitter = number("jitter", float, 0.0, 0.95)
+    c.gap_max = number("gap-max", float, 0.0, 86400.0)
+    c.pass_pause_max = number("pass-pause-max", float, 0.0, 86400.0)
+    c.remember_passes = number("remember-passes", int, 1, 100000)
+    c.remember_once = number("remember-once", int, 1, 100000)
+    c.max_channels = number("max-channels", int, 0, 100000)
+    c.crop = number("crop", float, 0.0, 50.0)        # percent, as rtl_power -c
+    c.min_free_mb = number("min-free-mb", int, 0, 10 ** 9)
+    c.wait_seconds = number("wait-seconds", float, 0.0, 86400.0)
+    c.log_interval = number("log-interval", float, 1.0, 86400.0)
+    for flag in ("iq-rate", "iq-rate-wide"):
+        r = number(flag, int, 1, 10 ** 8)
+        if not any(lo <= r <= hi for lo, hi in RATE_OK):
+            raise bad(flag, "the RTL2832U only samples at 225001-300000 or 900001-3200000 S/s")
+        setattr(c, flag.replace("-", "_"), r)
+
+    scans = []
+    try:
+        sc = parse_scan(val("scan"))
+    except ValueError as e:
+        raise bad("scan", str(e))
+    sc["name"] = "main"
+    scans.append(sc)
+    for tok in val("fine").replace(",", " ").split():
+        try:
+            sc = parse_scan(tok)
+        except ValueError as e:
+            raise bad("fine", "%s: %s" % (tok, e))
+        name = base = sc["name"] or auto_scan_name(sc)
+        k = 2
+        while name in [s["name"] for s in scans]:
+            name, k = "%s%d" % (base, k), k + 1
+        sc["name"] = name
+        scans.append(sc)
+    for sc in scans:
+        sc["sweeps"] = c.sweeps
+    c.scans = scans
+
+    c.exclude = []
+    for tok in val("exclude").replace(",", " ").split():
+        m = re.match(r"^(\d+(?:\.\d*)?)-(\d+(?:\.\d*)?)$", tok)
+        if not m or float(m.group(1)) >= float(m.group(2)):
+            raise bad("exclude", "%r is not a LO-HI range in MHz" % tok)
+        c.exclude.append((float(m.group(1)), float(m.group(2))))
+
+    vids = val("mic-vid").replace(",", " ").lower().split()
+    for v in vids:
+        if v != "any" and not re.match(r"^[0-9a-f]{4}$", v):
+            raise bad("mic-vid", "%r is not a 4-digit hex USB vendor ID or 'any'" % v)
+    c.mic_vid = vids
+
+    if args.passes < 0:
+        raise ConfigError("--passes must be 0 (forever) or more")
+    c.passes = args.passes
+    return c
+
+
+# --- the dongle -----------------------------------------------------------------------
+
+def usb_str(path):
+    try:
+        with open(path, "rb") as fh:
+            s = fh.read().decode("latin-1")
+    except OSError:
+        s = ""
+    s = "".join(ch for ch in s if ch in USB_STR_OK)[:64]
+    return s or "unknown"
+
+
+def sysfs_usb():
+    """(sysfs dir, vvvv, pppp) for every USB device on the bus."""
+    out = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*/")):
+        try:
+            with open(d + "idVendor") as fh:
+                v = fh.read().strip().lower()
+            with open(d + "idProduct") as fh:
+                p = fh.read().strip().lower()
+        except OSError:
+            continue
+        out.append((d, v, p))
+    return out
+
+
+def find_dongle_sysfs():
+    hits = [(d, v, p) for d, v, p in sysfs_usb() if "%s:%s" % (v, p) in RTL_IDS]
+    if not hits:
+        return None
+    d, v, p = hits[0]
+    drivers = sorted({os.path.basename(os.path.realpath(x)) for x in glob.glob(d + "*:*/driver")})
+    return {"usb_id": "%s:%s" % (v, p), "vendor_id": v, "product_id": p, "sdr": "RTL2832U",
+            "product": usb_str(d + "product"), "manufacturer": usb_str(d + "manufacturer"),
+            "serial": usb_str(d + "serial"), "_count": len(hits), "_drivers": drivers}
+
+
+def rtl_test_probe(rtl_test):
+    """Open the dongle once with `rtl_test -t`. On an R820T it prints the
+    device and tuner and exits at once ("No E4000 tuner found, aborting").
+    Returns (opened, info, output)."""
+    try:
+        r = subprocess.run([rtl_test, "-t"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=20)
+        text, rc = r.stdout.decode("utf-8", "replace"), r.returncode
+    except subprocess.TimeoutExpired as e:
+        text, rc = (e.output or b"").decode("utf-8", "replace"), -1
+    except OSError as e:
+        return False, {}, str(e)
+    info = {}
+    m = re.search(r"^\s*0:\s+(.*?), (.*?), SN: (.*?)\s*$", text, re.M)
+    if m:
+        for key, s in zip(("manufacturer", "product", "serial"), m.groups()):
+            info[key] = "".join(ch for ch in s if ch in USB_STR_OK)[:64] or "unknown"
+    m = re.search(r"Found (.+?) tuner", text)
+    if m:
+        info["tuner"] = "".join(ch for ch in m.group(1) if ch in USB_STR_OK)[:64]
+    # librtlsdr names devices from its own VID:PID table, which is the only
+    # way to learn the USB ID on a Mac without poking IOKit.
+    m = re.search(r"Using device 0: (.+)", text)
+    if m:
+        info["usb_id"] = {"Generic RTL2832U OEM": "0bda:2838",
+                          "Generic RTL2832U": "0bda:2832"}.get(m.group(1).strip(), "unknown")
+    return (rc == 0 or "tuner" in info), info, text
+
+
+def rtl_hint(text):
+    """The librtlsdr messages that name a field fault, translated."""
+    if "Kernel driver is active" in text:
+        return (" - the kernel DVB driver holds the dongle: is /etc/modprobe.d/umik-sdr.conf "
+                "in place? (it takes effect at the next boot)")
+    if "usb_claim_interface error" in text:
+        return (" - something else has the dongle open (a leftover rtl_* process, a second "
+                "umik-sdr, rtl_test from umik-diag?)")
+    if "usb_open error" in text or "device permissions" in text:
+        return (" - permission denied: the recorder user needs the plugdev group and "
+                "librtlsdr0's udev rule (60-librtlsdr0.rules)")
+    if "No supported devices found" in text or "No matching devices" in text:
+        return " - the dongle has gone from the bus (unplugged? a brown-out on a long cable?)"
+    if "PLL not locked" in text:
+        return " - the tuner would not lock (frequency outside the R820T2's ~24-1766 MHz?)"
+    return ""
+
+
+def find_tool(name, rtl_dir):
+    if rtl_dir:
+        p = os.path.join(rtl_dir, name)
+        return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
+    p = shutil.which(name)
+    if p:
+        return p
+    for d in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"):
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def rtl_version(tool):
+    """Upstream rtl-sdr version: dpkg on the Pi ("2.0.2-2+b1" -> "2.0.2"), the
+    Cellar path under Homebrew, else unknown."""
+    try:
+        r = subprocess.run(["dpkg-query", "-W", "-f=${Version}", "rtl-sdr"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        v = r.stdout.decode("ascii", "replace").strip()
+        if r.returncode == 0 and v:
+            v = v.split(":", 1)[-1]
+            return v.rsplit("-", 1)[0] if "-" in v else v
+    except (OSError, subprocess.SubprocessError):
+        pass
+    m = re.search(r"/Cellar/[^/]+/([^/]+)/", os.path.realpath(tool or ""))
+    return m.group(1) if m else "unknown"
+
+
+def mic_present(vids):
+    """(usbid, card) of a sound card umik-record would take, else None."""
+    for u in sorted(glob.glob("/proc/asound/card*/usbid")):
+        try:
+            with open(u) as fh:
+                usbid = fh.read().strip().lower()
+        except OSError:
+            continue
+        if "any" in vids or usbid.split(":")[0] in vids:
+            return usbid, u.split("/")[3][len("card"):]
+    return None
+
+
+def locate_dongle(cfg, rtl_dir):
+    """Wait up to UMIK_SDR_WAIT_SECONDS for the dongle: udev may not have
+    settled when we start. Linux walks sysfs (no tool needed, so a mic-only
+    box without the rtl-sdr packages still bows out with 79); a Mac has no
+    sysfs and asks rtl_test."""
+    linux = sys.platform.startswith("linux")
+    rtl_test = None if linux else find_tool("rtl_test", rtl_dir)
+    if not linux and not rtl_test:
+        raise Exit(1, "FATAL: rtl_test not found (looked in %s) - brew install librtlsdr, or --rtl-dir"
+                   % (rtl_dir or "PATH"))
+    t_end = time.monotonic() + cfg.wait_seconds
+    while True:
+        if STOP:
+            raise Stopped()
+        if linux:
+            dev = find_dongle_sysfs()
+            if dev:
+                return dev
+        else:
+            ok, info, _ = rtl_test_probe(rtl_test)
+            if ok:
+                uid = info.get("usb_id", "unknown")
+                dev = {"usb_id": uid, "vendor_id": uid.split(":")[0] if ":" in uid else "unknown",
+                       "product_id": uid.split(":")[1] if ":" in uid else "unknown", "sdr": "RTL2832U",
+                       "product": info.get("product", "unknown"),
+                       "manufacturer": info.get("manufacturer", "unknown"),
+                       "serial": info.get("serial", "unknown"), "_count": 1, "_drivers": []}
+                if info.get("tuner"):
+                    dev["tuner"] = info["tuner"]
+                return dev
+        if time.monotonic() >= t_end:
+            break
+        time.sleep(1)
+    mic = mic_present(cfg.mic_vid)
+    if mic:
+        # Not a fault: this box records audio. One line, then 79, which the
+        # unit counts as success and never restarts.
+        raise Exit(79, "no RTL-SDR, but a microphone (%s, ALSA card %s) is attached - umik-record "
+                       "records on this box; SDR recorder idle" % mic)
+    lines = ["FATAL: no RTL-SDR (USB 0bda:2838 or 0bda:2832) after %ds - is the dongle in one of "
+             "the Pi's USB-A ports?" % cfg.wait_seconds]
+    for d, v, p in sysfs_usb():
+        if v != "1d6b":                       # root hubs
+            lines.append('  saw USB device: %s:%s ("%s")' % (v, p, usb_str(d + "product")))
+    raise Exit(1, lines)
+
+
+# --- storage, unit, clock (umik-record's logic, line for line) ---------------------------
+
+def resolve_storage(data_dir):
+    """A USB stick mounted at /data/usb wins, then the SD card's /data;
+    UMIK_DATA_DIR overrides both."""
+    if data_dir:
+        return data_dir, "custom"
+    if os.path.ismount("/data/usb"):
+        return "/data/usb/recordings", "usb"
+    return "/data/recordings", "sd"
+
+
+def unit_name(cli_unit):
+    """/boot/firmware/umik-unit filtered exactly as umik-record filters it
+    (`tr -cd 'a-z0-9-' | cut -c1-16`), so both recorders on one box always
+    agree on its name; else pi-<last 4 of the CPU serial>."""
+    if cli_unit is not None:
+        raw = cli_unit.lower()
+    else:
+        try:
+            with open("/boot/firmware/umik-unit", "rb") as fh:
+                raw = fh.read().decode("latin-1")
+        except OSError:
+            raw = ""
+    unit = "".join(ch for ch in raw if ch in "abcdefghijklmnopqrstuvwxyz0123456789-")[:16]
+    if unit:
+        return unit
+    serial = ""
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("Serial"):
+                    parts = line.split()
+                    serial = parts[2] if len(parts) >= 3 else ""
+    except OSError:
+        pass
+    return "pi-" + serial[-4:] if serial else "pi-unknown"
+
+
+def read_state(path):
+    """(raw text, parsed object) of a /run/umik-*.json file. The trust test
+    below runs on the raw text exactly as umik-record's `case` does; the
+    parsed object is what session.json embeds (the raw text if it is not
+    valid JSON, so nothing is lost)."""
+    try:
+        with open(path) as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return "", None
+    if not raw:
+        return "", None
+    try:
+        return raw, json.loads(raw)
+    except ValueError:
+        return raw, raw[:4096]
+
+
+def clock_ladder(trust_host):
+    """GPS-anchored or nothing, as in umik-record: gps synced -> gps (or
+    gps-time-only without a fix); wired NTP -> ntp; a disciplined RTC -> rtc;
+    a Mac time-seed -> seeded, still untrusted. --trust-clock (a Mac on NTP)
+    -> host."""
+    gps_raw, gps = read_state("/run/umik-gps.json")
+    net_raw, net = read_state("/run/umik-net.json")
+    rtc_raw, rtc = read_state("/run/umik-rtc.json")
+    seed_raw, seed = read_state("/run/umik-time-seed.json")
+    trusted, source = False, "none"
+    if '"synced": true' in gps_raw:
+        trusted = True
+        source = "gps" if '"fix": true' in gps_raw else "gps-time-only"
+    if not trusted and '"synced": true' in net_raw:
+        trusted, source = True, "ntp"
+    if not trusted and '"trusted": true' in rtc_raw:
+        trusted, source = True, "rtc"
+    if source == "none" and '"applied": true' in seed_raw:
+        source = "seeded"
+    if trust_host and not trusted:
+        trusted, source = True, "host"
+    return trusted, source, {"gps": gps, "net": net, "rtc": rtc, "time_seed": seed}
+
+
+def remove_stale_parts(data_dir):
+    """Pulling the power is how this box normally stops, so nearly every
+    earlier session ends with a clip-*.cu8.part. Nothing downstream seals or
+    prunes them (ingest skips *.part); the recorder owns its scratch, so it
+    clears it before the next session starts. SDR sessions only - the mic's
+    directories are not ours to touch."""
+    n = 0
+    for path in glob.glob(os.path.join(glob.escape(data_dir), "*-sdr_*", "*.part")):
+        try:
+            os.remove(path)
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def next_session(data_dir):
+    """The persistent session counter, separate from the mic's. Write-then-
+    rename: a power cut mid-write must not zero it."""
+    path = os.path.join(data_dir, ".sdr-session-counter")
+    try:
+        with open(path) as fh:
+            s = fh.read().strip()
+    except OSError:
+        s = ""
+    seq = int(s) if re.match(r"^[0-9]+$", s) else 0
+    seq += 1
+    with open(path + ".tmp", "w") as fh:
+        fh.write("%d\n" % seq)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(path + ".tmp", path)
+    os.sync()
+    return seq
+
+
+# --- rtl_power: plan, parse, detect ----------------------------------------------------
+
+def power_plan(lower, upper, max_size, crop=0.0):
+    """rtl_power's frequency_range(), integer for integer: hop count and
+    width, FFT length, bin step, and how many bins each CSV row prints. It
+    picks the fewest hops of at most 2.8 MHz, then the smallest power of two
+    of FFT bins that gets under the asked bin size - so "50k" really means
+    43.7 kHz on the main scan and "10k" means 5 kHz on the fine ones."""
+    span = upper - lower
+    tune_count = bw_seen = bw_used = 0
+    for i in range(1, 1500):
+        bw_seen = span // i
+        bw_used = int(bw_seen / (1.0 - crop))
+        if bw_used > POWER_MAX_RATE:
+            continue
+        tune_count = i
+        break
+    if tune_count == 0 or bw_seen <= 0:
+        raise ValueError("rtl_power cannot plan %d-%d Hz" % (lower, upper))
+    downsample = 1
+    if bw_used < POWER_MIN_RATE:
+        tune_count = 1
+        downsample = POWER_MAX_RATE // bw_used
+        bw_used *= downsample
+    bin_e = 1
+    for bin_e in range(1, 22):
+        if bw_used / ((1 << bin_e) * downsample) <= max_size:
+            break
+    length = 1 << bin_e
+    i1 = int(length * crop * 0.5)
+    bin_count = int(length * (1.0 - crop))
+    return {"hops": tune_count, "bw": bw_seen, "rate": bw_used, "length": length,
+            "bins": length - 2 * i1, "step": bw_used / (length * downsample),
+            "bw2": int(bw_used * bin_count / (length * 2 * downsample)),
+            "centres": [lower + i * bw_seen + bw_seen // 2 for i in range(tune_count)]}
+
+
+def scan_grid(plan):
+    """The scan's common frequency grid: the unshifted sweep's bins."""
+    n, step = plan["bins"], plan["step"]
+    f0 = plan["centres"][0] - (n // 2) * step
+    f_last = plan["centres"][-1] + (n - 1 - n // 2) * step
+    return {"f0": f0, "step": step, "n": int(round((f_last - f0) / step)) + 1}
+
+
+def prepare_scan(sc, crop_pct):
+    sc["bin_hz"] = int(round(sc["bin_khz"] * 1000))
+    sc["crop"] = crop_pct / 100.0
+    sc["plan"] = power_plan(int(round(sc["start_mhz"] * 1e6)), int(round(sc["stop_mhz"] * 1e6)),
+                            sc["bin_hz"], sc["crop"])
+    sc["grid"] = scan_grid(sc["plan"])
+    return sc
+
+
+def sweep_shifted(pass_no, sweep):
+    """Odd passes go plain, shifted, plain...; even passes start shifted. With
+    UMIK_SDR_SWEEPS=1 the shift then alternates pass by pass instead."""
+    return (sweep % 2 == 1) != (pass_no % 2 == 0)
+
+
+def sweep_range(sc, shifted):
+    """The -f range for one sweep, in Hz. Shifted: a quarter hop lower and
+    one hop more, so the hop width stays the same (the bins stay on the
+    grid), the plain sweep's hop centres and hop edges both land a quarter
+    hop inside a shifted hop, and the whole range is still covered."""
+    lo, hi = int(round(sc["start_mhz"] * 1e6)), int(round(sc["stop_mhz"] * 1e6))
+    if not shifted:
+        return lo, hi
+    bw = sc["plan"]["bw"]
+    lo -= bw // 4
+    return lo, lo + (sc["plan"]["hops"] + 1) * bw
+
+
+def parse_power_csv(text):
+    """rtl_power CSV -> [(hz_low, hz_high, step, samples, [dB or None])].
+    One row per hop: date, time, Hz low, Hz high, Hz step, samples, then the
+    bins. csv_dbm() prints the last bin twice (it writes avg[i2] again to end
+    the line), so an odd bin count loses its last value. -inf/nan (an
+    all-zero FFT bin) become None."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split(",")
+        if len(parts) < 8:
+            continue
+        try:
+            lo, hi = int(parts[2]), int(parts[3])
+            step, samples = float(parts[4]), int(parts[5])
+        except ValueError:
+            continue
+        vals = []
+        for s in parts[6:]:
+            try:
+                v = float(s)
+            except ValueError:
+                v = None
+            vals.append(v if v is not None and math.isfinite(v) else None)
+        if len(vals) % 2:
+            vals.pop()
+        if step > 0 and hi > lo and vals:
+            rows.append((lo, hi, step, samples, vals))
+    return rows
+
+
+def hop_profile(rows, min_rows=8):
+    """The roll-off shape shared by every hop of one sweep, as a correction
+    per bin position: for each position, the 25th percentile over all hops of
+    its level relative to its own hop's median, made relative to the typical
+    position and used only where negative (a roll-off is a loss, never a
+    gain). A quantile rather than the median, so a few hops with a signal at
+    the same position cannot pass for the shape. Signal and noise roll off
+    together, so adding the loss back restores a carrier's true SNR. Too few
+    hops (a short fine scan) to measure it: no correction."""
+    if len(rows) < min_rows:
+        return None
+    n = len(rows[0][4])
+    if any(len(r[4]) != n for r in rows):
+        return None
+    cols = [[] for _ in range(n)]
+    for r in rows:
+        vals = [v for v in r[4] if v is not None]
+        if not vals:
+            continue
+        med = statistics.median(vals)
+        for j, v in enumerate(r[4]):
+            if v is not None:
+                cols[j].append(v - med)
+    q = [sorted(c)[int(round(0.25 * (len(c) - 1)))] if c else 0.0 for c in cols]
+    # With few hops each position's estimate is noisy; the real shape is a
+    # filter response, smooth across positions, so smooth the estimate. And
+    # leave sub-0.5 dB wiggles alone: that is estimation noise, not roll-off.
+    half = 0 if len(rows) >= 64 else n // 64
+    if half:
+        q = [statistics.median(q[max(0, j - half):j + half + 1]) for j in range(n)]
+    ref = statistics.median(q)
+    return [max(-20.0, x - ref) if x - ref < -0.5 else 0.0 for x in q]
+
+
+def rows_to_grid(rows, grid, mask_hz=DC_MASK_HZ, flatten=True):
+    """Lay one sweep's rows onto the scan grid (nearest bin), roll-off taken
+    out, with the bins around each hop's centre masked: rtl_power overwrites
+    the exact centre bin with its neighbour, which hides the DC spike but not
+    its skirts. The first bin of every row is masked too: uncropped it is the
+    FFT's Nyquist bin, where both edges of the hop fold together, cropped it
+    is an edge bin, and either way the shifted sweeps cover it. With
+    mask_hz=0 nothing is masked (the self-test's control). Where hops overlap
+    (with crop) the higher value wins."""
+    f0, gstep, n = grid["f0"], grid["step"], grid["n"]
+    prof = hop_profile(rows) if flatten else None
+    out = [None] * n
+    for lo, hi, step, _samples, vals in rows:
+        half = len(vals) // 2               # the centre (DC) bin, crop or not
+        centre = (lo + hi) / 2.0
+        mask = max(1, int(math.ceil(mask_hz / step))) if mask_hz > 0 else -1
+        for j, v in enumerate(vals):
+            if v is None or abs(j - half) <= mask or (j == 0 and mask_hz > 0):
+                continue
+            if prof is not None and len(prof) == len(vals):
+                v -= prof[j]
+            k = int(round((centre + (j - half) * step - f0) / gstep))
+            if 0 <= k < n and (out[k] is None or v > out[k]):
+                out[k] = v
+    return out
+
+
+def rolling_quantile(vals, half, q):
+    """q-quantile of the valid values within +-half bins of each bin (None
+    where the window holds none). A sorted sliding window: each step is one
+    insort and one delete, both memmoves - quick enough for ~40k bins on a Pi."""
+    n = len(vals)
+    win, out = [], [None] * n
+    for j in range(min(half, n - 1) + 1):
+        if vals[j] is not None:
+            bisect.insort(win, vals[j])
+    for k in range(n):
+        if k:
+            j = k + half
+            if j < n and vals[j] is not None:
+                bisect.insort(win, vals[j])
+            j = k - half - 1
+            if j >= 0 and vals[j] is not None:
+                del win[bisect.bisect_left(win, vals[j])]
+        m = len(win)
+        if m:
+            if q == 0.5:
+                out[k] = (win[(m - 1) // 2] + win[m // 2]) / 2.0
+            else:
+                out[k] = win[int(round(q * (m - 1)))]
+    return out
+
+
+def local_floor(vals, step):
+    """Per-bin noise floor of one sweep (see FLOOR_* above). Bins with no
+    data anywhere near them inherit the nearest floor."""
+    half = max(2, int(FLOOR_HZ / step / 2))
+    med = rolling_quantile(vals, half, 0.5)
+    low = rolling_quantile(vals, max(half, int(FLOOR_WIDE_HZ / step / 2)), FLOOR_WIDE_Q)
+    out = [None] * len(vals)
+    for k, (m, w) in enumerate(zip(med, low)):
+        if m is not None:
+            out[k] = m if w is None else min(m, w + FLOOR_WIDE_SLACK_DB)
+        elif w is not None:
+            out[k] = w + FLOOR_WIDE_SLACK_DB
+    for order in (range(len(out)), range(len(out) - 1, -1, -1)):
+        last = None
+        for k in order:
+            if out[k] is None:
+                out[k] = last
+            else:
+                last = out[k]
+    return out
+
+
+def band_of(f_hz):
+    mhz = f_hz / 1e6
+    for lo, hi, name, kind in US_BANDS:
+        if lo <= mhz <= hi:
+            return name, kind
+    return "unallocated / no common service here", "unknown"
+
+
+def detect(scan, grid, sweeps, thr):
+    """One scan's sweeps (grid-aligned lists) -> (signals, per-sweep floors).
+    A signal is a run of contiguous bins whose best SNR over the sweeps is
+    >= thr. Its peak is the run's strongest bin on the max-hold trace (as in
+    listen_monitor: a TV channel peaks at its pilot, a flat LTE block
+    anywhere inside it); its width is measured -6 dB down on that trace; its
+    occupancy is the fraction of sweeps (that saw it at all) in which the
+    peak bin, or one beside it, was >= thr. One bin of slack, because a cheap
+    free-running transmitter drifts a 5 kHz bin between sweeps and must not
+    read as intermittent for it. A sweep counts only if it measured the peak
+    bin itself: where that bin was masked (a hop centre) the neighbours have
+    data but not the carrier."""
+    n, step, f0 = grid["n"], grid["step"], grid["f0"]
+    floors = [local_floor(v, step) for v in sweeps]
+    snrs = [[None if a is None or b is None else a - b for a, b in zip(v, fl)]
+            for v, fl in zip(sweeps, floors)]
+    best, best_s, mx = [None] * n, [0] * n, [None] * n
+    for s, (v, sn) in enumerate(zip(sweeps, snrs)):
+        for k in range(n):
+            x = sn[k]
+            if x is not None and (best[k] is None or x > best[k]):
+                best[k], best_s[k] = x, s
+            a = v[k]
+            if a is not None and (mx[k] is None or a > mx[k]):
+                mx[k] = a
+    # bins masked in every sweep (only with one sweep) take their neighbours'
+    # level, so a -6 dB walk crosses them instead of stopping dead
+    for order in (range(n), range(n - 1, -1, -1)):
+        last = None
+        for k in order:
+            if mx[k] is None:
+                mx[k] = last
+            else:
+                last = mx[k]
+    sigs = []
+    k = 0
+    while k < n:
+        if best[k] is None or best[k] < thr:
+            k += 1
+            continue
+        a = k
+        # A bin no sweep measured (masked in every one, which only happens
+        # with one sweep a pass) neither ends a run nor starts one: no data
+        # is not a gap, and an LTE block must not split at every hop centre.
+        while k < n and (best[k] is None or best[k] >= thr):
+            k += 1
+        kp = max((j for j in range(a, k) if best[j] is not None), key=mx.__getitem__)
+        s = best_s[kp]
+        peak, floor = sweeps[s][kp], floors[s][kp]
+        level = mx[kp] - WIDTH_DB
+        lo = kp
+        while lo > 0 and mx[lo - 1] is not None and mx[lo - 1] >= level:
+            lo -= 1
+        hi = kp
+        while hi < n - 1 and mx[hi + 1] is not None and mx[hi + 1] >= level:
+            hi += 1
+        valid = above = 0
+        for sn in snrs:
+            if sn[kp] is None:
+                continue
+            valid += 1
+            if max(sn[j] for j in (kp - 1, kp, kp + 1) if 0 <= j < n and sn[j] is not None) >= thr:
+                above += 1
+        f = f0 + kp * step
+        band, kind = band_of(f)
+        sigs.append({"freq_hz": int(round(f)), "peak_db": round(peak, 1),
+                     "floor_db": round(floor, 1), "snr_db": round(peak - floor, 1),
+                     "width_khz": round((hi - lo + 1) * step / 1e3, 1),
+                     "occupancy": round(above / float(valid), 3) if valid else 0.0,
+                     "kind": kind, "band": band, "scan": scan})
+    return sigs, floors
+
+
+# --- channel selection ----------------------------------------------------------------
+
+def in_fm(f_hz):
+    return FM_LO_HZ <= f_hz <= FM_HI_HZ
+
+
+def kind_radius_khz(x):
+    if x["kind"] == "broadcast" and x["freq_hz"] > 400e6:
+        return TV_CLUSTER_KHZ
+    return KIND_CLUSTER_KHZ.get(x["kind"], 0.0)
+
+
+def cluster_band(sigs, lo_hz, hi_hz, radius_khz):
+    """Inside [lo, hi] keep only the strongest detection per radius: one FM
+    station is one channel. A carrier parked >= radius from a station
+    survives as its own channel; anything closer is under the station anyway."""
+    inband = sorted((x for x in sigs if lo_hz <= x["freq_hz"] <= hi_hz), key=lambda x: -x["peak_db"])
+    keep = []
+    for x in inband:
+        if all(abs(x["freq_hz"] - k["freq_hz"]) / 1e3 > radius_khz for k in keep):
+            keep.append(x)
+    return [x for x in sigs if not lo_hz <= x["freq_hz"] <= hi_hz] + keep
+
+
+def cluster_wide(sigs, merge_khz):
+    """One channel per wide signal: strongest first, a detection inside a
+    stronger one's -6 dB width (+ merge_khz) is absorbed by it, and the
+    survivor's width grows to cover the lump."""
+    keep = []
+    for x in sorted(sigs, key=lambda x: -x["peak_db"]):
+        for k in keep:
+            d = abs(x["freq_hz"] - k["freq_hz"]) / 1e3
+            if d <= max(x["width_khz"], k["width_khz"]) / 2 + merge_khz:
+                k["width_khz"] = round(max(k["width_khz"], x["width_khz"], d * 2), 1)
+                break
+        else:
+            keep.append(dict(x))
+    return sorted(keep, key=lambda x: x["freq_hz"])
+
+
+def cluster_kind(sigs):
+    """Same-kind detections within the kind's radius of a stronger one are
+    absorbed: an LTE carrier, a Wi-Fi channel, a UHF TV channel."""
+    keep = []
+    for x in sorted(sigs, key=lambda x: -x["peak_db"]):
+        r = kind_radius_khz(x)
+        if r and any(k["kind"] == x["kind"] and abs(k["freq_hz"] - x["freq_hz"]) / 1e3 <= r
+                     for k in keep):
+            continue
+        keep.append(x)
+    return sorted(keep, key=lambda x: x["freq_hz"])
+
+
+def dedupe(sigs, merge_khz):
+    """By frequency; entries closer than merge_khz merge, the stronger kept."""
+    kept = []
+    for x in sorted(sigs, key=lambda x: x["freq_hz"]):
+        if kept and abs(x["freq_hz"] - kept[-1]["freq_hz"]) / 1e3 <= merge_khz:
+            if x["peak_db"] > kept[-1]["peak_db"]:
+                kept[-1] = x
+        else:
+            kept.append(x)
+    return kept
+
+
+def excluded(f_hz, ranges):
+    return any(lo * 1e6 <= f_hz <= hi * 1e6 for lo, hi in ranges)
+
+
+def select_signals(sigs, thr_burst, exclude):
+    """All detections of a pass (every scan pooled) -> the channels found.
+    Exclusions go FIRST, unlike listen_monitor: an excluded uplink burst must
+    never absorb a real carrier next to it before being dropped itself."""
+    out = [x for x in sigs if x["occupancy"] >= CONTINUOUS or x["snr_db"] >= thr_burst]
+    out = [x for x in out if not excluded(x["freq_hz"], exclude)]
+    out = cluster_band(out, FM_LO_HZ, FM_HI_HZ, FM_CLUSTER_KHZ)
+    out = cluster_wide(out, MERGE_KHZ)
+    out = cluster_kind(out)
+    return dedupe(out, MERGE_KHZ)
+
+
+class Rotation:
+    """listen_monitor's memory. A channel seen in a scan stays in the listen
+    plan for a while even if it is silent at later scans - a transmitter that
+    keys up now and then is exactly what we are here to catch. Seen in two or
+    more scans: remember_passes passes after it was last seen. Seen once:
+    remember_once, so a marginal one-off cannot hold a slot for 8 passes."""
+
+    def __init__(self, remember_passes, remember_once):
+        self.passes = remember_passes
+        self.once = min(remember_once, remember_passes)
+        self.seen = {}          # key (Hz when first seen) -> {"sig", "last", "n"}
+
+    @staticmethod
+    def radius_khz(x, old):
+        # a wide signal's strongest lump wanders inside its own width between
+        # scans, and a wide transmitter's inside its kind's radius: same key
+        r = FM_CLUSTER_KHZ if in_fm(x["freq_hz"]) else MEMORY_KHZ
+        r = max(r, old["width_khz"] / 2, x["width_khz"] / 2)
+        if old["kind"] == x["kind"]:
+            r = max(r, kind_radius_khz(x))
+        return r
+
+    def update(self, sigs, pass_no):
+        for x in sorted(sigs, key=lambda s: -s["peak_db"]):
+            best = None
+            for key, v in self.seen.items():
+                d = abs(key - x["freq_hz"]) / 1e3
+                if d <= self.radius_khz(x, v["sig"]) and (best is None or d < best[0]):
+                    best = (d, key)
+            if best is not None:
+                v = self.seen[best[1]]
+                if v["last"] != pass_no:
+                    v["sig"], v["last"], v["n"] = dict(x), pass_no, v["n"] + 1
+                    continue
+                # Already claimed this pass by a stronger detection: the same
+                # transmitter seen twice (main + fine scan), or a distinct one
+                # that just shares the neighbourhood and gets its own key.
+                if abs(v["sig"]["freq_hz"] - x["freq_hz"]) / 1e3 <= self.radius_khz(x, v["sig"]):
+                    continue
+            key = x["freq_hz"]
+            while key in self.seen:
+                key += 1
+            self.seen[key] = {"sig": dict(x), "last": pass_no, "n": 1}
+        if len(self.seen) > MEMORY_MAX:
+            for key in sorted(self.seen, key=lambda k: self.seen[k]["last"])[:len(self.seen) - MEMORY_MAX]:
+                del self.seen[key]
+
+    def plan(self, pass_no, cap):
+        out = []
+        for v in self.seen.values():
+            if pass_no - v["last"] < (self.passes if v["n"] >= 2 else self.once):
+                ch = dict(v["sig"])
+                ch.update(seen_scans=v["n"], last_seen_pass=v["last"],
+                          source="scan" if v["last"] == pass_no else "remembered")
+                out.append(ch)
+        out.sort(key=lambda c: -c["snr_db"])
+        return out[:cap]
+
+
+def iq_rate_for(ch, rate, rate_wide):
+    return rate_wide if in_fm(ch["freq_hz"]) or ch["width_khz"] > WIDE_KHZ else rate
+
+
+def capture_samples(dwell_s, rate):
+    """Samples to ask rtl_sdr for. It stops only when the bytes still wanted
+    fall INSIDE a USB block (rtlsdr_callback: bytes_to_read < len). Land
+    exactly on a block boundary and the count hits 0, the "> 0" test fails,
+    and it records until the disk is full. One sample more and it stops."""
+    n = max(1, int(round(dwell_s * rate)))
+    if (2 * n) % RTL_SDR_BLOCK == 0:
+        n += 1
+    return n
+
+
+def clip_name(t, freq_hz):
+    return "clip-%s-%dk.cu8" % (time.strftime("%Y%m%d-%H%M%S", time.gmtime(t)),
+                                int(round(freq_hz / 1000.0)))
+
+
+# --- --fake: no hardware ----------------------------------------------------------------
+# Synthetic rtl_power CSV, laid out by the same hop planner the real tool uses
+# (so hops, bins and the shifted sweeps match a real run), and clips of the
+# right length. Everything downstream - parsing, detection, rotation, files,
+# JSON - is the real code. Deterministic per (pass, scan, sweep).
+
+FAKE_DEVICE = {"usb_id": "0bda:2838", "vendor_id": "0bda", "product_id": "2838",
+               "sdr": "RTL2832U", "product": "RTL2838UHIDIR", "manufacturer": "Realtek",
+               "serial": "FAKE", "tuner": "fake", "_count": 1, "_drivers": []}
+
+# (MHz, width kHz, dB above the floor, sweeps it is on in (None = all),
+#  passes it is on in (None = all))
+# FM stations: the carrier plus a modulation lump either side, as a 10 kHz
+# scan catches them - one channel each after clustering.
+FAKE_FM = tuple((f + d, 30.0, db, None, None)
+                for f in (88.5, 94.7, 99.5, 101.1, 104.1, 106.7)
+                for d, db in ((-0.06, 26.0), (0.0, 38.0), (0.07, 29.0)))
+FAKE_EMITTERS = FAKE_FM + (
+    (100.35, 3.0, 18.0, None, None),        # a lone narrow carrier between stations
+    (146.52, 3.0, 30.0, None, None),        # 2 m simplex
+    (162.55, 12.0, 25.0, None, None),       # NOAA weather
+    (315.0, 3.0, 13.0, (1,), None),         # weak and bursty: dropped
+    (433.92, 3.0, 22.0, (0,), None),        # a strong burst: kept on SNR alone
+    (462.5625, 3.0, 16.0, None, None),      # FRS, always on
+    (506.0, 6000.0, 22.0, None, None),      # UHF TV channel 19 ...
+    (503.31, 3.0, 30.0, None, None),        # ... and its ATSC pilot
+    (710.0, 1000.0, 25.0, None, None),      # a band 12/17 LTE uplink: excluded, never listened to
+    (744.0, 10000.0, 20.0, None, None),     # a 10 MHz LTE downlink block
+    (915.0, 200.0, 18.0, None, None),       # 915 MHz ISM, wide
+    (1090.0, 3.0, 20.0, (2,), (1, 3, 5)),   # ADS-B: odd passes only, remembered on even ones
+)
+
+
+def fake_power_csv(plan, emitters, sweep=0, pass_no=1, seed=0, spur_db=15.0, now=None):
+    rng = random.Random(seed)
+    n, step = plan["bins"], plan["step"]
+    sigma = 0.4 if step > 20000 else 0.8
+    stamp = time.strftime("%Y-%m-%d, %H:%M:%S", time.localtime(now))
+    samples = max(1, 8192 // plan["length"])
+    live = [e for e in emitters if (e[3] is None or sweep in e[3]) and (e[4] is None or pass_no in e[4])]
+    out = []
+    for c in plan["centres"]:
+        vals = []
+        for j in range(n):
+            f = c + (j - n // 2) * step
+            base = -52.0 + 5.0 * (f - 87.5e6) / 1662.5e6      # the floor rises with frequency
+            p = 10 ** ((base + rng.gauss(0.0, sigma)) / 10)
+            for mhz, khz, db, _s, _p in live:
+                if abs(f - mhz * 1e6) <= max(khz * 500.0, step / 2):
+                    p += 10 ** ((base + db) / 10)
+            if j in (n // 2 - 1, n // 2 + 1):                  # DC spur skirts
+                p += 10 ** ((base + spur_db) / 10)
+            edge = min(j, n - 1 - j)                            # hop-edge roll-off
+            vals.append(10 * math.log10(p) - (3.0, 1.0, 0.0)[min(edge, 2)])
+        vals[n // 2] = vals[n // 2 + 1]     # rtl_power's own DC fix: avg[0] = avg[1]
+        vals.append(vals[-1])               # ... and its repeated last bin
+        out.append("%s, %d, %d, %.2f, %d, %s\n" % (stamp, c - plan["bw2"], c + plan["bw2"], step,
+                                                    samples, ", ".join("%.2f" % v for v in vals)))
+    return "".join(out)
+
+
+def fake_iq_block():
+    """64 KB of cu8: a carrier exactly where the target sits (baseband
+    -iq_rate/4, i.e. one turn every 4 samples: 1, -j, -1, +j) in light noise.
+    Mixing by exp(+j 2 pi offset t), as the contract says the demodulator
+    does, must bring it to 0 Hz - a check of the offset's sign for free."""
+    rng = random.Random(4)
+    turn = ((40, 0), (0, -40), (-40, 0), (0, 40))
+    out = bytearray()
+    for i in range(32768):
+        for d in turn[i % 4]:
+            out.append(min(255, max(0, int(round(127.5 + d + rng.gauss(0.0, 6.0))))))
+    return bytes(out)
+
+
+# --- the recorder ---------------------------------------------------------------------------
+
+class Recorder:
+    def __init__(self, cfg, args, data_dir, storage):
+        self.cfg, self.args = cfg, args
+        self.fake = args.fake
+        self.data_dir, self.storage = data_dir, storage
+        # SystemRandom: the schedule must not be predictable from a seed.
+        self.rng = random.SystemRandom()
+        self.rotation = Rotation(cfg.remember_passes, cfg.remember_once)
+        self.tools = {}
+        self.device = None
+        self.sdir = None
+        self.session = None
+        self.parts = set()          # in-flight files to discard if we are stopped
+        self.fails = 0              # consecutive failed captures
+        self.clips_ok = self.clips_failed = 0
+        self.bytes = 0              # written to the session directory
+        self.pass_no = 0
+        self.phase = "starting"
+        self.last_hb = mono()
+        self.gain_logged = False
+        self.plan_warned = set()
+        self.iq_block = None
+
+    # --- waiting, children, heartbeat ---
+
+    def heartbeat(self, force=False):
+        """Every UMIK_LOG_INTERVAL: where we are and that bytes are landing.
+        Emitted from the waiting loops of the main thread, so a wedged
+        recorder stops the heartbeat - the log shows a stall as silence."""
+        now = mono()
+        if not force and now - self.last_hb < self.cfg.log_interval:
+            return
+        self.last_hb = now
+        try:
+            free = "%dMB free" % free_mb(self.data_dir)
+        except OSError:
+            free = "free space unknown"
+        applog("%s - %d clips (%d failed), session %dMB, %s" % (
+            self.phase, self.clips_ok, self.clips_failed, self.bytes // 1048576, free))
+
+    def idle(self, seconds):
+        end = mono() + max(0.0, seconds)
+        while True:
+            if STOP:
+                raise Stopped()
+            self.heartbeat()
+            left = end - mono()
+            if left <= 0:
+                return
+            time.sleep(min(TICK, left))
+
+    def run_child(self, argv, timeout, want_stdout=True):
+        """Run an rtl_* tool, polling every TICK so a stop or a hang is
+        noticed. -> (returncode or None, stdout bytes, stderr text, timed_out)."""
+        try:
+            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE if want_stdout else subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE)
+        except OSError as e:
+            return None, b"", str(e), False
+        t_end = mono() + timeout
+        timed_out = False
+        while True:
+            try:
+                out, err = p.communicate(timeout=TICK)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if STOP:
+                stop_child(p)
+                raise Stopped()
+            self.heartbeat()
+            if mono() > t_end:
+                timed_out = True
+                stop_child(p)
+                out, err = p.communicate()
+                break
+        if STOP:
+            raise Stopped()
+        return p.returncode, out or b"", (err or b"").decode("utf-8", "replace"), timed_out
+
+    def ensure_space(self, need_bytes=0):
+        """Stop cleanly with 78 rather than fill the medium. Counts the clip
+        about to be written, so the floor is never crossed."""
+        free = free_mb(self.data_dir)
+        if free - need_bytes / 1048576.0 >= self.cfg.min_free_mb:
+            return
+        lines = ["FATAL: less than %dMB free - storage is full; stopping cleanly" % self.cfg.min_free_mb]
+        if self.session:
+            lines.append("session %s stopped: storage full (%dMB, %d clips)"
+                         % (self.session, self.bytes // 1048576, self.clips_ok))
+        raise Exit(78, lines, ["move old sessions off %s and power-cycle to resume" % self.data_dir])
+
+    def discard_parts(self):
+        for path in list(self.parts):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            self.parts.discard(path)
+
+    # --- start-up ---
+
+    def start(self):
+        cfg, args = self.cfg, self.args
+        if self.fake:
+            self.device = dict(FAKE_DEVICE)
+            self.rtl_ver = "fake"
+        else:
+            self.device = locate_dongle(cfg, args.rtl_dir)
+            for name in ("rtl_power", "rtl_sdr", "rtl_test"):
+                self.tools[name] = find_tool(name, args.rtl_dir)
+            if not self.tools["rtl_power"] or not self.tools["rtl_sdr"]:
+                raise Exit(1, "FATAL: dongle present but rtl_power/rtl_sdr not found (looked in %s) - "
+                              "SDR support not provisioned (the rtl-sdr .debs did not install?)"
+                           % (args.rtl_dir or "PATH, /usr/bin"))
+            self.rtl_ver = rtl_version(self.tools["rtl_sdr"])
+            self.probe_dongle()
+        d = self.device
+        applog("found RTL-SDR %s (%s %s, serial %s%s)" % (
+            d["usb_id"], d["manufacturer"], d["product"], d["serial"],
+            ", tuner " + d["tuner"] if d.get("tuner") else ""))
+        if d.get("_count", 1) > 1:
+            applog("WARNING: %d RTL-SDR dongles attached; rtl_* use the first one librtlsdr lists"
+                   % d["_count"])
+        for sc in cfg.scans:
+            prepare_scan(sc, cfg.crop)
+            lo, hi = TUNER_MHZ
+            if sc["start_mhz"] < lo or sc["stop_mhz"] > hi:
+                applog("WARNING: scan %s %g-%g MHz goes outside the R820T2's ~%g-%g MHz"
+                       % (sc["name"], sc["start_mhz"], sc["stop_mhz"], lo, hi))
+        applog("scans: " + "; ".join(
+            "%s %g-%g MHz in %d hops of %d x %.1f kHz bins" % (
+                sc["name"], sc["start_mhz"], sc["stop_mhz"], sc["plan"]["hops"],
+                sc["plan"]["bins"], sc["plan"]["step"] / 1e3) for sc in cfg.scans)
+            + "; %d sweeps each, every other one a quarter hop off%s"
+            % (cfg.sweeps, ", crop %g%%" % cfg.crop if cfg.crop else ""))
+        applog("captures: gain %s, ppm %d, %d/%d S/s, dwell %gs +-%d%%, gaps 0-%gs, pauses 0-%gs, "
+               "up to %d channels a pass; exclude %s" % (
+                   "auto" if cfg.gain == "auto" else "%g dB" % cfg.gain, cfg.ppm, cfg.iq_rate,
+                   cfg.iq_rate_wide, cfg.dwell, round(cfg.jitter * 100), cfg.gap_max,
+                   cfg.pass_pause_max, cfg.max_channels,
+                   " ".join("%g-%g" % r for r in cfg.exclude) or "nothing"))
+        self.open_session()
+
+    def probe_dongle(self):
+        """Open the dongle once before creating a session, so 'cannot open it'
+        is one clear FATAL line and not an empty session directory."""
+        d = self.device
+        if "dvb_usb_rtl28xxu" in d.get("_drivers", []):
+            applog("WARNING: the kernel DVB driver (dvb_usb_rtl28xxu) is bound to the dongle - "
+                   "/etc/modprobe.d/umik-sdr.conf is missing or not in effect yet (it needs a "
+                   "reboot); librtlsdr will detach it on every open")
+        if not sys.platform.startswith("linux") or not self.tools.get("rtl_test"):
+            return                       # the Mac already opened it to find it
+        # At boot the dongle can be on the bus a moment before udev has
+        # applied the plugdev rule; give it a few seconds before calling it.
+        for attempt in range(3):
+            if attempt:
+                time.sleep(2)
+            if STOP:
+                raise Stopped()
+            ok, info, text = rtl_test_probe(self.tools["rtl_test"])
+            if ok:
+                break
+        else:
+            raise Exit(1, "FATAL: the dongle is on the bus but cannot be opened: %s%s"
+                       % (last_line(text), rtl_hint(text)))
+        if info.get("tuner"):
+            d["tuner"] = info["tuner"]
+
+    def open_session(self):
+        cfg, args = self.cfg, self.args
+        try:
+            os.makedirs(self.data_dir, exist_ok=True)
+        except OSError as e:
+            raise Exit(1, "FATAL: cannot create %s: %s" % (self.data_dir, e))
+        stale = remove_stale_parts(self.data_dir)
+        if stale:
+            applog("removed %d stale .part file(s) from earlier sessions" % stale)
+        self.ensure_space()
+        unit = unit_name(args.unit)
+        trusted, source, states = clock_ladder(args.trust_clock)
+        seq = next_session(self.data_dir)
+        wall, started = utc_stamp(), mono()
+        self.session = "%06d" % seq
+        self.trusted = trusted
+        self.sdir = os.path.join(self.data_dir, "%s-sdr_%s_%s" % (unit, self.session, wall))
+        os.makedirs(self.sdir, exist_ok=True)
+        self.clips_path = os.path.join(self.sdir, "clips.jsonl")
+        device = {k: v for k, v in self.device.items() if not k.startswith("_")}
+        doc = {
+            "session": self.session, "unit": unit, "recorder": "sdr",
+            "started_utc": wall, "started_mono": round(started, 1),
+            "clock_trusted": trusted, "time_source": source,
+            "gps": states["gps"], "net": states["net"], "rtc": states["rtc"],
+            "time_seed": states["time_seed"],
+            "storage": self.storage,
+            "device": device,
+            "sdr": {
+                "gain_db": fmt_num(cfg.gain), "ppm": cfg.ppm,
+                "iq_rate": cfg.iq_rate, "iq_rate_wide": cfg.iq_rate_wide,
+                "dwell_s": fmt_num(cfg.dwell), "jitter": fmt_num(cfg.jitter),
+                "gap_max_s": fmt_num(cfg.gap_max), "pass_pause_max_s": fmt_num(cfg.pass_pause_max),
+                "scans": [{"name": sc["name"], "start_mhz": fmt_num(sc["start_mhz"]),
+                           "stop_mhz": fmt_num(sc["stop_mhz"]), "bin_khz": fmt_num(sc["bin_khz"]),
+                           "sweeps": sc["sweeps"]} for sc in cfg.scans],
+                "thr_db": fmt_num(cfg.thr), "thr_burst_db": fmt_num(cfg.thr_burst),
+                "exclude_mhz": [[fmt_num(lo), fmt_num(hi)] for lo, hi in cfg.exclude],
+                "remember_passes": cfg.remember_passes, "remember_once": cfg.remember_once,
+                "max_channels": cfg.max_channels, "crop_pct": fmt_num(cfg.crop),
+            },
+            "software": {"umik_sdr": VERSION, "rtl_sdr": self.rtl_ver},
+        }
+        if self.fake:
+            doc["fake"] = True
+        # indent=2 keeps one top-level key per line, ahead of any nested
+        # object: the Mac tools read unit, started_utc, clock_trusted and
+        # time_source with a line-based sed (tools/umik-lib.sh json_str).
+        write_json(os.path.join(self.sdir, "session.json"), doc)
+        os.sync()
+        if not trusted:
+            log("WARNING: clock not anchored (no GPS/NTP sync this boot, no disciplined RTC);")
+            log("         rely on the session counter (%s) for ordering" % self.session)
+        applog("session %s started -> %s (clock_trusted=%s, time_source=%s, %dMB free)" % (
+            self.session, self.sdir, "true" if trusted else "false", source, free_mb(self.data_dir)))
+
+    # --- one pass ---
+
+    def run(self):
+        cfg = self.cfg
+        p = 0
+        while not cfg.passes or p < cfg.passes:
+            p += 1
+            self.run_pass(p)
+            if cfg.passes and p >= cfg.passes:
+                break
+            pause = self.rng.uniform(0, cfg.pass_pause_max)
+            self.phase = "pass %d done, idle %ds before pass %d" % (p, pause, p + 1)
+            self.idle(pause)
+        applog("session %s finished after %d pass%s (%dMB total, %d clips)" % (
+            self.session, p, "" if p == 1 else "es", self.bytes // 1048576, self.clips_ok))
+
+    def run_pass(self, p):
+        cfg = self.cfg
+        self.pass_no = p
+        started_utc, started_mono = utc_stamp(), mono()
+        self.ensure_space()
+        meta, signals = self.scan_pass(p)
+        kept = select_signals(signals, cfg.thr_burst, cfg.exclude)
+        self.rotation.update(kept, p)
+        plan = self.rotation.plan(p, cfg.max_channels)
+        self.rng.shuffle(plan)
+        for i, ch in enumerate(plan, 1):
+            ch["iq_rate"] = iq_rate_for(ch, cfg.iq_rate, cfg.iq_rate_wide)
+            ch["index"] = i
+        write_json(os.path.join(self.sdir, "scan-p%04d.json" % p), {
+            "pass": p, "started_utc": started_utc, "started_mono": round(started_mono, 1),
+            "scans": meta, "signals": sorted(signals, key=lambda x: x["freq_hz"]),
+            "channels": plan})
+        self.bytes += os.path.getsize(os.path.join(self.sdir, "scan-p%04d.json" % p))
+
+        per_scan = ", ".join("%s %d" % (m["name"], sum(1 for x in signals if x["scan"] == m["name"]))
+                             for m in meta)
+        wide = sum(1 for ch in plan if ch["iq_rate"] == cfg.iq_rate_wide)
+        est_mb = sum(2 * cfg.dwell * ch["iq_rate"] for ch in plan) / 1e6
+        applog("pass %d: %d signals (%s), %d after filters; plan %d channels (%d remembered, "
+               "%d wide), ~%dMB; scans took %ds" % (
+                   p, len(signals), per_scan, len(kept), len(plan),
+                   sum(1 for ch in plan if ch["source"] == "remembered"), wide, est_mb,
+                   sum(m["seconds"] for m in meta)))
+        self.antenna_check(signals)
+
+        ok0, failed0, t0 = self.clips_ok, self.clips_failed, mono()
+        for ch in plan:
+            self.phase = "pass %d: gap before clip %d/%d" % (p, ch["index"], len(plan))
+            self.idle(self.rng.uniform(0, cfg.gap_max))
+            self.capture(ch, p, len(plan))
+        applog("pass %d done: %d clips, %d failed, in %ds" % (
+            p, self.clips_ok - ok0, self.clips_failed - failed0, mono() - t0))
+
+    def antenna_check(self, signals):
+        """A disconnected antenna still produces scans - of the dongle's own
+        spurs - and a night of clips of nothing. FM broadcast is everywhere in
+        the US: if none of it stands 20 dB clear, say so in the log."""
+        covers = any(sc["start_mhz"] <= 90 and sc["stop_mhz"] >= 106 for sc in self.cfg.scans)
+        if covers and not any(in_fm(x["freq_hz"]) and x["snr_db"] >= 20 for x in signals):
+            applog("WARNING: no FM broadcast station stands 20 dB clear of the floor in 88-108 MHz "
+                   "- is the antenna connected?")
+
+    def scan_pass(self, p):
+        """Run every scan's sweeps (interleaved, so each scan's sweeps are
+        spread over the whole scan phase), keep the raw CSV gzipped, detect."""
+        cfg = self.cfg
+        states = []
+        try:
+            for sc in cfg.scans:
+                path = os.path.join(self.sdir, "scan-p%04d-%s.csv.gz" % (p, sc["name"]))
+                fh = open(path + ".part", "wb")
+                self.parts.add(path + ".part")
+                gz = gzip.GzipFile(filename=os.path.basename(path)[:-3], mode="wb", fileobj=fh,
+                                   compresslevel=6, mtime=int(time.time()))
+                states.append({"sc": sc, "path": path, "fh": fh, "gz": gz, "sweeps": [], "seconds": 0.0})
+            for s in range(cfg.sweeps):
+                shifted = sweep_shifted(p, s)
+                for st in states:
+                    sc = st["sc"]
+                    self.phase = "pass %d: scanning %s, sweep %d/%d" % (p, sc["name"], s + 1, cfg.sweeps)
+                    text, rows, secs = self.power_sweep(sc, s, shifted, p)
+                    st["gz"].write(text.encode("ascii", "replace"))
+                    st["sweeps"].append(rows_to_grid(rows, sc["grid"]))
+                    st["seconds"] += secs
+            for st in states:
+                st["gz"].close()
+                st["fh"].flush()
+                os.fsync(st["fh"].fileno())
+                st["fh"].close()
+                os.replace(st["path"] + ".part", st["path"])
+                self.parts.discard(st["path"] + ".part")
+                self.bytes += os.path.getsize(st["path"])
+            fsync_path(self.sdir)
+        except BaseException:
+            for st in states:
+                try:
+                    st["gz"].close()
+                    st["fh"].close()
+                except (OSError, ValueError):
+                    pass
+            self.discard_parts()
+            raise
+        meta, signals = [], []
+        for st in states:
+            sc = st["sc"]
+            self.phase = "pass %d: analysing the %s scan" % (p, sc["name"])
+            sigs, floors = detect(sc["name"], sc["grid"], st["sweeps"], cfg.thr)
+            signals += sigs
+            fl = [x for f in floors for x in f if x is not None]
+            meta.append({"name": sc["name"], "file": os.path.basename(st["path"]),
+                         "sweeps": cfg.sweeps, "hops": sc["plan"]["hops"], "bins": sc["grid"]["n"],
+                         "floor_db_median": round(statistics.median(fl), 1) if fl else None,
+                         "seconds": round(st["seconds"], 1), "bin_hz": round(sc["plan"]["step"], 2)})
+        return meta, signals
+
+    def power_sweep(self, sc, s, shifted, p):
+        """One rtl_power sweep, retried POWER_RETRIES times. -> (csv text,
+        parsed rows, seconds). Judged by its output, never its exit status."""
+        cfg = self.cfg
+        lo, hi = sweep_range(sc, shifted)
+        plan = power_plan(lo, hi, sc["bin_hz"], sc["crop"])
+        argv = [self.tools.get("rtl_power", "rtl_power"), "-f", "%d:%d:%d" % (lo, hi, sc["bin_hz"]),
+                "-i", "1", "-1"]
+        if cfg.gain != "auto":
+            argv += ["-g", "%g" % cfg.gain]
+        argv += ["-p", str(cfg.ppm)]
+        if cfg.crop:
+            argv += ["-c", "%g%%" % cfg.crop]
+        argv.append("-")
+        problem, err = "", ""
+        for attempt in range(1 + POWER_RETRIES):
+            if attempt:
+                self.idle(2.0 * attempt)
+            t0 = mono()
+            if self.fake:
+                rc, err, timed_out = 0, "", False
+                text = fake_power_csv(plan, FAKE_EMITTERS, sweep=s, pass_no=p,
+                                      seed=p * 1000 + s * 10 + cfg.scans.index(sc))
+            else:
+                rc, out, err, timed_out = self.run_child(argv, timeout=30 + 0.12 * plan["hops"])
+                text = out.decode("ascii", "replace")
+            rows = parse_power_csv(text)
+            problem = self.judge_power(sc, plan, rc, timed_out, rows, err)
+            if not problem:
+                if not self.gain_logged:
+                    m = re.search(r"Tuner gain set to (.+?)\.?$", err, re.M)
+                    if m:
+                        applog("tuner gain: %s (asked for %s)" % (
+                            m.group(1), "auto" if cfg.gain == "auto" else "%g dB" % cfg.gain))
+                    self.gain_logged = True
+                return text, rows, mono() - t0
+            applog("WARNING: rtl_power %s sweep %d/%d failed: %s%s" % (
+                sc["name"], s + 1, cfg.sweeps, problem,
+                " - retrying" if attempt < POWER_RETRIES else ""))
+        raise Exit(1, "FATAL: rtl_power failed %d times running on the %s scan (%s)%s" % (
+            1 + POWER_RETRIES, sc["name"], problem, rtl_hint(err)))
+
+    def judge_power(self, sc, plan, rc, timed_out, rows, err):
+        if timed_out:
+            return "no result in time (dongle wedged?)"
+        if rc is None:
+            return "could not start: " + err
+        if rc != 0:
+            return "exit %d: %s" % (rc, last_line(err))
+        m = re.search(r"Number of frequency hops: (\d+)", err)
+        hops = int(m.group(1)) if m else plan["hops"]
+        if hops != plan["hops"] and sc["name"] not in self.plan_warned:
+            self.plan_warned.add(sc["name"])
+            applog("WARNING: rtl_power planned %d hops for %s, umik-sdr expected %d - "
+                   "bins are matched by frequency, so this costs little" % (hops, sc["name"], plan["hops"]))
+        if len(rows) != hops:
+            return "%d of %d hops in its output (%s)" % (len(rows), hops, last_line(err))
+        lost = err.count("dropped samples") + err.count("bad retune")
+        if lost > max(1, hops // 20):
+            return "%d of %d hops lost samples (USB trouble, or the dongle went away)" % (lost, hops)
+        return ""
+
+    # --- one clip ---
+
+    def capture(self, ch, p, n_plan):
+        cfg = self.cfg
+        rate, f = ch["iq_rate"], ch["freq_hz"]
+        offset = rate // 4
+        center = f + offset
+        dwell = cfg.dwell * self.rng.uniform(1 - cfg.jitter, 1 + cfg.jitter)
+        n = capture_samples(dwell, rate)
+        nbytes = 2 * n
+        self.ensure_space(nbytes)
+        # Name = UTC at the start, whole kHz. Never reuse one: a clock stepped
+        # backwards mid-session must not overwrite an earlier clip.
+        for _ in range(5):
+            t = time.time()
+            name = clip_name(t, f)
+            final = os.path.join(self.sdir, name)
+            if not os.path.exists(final) and not os.path.exists(final + ".part"):
+                break
+            self.idle(1.01 - t % 1.0)
+        part = final + ".part"
+        self.phase = "pass %d: clip %d/%d, %.4f MHz for %.1fs" % (p, ch["index"], n_plan, f / 1e6, n / float(rate))
+        line = {"file": name, "freq_hz": f, "center_hz": center, "offset_hz": offset, "iq_rate": rate,
+                "format": "cu8", "gain_db": fmt_num(cfg.gain), "started_utc": utc_stamp(t),
+                "started_mono": round(mono(), 3), "clock_trusted": self.trusted,
+                "duration_s": round(n / float(rate), 3), "samples": n, "bytes": nbytes,
+                "pass": p, "index": ch["index"]}
+        for key in ("snr_db", "peak_db", "floor_db", "width_khz", "occupancy", "kind", "band",
+                    "seen_scans", "last_seen_pass", "scan", "source"):
+            line[key] = ch[key]
+        self.parts.add(part)
+        if self.fake:
+            problem = self.fake_capture(part, n, rate)
+        else:
+            argv = [self.tools["rtl_sdr"], "-f", str(center), "-s", str(rate)]
+            if cfg.gain != "auto":
+                # rtl_sdr reads -g 0 as "auto"; 0.1 rounds to the tuner's 0.0 dB step
+                argv += ["-g", "%g" % (cfg.gain if cfg.gain > 0 else 0.1)]
+            argv += ["-p", str(cfg.ppm), "-n", str(n), part]
+            rc, _, err, timed_out = self.run_child(argv, timeout=n / float(rate) + 20, want_stdout=False)
+            problem = judge_sdr(rc, timed_out, err)
+        try:
+            size = os.path.getsize(part)
+        except OSError:
+            size = 0
+        if not problem and size != nbytes:
+            problem = "%s file: %d of %d bytes" % ("short" if size < nbytes else "long", size, nbytes)
+        if problem:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            self.parts.discard(part)
+            line.update(file=None, bytes=size, ok=False, error=problem)
+            append_jsonl(self.clips_path, line)
+            self.fails += 1
+            self.clips_failed += 1
+            applog("WARNING: clip %d/%d at %.4f MHz failed (%d in a row): %s" % (
+                ch["index"], n_plan, f / 1e6, self.fails, problem))
+            if self.fails >= SDR_FAIL_LIMIT:
+                raise Exit(1, "FATAL: %d captures failed in a row (last: %s)%s" % (
+                    self.fails, problem, rtl_hint(problem)))
+            return
+        fsync_path(part)
+        os.replace(part, final)
+        self.parts.discard(part)
+        fsync_path(self.sdir)
+        line["ok"] = True
+        append_jsonl(self.clips_path, line)
+        self.bytes += size
+        self.fails = 0
+        self.clips_ok += 1
+
+    def fake_capture(self, part, n, rate):
+        """Write the clip at the real pace, so stops, heartbeats and timing
+        behave as they would with a dongle."""
+        if self.iq_block is None:
+            self.iq_block = fake_iq_block()
+        left = 2 * n
+        per_tick = max(len(self.iq_block), int(2 * rate * TICK) // 8 * 8)
+        with open(part, "wb") as fh:
+            while left > 0:
+                chunk = min(left, per_tick)
+                while chunk > 0:
+                    k = min(chunk, len(self.iq_block))
+                    fh.write(self.iq_block[:k])
+                    chunk -= k
+                    left -= k
+                fh.flush()
+                if left > 0:
+                    self.idle(TICK)
+        return ""
+
+    def stopped(self):
+        had = [x for x in self.parts if x.endswith(".cu8.part")]
+        self.discard_parts()
+        if had:
+            applog("stopping - discarded the clip in flight")
+        if self.session:
+            applog("session %s stopped cleanly (%dMB total, %d clips)" % (
+                self.session, self.bytes // 1048576, self.clips_ok))
+        else:
+            applog("stopped before a session started")
+
+
+# What rtl_sdr and librtlsdr print when a clip is worthless: unopened, not
+# tuned, at the wrong rate or gain, PLL unlocked, or cut short. An explicit
+# list, because "Failed to allocate zero-copy buffer ... Falling back to
+# buffers in userspace" is librtlsdr reporting a harmless fallback, and a
+# blanket "Failed to" would fail every clip on a kernel that prints it.
+SDR_FAULTS = ("Failed to open", "Failed to set center freq", "Failed to set sample rate",
+              "Failed to set tuner gain", "Failed to enable manual gain", "PLL not locked",
+              "Short write", "Library error", "No supported devices", "usb_claim_interface",
+              "usb_open error", "Kernel driver is active")
+
+
+def judge_sdr(rc, timed_out, err):
+    if timed_out:
+        return "rtl_sdr did not finish in time (dongle wedged?)"
+    if rc is None:
+        return "could not start rtl_sdr: " + err
+    bad = [l.strip() for l in err.splitlines() if any(s in l for s in SDR_FAULTS)]
+    if rc != 0:
+        return "rtl_sdr exit %d: %s" % (rc, bad[-1] if bad else last_line(err))
+    return bad[0] if bad else ""
+
+
+def stop_child(p):
+    """SIGTERM, SIGTERM again, then SIGKILL. rtl_power reads the first
+    SIGTERM as "finish this sweep" (up to ~15 s on the main scan) and the
+    second as "abort now"; rtl_sdr stops on the first. The unit allows 30 s
+    in all (TimeoutStopSec), and only we get its SIGTERM (KillMode=mixed)."""
+    for sig, wait in ((signal.SIGTERM, 1.0), (signal.SIGTERM, 3.0), (signal.SIGKILL, 5.0)):
+        if p.poll() is not None:
+            return
+        try:
+            p.send_signal(sig)
+        except OSError:
+            return
+        try:
+            p.communicate(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def main(argv=None):
+    global LOG_FILE, BOOT_ID
+    args = build_parser().parse_args(argv)
+    raw = raw_settings(args, os.environ)
+    data_dir, storage = resolve_storage(raw["data-dir"][0].strip())
+    LOG_FILE = os.path.join(os.path.dirname(os.path.normpath(data_dir)), "logs", "umik.log")
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            BOOT_ID = fh.read().strip()[:8] or "unknown"
+    except OSError:
+        pass
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    applog("=== service start: storage=%s data=%s%s ===" % (
+        storage, data_dir, " FAKE (no hardware, synthetic scans and clips)" if args.fake else ""))
+    rec = None
+    try:
+        cfg = make_config(raw, args)
+        rec = Recorder(cfg, args, data_dir, storage)
+        rec.start()
+        rec.run()
+        return 0
+    except ConfigError as e:
+        applog("FATAL: %s" % e)
+        applog("ABNORMAL EXIT status=1")
+        return 1
+    except Stopped:
+        if rec:
+            rec.stopped()
+        else:
+            applog("stopped before a session started")
+        return 0
+    except Exit as e:
+        if rec:
+            rec.discard_parts()
+        for line in e.lines:
+            applog(line)
+        for hint in e.hints:
+            log(hint)
+        if e.code != 79:            # 79 is not a fault: no ABNORMAL line, as in umik-record
+            applog("ABNORMAL EXIT status=%d" % e.code)
+        return e.code
+    except Exception as e:         # a bug, or the medium vanished under us
+        if rec:
+            rec.discard_parts()
+        traceback.print_exc()
+        if isinstance(e, OSError) and e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+            applog("FATAL: storage full while writing (%s); stopping cleanly" % e)
+            applog("ABNORMAL EXIT status=78")
+            return 78
+        applog("ABNORMAL EXIT status=1 (%s: %s)" % (type(e).__name__, str(e)[:300]))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

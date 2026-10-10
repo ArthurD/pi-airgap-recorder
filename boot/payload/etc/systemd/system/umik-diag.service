@@ -3,7 +3,7 @@ Description=Dump recording-stack diagnostics to the data partition
 # Not After=multi-user.target: ordering a unit after the very target that
 # wants it invites a dependency cycle. The script's own settle delay (90s)
 # is what guarantees the stack has reached steady state before the dump.
-After=umik-record.service data.mount
+After=umik-record.service umik-sdr.service data.mount
 
 [Service]
 # Type=oneshot start jobs have no default start timeout (only oneshot is

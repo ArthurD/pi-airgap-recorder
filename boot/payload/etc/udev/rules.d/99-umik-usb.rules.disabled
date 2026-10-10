@@ -48,6 +48,14 @@ ATTR{idVendor}=="1a86", GOTO="umik_usb_end"
 ATTR{idVendor}=="10c4", GOTO="umik_usb_end"
 ATTR{idVendor}=="067b", GOTO="umik_usb_end"
 
+# Allow the optional RTL-SDR dongle (umik-sdr): an RTL2832U, which enumerates
+# as Realtek's 0bda:2838 (the Nooelec NESDR SMArt) or 0bda:2832. Pinned to
+# those two products, unlike the vendor-wide lines above: Realtek's 0bda also
+# covers its USB Wi-Fi, Bluetooth and Ethernet adapters, and a vendor-wide
+# allow would let a radio enumerate. The dongle itself only receives.
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", GOTO="umik_usb_end"
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2832", GOTO="umik_usb_end"
+
 # Everything else is refused.
 ATTR{authorized}="0"
 

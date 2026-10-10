@@ -29,13 +29,15 @@ Ignore the S3 and sealing sections and it is still simply "power on, record."
 to build the card** (the build scripts use `diskutil` and `hdiutil`; the on-Pi
 half is plain Debian). Optional: a USB stick for recordings, a
 [DS3231 RTC module](https://www.amazon.com/dp/B08X4H3NBR) (**recommended** —
-see [Timestamps](#timestamps)), a USB GPS receiver, an AWS account.
+see [Timestamps](#timestamps)), a USB GPS receiver, an RTL-SDR dongle (see
+[Recording from an SDR](#recording-from-an-sdr)), an AWS account.
 
 > **Recording law is your responsibility.** In many places recording people
 > without consent is illegal, and rules differ by country and state. This tool
 > makes recordings hard to dispute; it does not make them lawful.
 
 **Contents:** [Quick start](#quick-start) · [Hardware](#hardware) ·
+[Recording from an SDR](#recording-from-an-sdr) ·
 [Timestamps](#timestamps) · [LEDs](#leds) · [Build](#build) ·
 [Recordings](#recordings) · [S3 mirror](#s3-mirror) ·
 [Chain of custody](#chain-of-custody) · [Commands](#command-reference) ·
@@ -89,6 +91,7 @@ That is the whole loop. Everything below is detail and reasoning.
 | any USB-A | **microphone** — black 2.0 by habit, blue 3.0 works the same |
 | any USB-A | **USB stick** — whichever fits; some boards space the blue pair too tightly |
 | any USB-A | **GPS** (optional) — keep it *farthest* from the stick |
+| any USB-A | **RTL-SDR** (optional) — antenna on its magnetic-base cable, away from the stick and the Pi |
 | USB-C | power in — nothing else works there |
 
 The Pi's USB-C is power-only, so the mic cannot go there. All four USB-A ports
@@ -224,6 +227,147 @@ Two catches:
 
 ---
 
+## Recording from an SDR
+
+The same box can record radio, too. Plug an RTL-SDR dongle into any USB-A
+port and `umik-sdr` scans the spectrum, works out which channels are in use,
+and records a short clip of raw IQ from each, pass after pass, for as long as
+it has power. Same air-gap, same clock-trust ladder, same stick, same sealing;
+the session holds IQ instead of WAV.
+
+**Hardware.** A Nooelec NESDR SMArt v5: RTL2832U with an R820T2 tuner, 0.5 ppm
+TCXO, 100 kHz to 1.75 GHz, USB ID `0bda:2838`. Put the antenna on its
+magnetic-base cable, well away from the stick and the Pi; both radiate
+broadband noise, the same reason a GPS module sits away from a USB 3.0 stick.
+The dongle is **receive-only**: like the GPS it has no transmitter, so the
+air-gap holds and none of the four radio-silence layers changes.
+`umik-sdr.service` still `Requires=` the same radio check as the mic recorder.
+
+**What it does.** Each pass starts with `rtl_power`: a sweep of 87.5 MHz to
+1.75 GHz in 50 kHz bins, plus finer 10 kHz scans of the FM band and of
+420–480 MHz, three sweeps each. A signal is anything 12 dB over the local noise
+floor in every sweep, or 15 dB if it comes and goes. An FM station becomes one
+channel, and so does a wide transmitter (an LTE carrier, a Wi-Fi channel, a
+UHF TV channel) rather than the dozens of bins it covers; the phone uplink
+bands, your own phone's included, are never listened to. A channel seen in two
+or more scans stays in the rotation for 8 passes after it was last seen (2 if
+it was seen once), so an intermittent transmitter keeps getting visits. Up to
+120 channels (the strongest, when there are more) are then recorded in
+shuffled order, ~15 s each, with random gaps between channels and a random
+pause of up to 3 minutes between passes. The timing is randomised so the
+schedule can't be learned.
+
+**Storage budget.** IQ costs 2 bytes a sample (8-bit I and Q), whatever the
+signal:
+
+| Channel | IQ rate | Rate | 15 s clip |
+|---|---|---|---|
+| most | 250 kS/s | 500 KB/s | **7.5 MB** |
+| FM broadcast, or anything over 100 kHz wide | 1.024 MS/s | 2 MB/s | **30 MB** |
+
+With ~100 channels a pass that comes to roughly **20–30 GB a night**, or 2–3
+GB an hour; the number of FM stations in range moves it most, since each one
+is a 30 MB clip. A 128 GB stick is about two days of continuous running.
+Below 512 MB free it stops cleanly, like the mic.
+
+**Sessions** sit beside the mic's, with their own counter
+(`.sdr-session-counter`):
+
+```
+/data/usb/recordings/
+  umik1-sdr_000003_20261010T230000Z/
+    session.json                       unit, clock trust, dongle, every scan and capture setting
+    scan-p0001-main.csv.gz             pass 1's raw rtl_power sweep, gzipped (also -fm, -uhf)
+    scan-p0001.json                    pass 1: every detection, and the channel plan
+    clip-20261010-231502-104100k.cu8   ~15 s of raw IQ at 104.1 MHz
+    clips.jsonl                        one line per clip: frequency, rate, SNR, kind, band
+```
+
+Everything is flat in the session directory, because `umik download` seals
+top-level files only. Each clip is written as `.part` and renamed once it is
+complete, so pulling the plug costs at most the clip in flight. That leftover
+`.part` is not a recording: it is never sealed, `umik download` says how many
+it left on the stick, and `umik-sdr` deletes it the next time it starts.
+
+**Reading a clip.** `.cu8` is `rtl_sdr`'s native format, with no header:
+unsigned 8-bit I, then Q, and sample = (byte − 127.5) / 127.5. The dongle is
+tuned a quarter of the IQ rate above the target to keep its DC spike off it,
+so the target sits at −`offset_hz` in the clip. `clips.jsonl` carries
+`freq_hz`, `center_hz`, `offset_hz` and `iq_rate` for every clip, plus
+`started_mono` (seconds since boot), which spaces clips exactly even when the
+wall clock is not trusted.
+
+**Two recorders, one box.** Both are installed on every card, and each waits
+for its own device (the mic for 60 s, the dongle for 30 s):
+
+| Attached | `umik-record` | `umik-sdr` |
+|---|---|---|
+| mic | records | exits 79 |
+| dongle | exits 79 | records |
+| both | records | records, in its own session |
+| neither | FATAL, retries with backoff | FATAL, retries with backoff |
+
+Exit 79 means "not my device": mine is missing and the other recorder's is
+here. The recorder logs one line and stops, and its unit counts that as
+success and never restarts it, so it ends *inactive*, not failed. A mic-only
+unit therefore runs exactly as before, plus one line in `umik.log` per boot. A
+recorder that bowed out stays out until the next boot: plug the other device
+in, then power-cycle.
+
+**Build step.** Pi OS Lite has no `rtl-sdr`, and provisioning never touches a
+network, so the packages ride along in the payload. Run this once, any time
+before `03-inject`:
+
+```sh
+./build/05-fetch-sdr-debs.sh     # cached in cache/debs/; a re-run fetches nothing
+```
+
+It fetches three Debian trixie arm64 packages through the same `fetch()` as
+the OS image: `rtl-sdr`, `librtlsdr0`, and `libusb-1.0-0` (already on the
+image; a spare). Each one is checked against a SHA-256 pinned in the script,
+and the script writes `cache/debs/SHA256SUMS` for the Pi. `03-inject` copies
+them onto the card (about 140 KB), and firstrun re-checks them with
+`sha256sum -c`, then installs with `dpkg` only what is missing or older. Skip
+the step and the card builds exactly as before: `03-inject` says SDR support
+will not be provisioned, and `umik-sdr` stays disabled.
+
+**The DVB driver.** The RTL2832U started life as a DVB-T TV stick, and the
+kernel's TV driver (`dvb_usb_rtl28xxu`) claims the dongle the moment it
+enumerates. Neither Debian package blacklists it, so
+`/etc/modprobe.d/umik-sdr.conf` does: `blacklist` plus `install … /bin/false`
+for the driver, its demodulators, and its tuner. The `--- sdr ---` block of
+`logs/diag-latest.log` shows whether any of them loaded, along with `lsusb` and
+the dongle's device permissions.
+
+**LEDs** mean what they always did; green now answers for both recorders. It
+blips while either one is verifiably writing: a mic segment growing, or an SDR
+clip or scan finished within the last 6 minutes (the SDR writes in bursts, and
+a pass pause plus the next scan can leave minutes without a new file). Fast
+blink means a recorder failed, or both have stopped. A recorder that exited 79
+is idle, not trouble.
+
+**Tunables**, via `sudo systemctl edit umik-sdr`, as `Environment=` lines:
+
+| Variable | Default |
+|---|---|
+| `UMIK_SDR_GAIN` | `25.4` dB (R820T2 tuner gain). Fixed, so passes stay comparable; `auto` is allowed |
+| `UMIK_SDR_PPM` | `0` (frequency correction; the SMArt's TCXO is 0.5 ppm) |
+| `UMIK_SDR_SCAN` | `87.5-1750:50`, the main scan: MHz range, then bin width in kHz |
+| `UMIK_SDR_FINE` | `87.5-108:10 420-480:10`, the finer scans (space-separated) |
+| `UMIK_SDR_SWEEPS` | `3` per scan |
+| `UMIK_SDR_THR` / `UMIK_SDR_THR_BURST` | `12` / `15` dB over the local floor, for a continuous / an intermittent signal |
+| `UMIK_SDR_EXCLUDE` | `698-716 777-787 824-849` MHz, never listened to: the LTE uplink bands 12/17, 13 and 5, where phones (yours too) transmit |
+| `UMIK_SDR_DWELL` / `UMIK_SDR_JITTER` | `15` s / `0.3`: each clip is dwell × U(0.7, 1.3) |
+| `UMIK_SDR_GAP_MAX` / `UMIK_SDR_PASS_PAUSE_MAX` | `5` / `180` s of random idle, between channels / between passes |
+| `UMIK_SDR_REMEMBER_PASSES` / `UMIK_SDR_REMEMBER_ONCE` | `8` / `2` passes a channel stays after it was last seen (seen in ≥2 scans / in one) |
+| `UMIK_SDR_IQ_RATE` / `UMIK_SDR_IQ_RATE_WIDE` | `250000` / `1024000` samples/s (narrow / FM and wide channels) |
+| `UMIK_SDR_MAX_CHANNELS` | `120` per pass, strongest kept |
+| `UMIK_SDR_CROP` | `0` (rtl_power `-c` percent, discarding each hop's rolled-off edges). Off by default: the recorder measures the hop-edge roll-off in every sweep and removes it instead; set 20 if a real spectrum proves that wrong |
+| `UMIK_SDR_WAIT_SECONDS` | `30`, the wait for the dongle to enumerate |
+| `UMIK_MIN_FREE_MB` / `UMIK_LOG_INTERVAL` | `512` / `60`, the same names (and defaults) as the mic's |
+
+---
+
 ## Timestamps
 
 The Pi 4B has no built-in RTC and this box touches no network, so wall-clock
@@ -321,14 +465,16 @@ With no screen and no network, the two onboard LEDs are the only live feedback.
 | LED | Pattern | Meaning |
 |---|---|---|
 | green (ACT) | off | still booting |
-| green | solid | running but not writing yet — suspicious after minutes |
-| green | **blip every 2 s** | **recording**, verified: the segment file is growing |
-| green | fast blink | trouble: radio-check failed, recorder died, or disk full |
+| green | solid | a recorder running but not writing yet — suspicious after minutes |
+| green | **blip every 2 s** | **recording**, verified: the segment file is growing (or an SDR clip or scan was just written) |
+| green | fast blink | trouble: radio-check failed, a recorder died, or disk full |
 | red (PWR) | off | clock trust not yet determined |
 | red | **solid** | **clock trusted** — NTP or GPS this boot, or carried by the RTC |
 | red | slow blink | no trusted time |
 
-Happy state at a distance: **green blipping, red solid.**
+Happy state at a distance: **green blipping, red solid.** With an RTL-SDR
+attached, green answers for both recorders; see
+[Recording from an SDR](#recording-from-an-sdr).
 
 ---
 
@@ -347,6 +493,7 @@ tools/     host-side utilities  umik · umik-ingest.sh · umik-upload.sh ·
 
 ```sh
 ./build/00-fetch-verify.sh              # download + SHA-256 verify
+./build/05-fetch-sdr-debs.sh            # optional: RTL-SDR tools, 3 pinned .debs
 ./build/01-decompress.sh                # python3 lzma; no xz needed
 diskutil list external physical         # find your card
 ./build/02-flash.sh /dev/diskN          # DESTRUCTIVE; verifies readback
@@ -705,8 +852,8 @@ Also purged: `bluez`, `wpasupplicant`, `network-manager`, `avahi-daemon`,
 
 **Enforced, not just configured.** `umik-radio-check.service` asserts at every
 boot that there are no wireless interfaces, HCI devices, radio modules, rfkill
-switches or radio firmware — and `umik-record.service` `Requires=` it, so **if
-a radio is ever live, the box refuses to record.**
+switches or radio firmware — and `umik-record.service` `Requires=` it (as does
+`umik-sdr.service`), so **if a radio is ever live, the box refuses to record.**
 
 ### The one-time network window
 
@@ -728,6 +875,13 @@ socket), `ProtectSystem=strict` with `ReadWritePaths=/data`,
 `DevicePolicy=closed` with only ALSA character devices, and exactly
 `CAP_SYS_NICE`.
 
+`umik-sdr.service` gets the same sandbox with three changes, each explained in
+the unit. Its only devices are USB device nodes (`char-usb_device`, which is
+how libusb reaches the dongle; file permissions leave just the dongle's node
+writable, by `plugdev`). It may open `AF_NETLINK` sockets, because libusb will
+not start without its udev hotplug monitor, but only inside a private network
+namespace that holds nothing but `lo`. And it has no capabilities at all.
+
 ### Access, and the supply chain
 
 No SSH, no network. The console account works on HDMI + USB keyboard and on the
@@ -742,7 +896,11 @@ that verified image. `fetch()` in `build/lib.sh` is the single network entry
 point, with no `-k` and no way to disable certificate validation. Nothing is
 injected that isn't in this repo — no third-party scripts, no `curl | bash` —
 and because `alsa-utils` ships in Trixie Lite, **the Pi never touches a network
-to provision.**
+to provision.** The one addition is optional: the SDR recorder's three Debian
+packages, fetched by `05-fetch-sdr-debs.sh` through the same `fetch()`, pinned
+by SHA-256 in that script, and checked again on the Pi before `dpkg` sees them.
+(`rtl-sdr` also installs `rtl_tcp`, an IQ server; nothing starts it, and
+`umik-sdr` runs in a network namespace holding only `lo`.)
 
 **Known gap:** the detached GPG signature is downloaded but not checked (this
 host has no `gpg`, and bootstrapping it would rest on nothing stronger than the
@@ -767,6 +925,7 @@ Via `systemctl edit umik-record` (or the named unit), as `Environment=` lines:
 | `UMIK_DATA_DIR` | unset (auto: stick if mounted, else SD) |
 | `UMIK_MIN_FREE_MB` | `512` |
 | `UMIK_LOG_INTERVAL` | `60` (heartbeat seconds) |
+| `UMIK_SDR_*` | the SDR recorder's own, via `systemctl edit umik-sdr`; see [Recording from an SDR](#recording-from-an-sdr) |
 | `UMIK_USB_WAIT` | `6` (via `umik-usb-detect`) |
 | `UMIK_GPS_WAIT` / `UMIK_GPS_FIX_TIMEOUT` | `6` / `180` (via `umik-gps-time`) |
 | `UMIK_RTC_WAIT` | `5` (via `umik-rtc-time`) |
@@ -782,7 +941,7 @@ Raise the unit's `TimeoutStartSec` alongside any wait you increase.
 to a plain-text `logs/umik.log` on the same medium as the recordings. It records
 each boot's radio-check verdict, USB and GPS detection, clock sync (timestamps
 visibly jump when the clock is stepped — the jump *is* the adjustment), mic
-discovery, session start/stop, and a heartbeat every minute showing segment
+(or dongle) discovery, session start/stop, and a heartbeat every minute showing segment
 size and free space. A stalled recorder shows as a stopped heartbeat. Rotates
 at 5 MB, keeping one previous file.
 
@@ -836,6 +995,8 @@ Open:
       in and it has not recurred since.
 - [ ] A Pi 5's built-in RTC should work identically (same kernel interface)
       minus the overlay — untested.
+- [ ] The RTL-SDR recorder (`umik-sdr`) is new and has not run on a Pi yet;
+      the first-boot checks are in `TODO.md`.
 
 ---
 

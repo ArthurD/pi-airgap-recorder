@@ -240,6 +240,83 @@ systemctl enable umik-record.service
 systemctl enable umik-diag.service
 
 # ---------------------------------------------------------------------------
+step "SDR support"
+# ---------------------------------------------------------------------------
+# The optional RTL-SDR recorder, umik-sdr. Pi OS Lite ships no rtl-sdr and
+# this script never touches a network, so 03-inject brings the packages along
+# in ${PAYLOAD}/debs/ (fetched and SHA-256-pinned on the Mac by
+# build/05-fetch-sdr-debs.sh). Nothing here may cost the box its mic
+# recorder: every failure is a WARN, and provisioning carries on.
+#
+# The script, unit and DVB blacklist go in either way. The unit is enabled
+# only once rtl_sdr and rtl_power are really on the box - from these debs or
+# an earlier provisioning - so a card injected without the debs never gains a
+# recorder that can only crash-loop.
+install -m 0755 "${PAYLOAD}/usr/local/bin/umik-sdr" /usr/local/bin/umik-sdr \
+    || warn "umik-sdr not installed"
+install -m 0644 "${PAYLOAD}/etc/systemd/system/umik-sdr.service" /etc/systemd/system/ \
+    || warn "umik-sdr.service not installed"
+# The kernel's DVB-T driver would otherwise claim the dongle before librtlsdr.
+install -m 0644 "${PAYLOAD}/etc/modprobe.d/umik-sdr.conf" /etc/modprobe.d/ \
+    || warn "DVB blacklist not installed - the TV driver may claim the dongle"
+
+# librtlsdr0's udev rule gives the dongle to group plugdev (0660). The unit
+# names plugdev in SupplementaryGroups=, and a group that does not exist
+# fails the unit before it starts, so make sure this one does.
+getent group plugdev >/dev/null || groupadd --system plugdev \
+    || warn "could not create group plugdev"
+usermod -a -G plugdev recorder || warn "could not add recorder to plugdev"
+echo "recorder groups=$(id -Gn recorder)"
+
+DEBS="${PAYLOAD}/debs"
+if [ ! -d "$DEBS" ]; then
+    echo "no ${DEBS} in this payload - no packages to install"
+elif ! (cd "$DEBS" && sha256sum -c SHA256SUMS); then
+    warn "SDR support not provisioned: ${DEBS} fails sha256sum -c SHA256SUMS - nothing installed"
+else
+    # Only what SHA256SUMS names - exactly what was just verified - never
+    # *.deb. A package goes in only when it is absent or older than its .deb
+    # (the image already has libusb-1.0-0 at this version, and a re-run must
+    # not reinstall anything), and all of them in ONE dpkg call, so dpkg
+    # orders the dependencies itself. Versions come from the .deb's own
+    # control file, never its name: the name drops the epoch (2:1.0.28-1).
+    NEED=()
+    while read -r _ deb; do
+        pkg=$(dpkg-deb -f "${DEBS}/${deb}" Package 2>/dev/null)
+        new=$(dpkg-deb -f "${DEBS}/${deb}" Version 2>/dev/null)
+        if [ -z "$pkg" ] || [ -z "$new" ]; then
+            warn "cannot read ${deb} - skipped"
+            continue
+        fi
+        have=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$pkg" 2>/dev/null)
+        case "$have" in
+            "installed "*) have=${have#installed } ;;
+            *)             have="" ;;   # absent, removed, or half-installed
+        esac
+        if [ -n "$have" ] && dpkg --compare-versions "$have" ge "$new"; then
+            echo "${pkg} ${have} already installed (${deb} is ${new}) - skipped"
+        else
+            echo "${pkg}: ${have:-not installed} -> ${new}"
+            NEED+=("${DEBS}/${deb}")
+        fi
+    done < "${DEBS}/SHA256SUMS"
+    if [ ${#NEED[@]} -gt 0 ]; then
+        dpkg -i "${NEED[@]}" || warn "dpkg -i returned non-zero; see above"
+    fi
+fi
+
+# The unit file landed after the daemon-reload above; reload again so enable
+# sees the file systemd will actually run (and does not warn about it).
+systemctl daemon-reload
+if [ -x /usr/local/bin/umik-sdr ] && [ -x /usr/bin/rtl_sdr ] && [ -x /usr/bin/rtl_power ]; then
+    systemctl enable umik-sdr.service || warn "could not enable umik-sdr.service"
+    echo "SDR support ready: $(dpkg-query -W -f='${Package} ${Version}  ' rtl-sdr librtlsdr0 libusb-1.0-0 2>/dev/null)"
+else
+    systemctl disable umik-sdr.service 2>/dev/null
+    warn "SDR support not provisioned - umik-sdr stays disabled (no rtl-sdr? on the Mac: ./build/05-fetch-sdr-debs.sh, then inject again)"
+fi
+
+# ---------------------------------------------------------------------------
 step "removing first-boot hooks from cmdline.txt"
 # ---------------------------------------------------------------------------
 CMD="${BOOT}/cmdline.txt"

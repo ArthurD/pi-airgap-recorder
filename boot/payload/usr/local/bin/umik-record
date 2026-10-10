@@ -303,6 +303,18 @@ find_usb_strings() { # <vvvv:pppp>
 elapsed=0
 while ! FOUND=$(find_card); do
     if [ "$elapsed" -ge "$WAIT_SECS" ]; then
+        # No mic, but an RTL-SDR dongle: this box records radio, and umik-sdr
+        # is its recorder. Not a fault - one line, then exit 79, which the
+        # unit counts as success and never restarts (and no ABNORMAL EXIT).
+        for d in /sys/bus/usb/devices/*/; do
+            [ "$(cat "${d}idVendor" 2>/dev/null)" = 0bda ] || continue
+            _pid=$(cat "${d}idProduct" 2>/dev/null) || continue
+            case "$_pid" in 2838|2832)
+                applog "no microphone, but an RTL-SDR (0bda:${_pid}) is attached - umik-sdr records on this box; mic recorder idle"
+                trap - EXIT
+                exit 79 ;;
+            esac
+        done
         if [ "$UMIK_VID" = "any" ]; then
             applog "FATAL: no USB audio capture device after ${WAIT_SECS}s - is the mic in one of the four USB-A ports (any colour - NOT the USB-C, and no hub)?"
         else

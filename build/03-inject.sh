@@ -39,6 +39,20 @@ fi
 
 say "boot partition: $BOOT"
 
+# --- SDR packages (optional) -------------------------------------------------
+# umik-sdr needs rtl-sdr, which Pi OS Lite does not ship and the Pi cannot
+# fetch. build/05-fetch-sdr-debs.sh pins the .debs into cache/debs/; they ride
+# along in the payload and firstrun re-checks and installs them, offline.
+# Checked HERE, before anything on the card changes, so a bad cache stops the
+# run while the card is still exactly as it was.
+SDR_DEBS="${CACHE}/debs"
+SDR=0
+if [ -f "${SDR_DEBS}/SHA256SUMS" ]; then
+    (cd "$SDR_DEBS" && shasum -a 256 -c SHA256SUMS >/dev/null) \
+        || die "cache/debs no longer matches its SHA256SUMS - re-run ./build/05-fetch-sdr-debs.sh"
+    SDR=1
+fi
+
 # --- unit identity ---------------------------------------------------------
 # Names THIS recorder (umik1, umik2, ...). umik-record stamps the name into
 # every session directory and session.json - with two units in the field it
@@ -100,6 +114,19 @@ mkdir -p "${BOOT}/umik"
 cp -R boot/payload/. "${BOOT}/umik/"
 cp boot/firstrun.sh "${BOOT}/firstrun.sh"
 chmod 0755 "${BOOT}/firstrun.sh" 2>/dev/null || true
+# Only the files SHA256SUMS names are copied: a stray .deb in the cache was
+# never checked by anything, so it never reaches the card.
+if [ "$SDR" -eq 1 ]; then
+    mkdir -p "${BOOT}/umik/debs"
+    cp "${SDR_DEBS}/SHA256SUMS" "${BOOT}/umik/debs/"
+    while read -r _ deb; do
+        cp "${SDR_DEBS}/${deb}" "${BOOT}/umik/debs/"
+    done < "${SDR_DEBS}/SHA256SUMS"
+    say "SDR packages copied ($(wc -l < "${SDR_DEBS}/SHA256SUMS" | tr -d ' ') .debs, verified); firstrun installs them"
+else
+    say "NOTE: no cache/debs/SHA256SUMS - SDR support (umik-sdr) will NOT be provisioned."
+    say "      To add it: ./build/05-fetch-sdr-debs.sh, then run this inject again."
+fi
 
 # Time-seed: the Pi steps its clock forward to this at boot (a floor, not
 # trusted time - GPS overrides it). Refreshed on every inject and by

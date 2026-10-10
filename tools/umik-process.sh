@@ -228,12 +228,15 @@ elif [ "${#NEW[@]}" -eq 0 ]; then
     say "nothing new was sealed - archive untouched"
 elif [ "$rc_s3" -eq 0 ] && [ "$rc_nas" -eq 0 ]; then
     for s in "${NEW[@]}"; do
-        for f in "$ARCHIVE/$s"/*.wav; do
+        # Mic segments and umik-sdr's IQ clips alike: both are bulk audio
+        # with verified copies off-box; seals, session.json, clips.jsonl and
+        # the scan files stay.
+        for f in "$ARCHIVE/$s"/*.wav "$ARCHIVE/$s"/*.cu8; do
             [ -f "$f" ] || continue
             rm -f "$f" && deleted=$((deleted + 1))
         done
     done
-    say "S3 and NAS both verified - deleted $deleted local audio file(s); seals kept"
+    say "S3 and NAS both verified - deleted $deleted local audio/IQ file(s); seals kept"
 else
     say "local audio KEPT: S3 leg rc=$rc_s3, NAS leg rc=$rc_nas (2 = leg not configured/mounted)"
 fi

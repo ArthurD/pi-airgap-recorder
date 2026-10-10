@@ -1,0 +1,121 @@
+[Unit]
+Description=RTL-SDR scan-and-capture recorder
+Documentation=file:/usr/local/share/doc/umik-autorecord/README.md
+# Same hard interlock as the mic: no recording unless the box is provably
+# radio-silent. The dongle only receives, so it changes nothing the check
+# asserts - it just has to pass, as it does for umik-record.
+Requires=umik-radio-check.service
+After=umik-radio-check.service local-fs.target
+# A USB drive, if present, is mounted first so recordings land on it.
+# Wants (not Requires): a missing or broken stick must never block recording.
+Wants=umik-usb-detect.service
+After=umik-usb-detect.service
+# The whole clock chain runs first, exactly as for umik-record, so the session
+# directory and every clip name carry the best time this boot can get. Wants
+# (not Requires): no GPS module, cable, RTC or seed may ever block recording.
+Wants=umik-gps-time.service umik-rtc-time.service umik-net-time.service umik-time-seed.service
+After=umik-gps-time.service umik-rtc-time.service umik-net-time.service umik-time-seed.service
+# Order after the exFAT data mount when it exists (nofail mounts are not
+# waited on by local-fs.target, so name it explicitly).
+After=data.mount
+# /data is a plain directory on the root filesystem, created by firstrun.
+ConditionPathExists=/data
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/umik-sdr
+# Everything on this box is UTC ("Z" in session.json, clip names, umik.log).
+Environment=TZ=UTC
+# Python block-buffers stdout when it is not a terminal; unbuffered, the
+# journal gets each line when it happens.
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=2
+# Back off on repeated failure: 2s doubling to 60s, as for umik-record.
+RestartSteps=8
+RestartMaxDelaySec=60
+# 78 = deliberate "storage is full" stop: not restarted, and left failed so
+# the green LED asks for service. 79 = "not my device": no dongle after
+# UMIK_SDR_WAIT_SECONDS, but a mic is attached, so this box is umik-record's.
+# Counted as success AND not restarted, so the unit ends inactive rather than
+# failed - a mic-only box neither thrash-restarts this nor shows "trouble".
+SuccessExitStatus=79
+RestartPreventExitStatus=78 79
+User=recorder
+Group=recorder
+# plugdev: librtlsdr0's udev rule gives the dongle (0bda:2838 / 0bda:2832)
+# to that group, mode 0660. audio: as for umik-record. firstrun creates
+# plugdev if the image lacks it - a group named here that does not exist
+# fails the unit before it starts.
+SupplementaryGroups=audio plugdev
+# umik-sdr traps SIGTERM, stops its own rtl_sdr / rtl_power child and closes
+# the session; mixed = only it gets the SIGTERM, and anything it leaves
+# running is SIGKILLed when the stop times out. The most a stop can cost is
+# the clip in flight, left as a .part that everything ignores.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+# No Nice= and no I/O class, unlike umik-record: when both recorders run, the
+# mic keeps the scheduling edge. rtl_sdr's own USB buffering (~2s at the
+# widest rate) rides out the contention.
+
+# --- sandboxing -------------------------------------------------------------
+# umik-record's confinement, with each deviation explained where it occurs.
+# The recorder still has no network: PrivateNetwork gives it a namespace
+# holding nothing but lo.
+PrivateNetwork=yes
+# AF_NETLINK, unlike umik-record. librtlsdr reaches the dongle through libusb,
+# and libusb refuses to initialise at all unless it can open a udev netlink
+# monitor for hotplug events (libusb 1.0.28, linux_usbfs.c op_init); with
+# AF_UNIX alone every rtl_* tool reports "No supported devices found". The
+# socket lives in the private namespace above, which has no interface but lo
+# and receives no kernel device events, and IPAddressDeny still drops all IP.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+ReadWritePaths=/data
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# NOTE: ProcSubset=pid must NOT be used here either: it hides /proc/asound,
+# where the "not my device" check looks for a mic.
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+
+# No capabilities at all: there is no negative nice to grant (see above).
+CapabilityBoundingSet=
+
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Only USB device nodes are reachable. libusb opens the dongle as
+# /dev/bus/usb/BBB/DDD, character major 189, which /proc/devices lists as
+# "usb_device"; systemd resolves "char-<name>" through /proc/devices, the
+# same way umik-record's char-alsa becomes ALSA's major 116. A path cannot do
+# this job: systemd rejects a directory such as /dev/bus/usb as "not a
+# device", and a node path is resolved once, at start, while the dongle's
+# node number changes every time it enumerates. The group spans every USB
+# device node; what narrows it to the dongle is file permission. usbfs only
+# accepts transfers on a node opened for writing, and only the dongle's node
+# is writable by plugdev (librtlsdr0's udev rule) - every other one stays
+# writable by root alone.
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+
+[Install]
+WantedBy=multi-user.target

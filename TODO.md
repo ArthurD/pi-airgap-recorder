@@ -61,6 +61,39 @@ copy, the Mac keeps only seals and metadata, the stick is a courier.
       three sticks (`TESLADRIVE` 256 GB, `UMIK2`, `UMIK3` 128 GB exFAT, added
       2026-10-07) between the two units.
 
+## RTL-SDR (umik-sdr): first boot with the dongle
+
+Nothing below has run on a Pi yet. Build with `./build/05-fetch-sdr-debs.sh`,
+inject, and boot with the NESDR SMArt v5 attached; the answers are in
+`umik-firstrun.log`, `logs/diag-latest.log` (`--- sdr ---`) and `umik.log`.
+
+- [ ] **Provisioning.** The firstrun SDR step shows three checksum `OK`s,
+      `libusb-1.0-0 2:1.0.28-1 already installed ... skipped`, one `dpkg -i`
+      of librtlsdr0 + rtl-sdr, and `SDR support ready`.
+- [ ] **USB ID and strings.** Expect `0bda:2838`, product `RTL2838UHIDIR`,
+      manufacturer `Realtek` in `lsusb` and in `session.json`'s `device`. A
+      different ID has to go into umik-record's exit-79 check, umik-sdr's
+      device match, and the udev rule.
+- [ ] **The plugdev rule took.** The dongle's node reads `crw-rw---- root
+      plugdev`, `id recorder` lists `plugdev`, and umik-sdr opens the dongle
+      from inside its sandbox: no `usb_open error`, `usb_claim_interface
+      error` or `No supported devices found`. This is also the first real test
+      of `DeviceAllow=char-usb_device` and `AF_NETLINK` in the unit.
+- [ ] **DVB modules absent.** The `lsmod` line in `--- sdr ---` shows none of
+      `dvb_usb_rtl28xxu rtl2832 rtl2830 rtl2832_sdr r820t`, and there is no
+      `/dev/dvb`.
+- [ ] **Gain vs the strong local FM station.** At the fixed 25.4 dB, check the
+      FM-band clips for clipping (cu8 bytes piling up at 0 and 255) and the
+      main scan for that station's images elsewhere in the band. If either
+      shows, lower `UMIK_SDR_GAIN` and write down the value.
+- [ ] **Green LED with the SDR alone.** Solid through the first scan, then
+      blipping; confirm it does not drop back to solid between passes (the
+      6-minute freshness window vs a real pass pause plus scan on the Pi).
+- [ ] **Mic-only units unchanged.** After re-injecting unit 1 and unit 2 with
+      this payload: umik-sdr logs its one "not my device" line and stays
+      inactive (not failed), green blips as before, `systemctl --failed` is
+      empty.
+
 ## Housekeeping
 
 - [ ] The `admin` AWS profile is a browser login session that expires; every
