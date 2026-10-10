@@ -47,15 +47,17 @@ umik_hex_to_b64() { # <hex>
 
 # Content types are set at PUT time because, under write-once, there is no
 # second chance to fix them: a metadata correction is an overwrite. The SDR
-# rows are umik-sdr's session files: raw IQ clips (.cu8), the per-clip log
-# (clips.jsonl), and the gzipped rtl_power scans (.csv.gz).
+# rows are umik-sdr's session files: SigMF clip pairs (raw IQ in .sigmf-data,
+# the JSON that describes it in .sigmf-meta), the per-clip log (clips.jsonl),
+# and the gzipped rtl_power scans (.csv.gz).
 umik_content_type() { # <path-or-key>
     case "$1" in
         *.wav)                echo audio/x-wav ;;
         *SHA256SUMS|*.log|*.head) echo text/plain ;;
         *.jsonl)              echo application/x-ndjson ;;
         *.json)               echo application/json ;;
-        *.cu8)                echo application/octet-stream ;;
+        *.sigmf-data)         echo application/octet-stream ;;
+        *.sigmf-meta)         echo application/json ;;
         *.csv.gz)             echo application/gzip ;;
         *.csv)                echo text/csv ;;
         *)                    echo binary/octet-stream ;;

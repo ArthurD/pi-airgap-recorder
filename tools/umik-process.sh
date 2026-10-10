@@ -228,10 +228,11 @@ elif [ "${#NEW[@]}" -eq 0 ]; then
     say "nothing new was sealed - archive untouched"
 elif [ "$rc_s3" -eq 0 ] && [ "$rc_nas" -eq 0 ]; then
     for s in "${NEW[@]}"; do
-        # Mic segments and umik-sdr's IQ clips alike: both are bulk audio
-        # with verified copies off-box; seals, session.json, clips.jsonl and
-        # the scan files stay.
-        for f in "$ARCHIVE/$s"/*.wav "$ARCHIVE/$s"/*.cu8; do
+        # Mic segments and umik-sdr's raw IQ (the .sigmf-data half of each
+        # clip) alike: both are bulk data with verified copies off-box; seals,
+        # session.json, clips.jsonl, each clip's .sigmf-meta and the scan
+        # files stay.
+        for f in "$ARCHIVE/$s"/*.wav "$ARCHIVE/$s"/*.sigmf-data; do
             [ -f "$f" ] || continue
             rm -f "$f" && deleted=$((deleted + 1))
         done

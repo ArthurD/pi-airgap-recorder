@@ -262,13 +262,16 @@ signal:
 
 | Channel | IQ rate | Rate | 15 s clip |
 |---|---|---|---|
-| most | 250 kS/s | 500 KB/s | **7.5 MB** |
-| FM broadcast, or anything over 100 kHz wide | 1.024 MS/s | 2 MB/s | **30 MB** |
+| everything outside the FM band | 250 kS/s | 500 KB/s | **7.5 MB** |
+| FM broadcast (87.5–108 MHz) | 1.024 MS/s | 2 MB/s | **30 MB** |
 
-With ~100 channels a pass that comes to roughly **20–30 GB a night**, or 2–3
-GB an hour; the number of FM stations in range moves it most, since each one
-is a 30 MB clip. A 128 GB stick is about two days of continuous running.
-Below 512 MB free it stops cleanly, like the mic.
+Only the FM band gets the wide rate: a station spreads over ±100 kHz, while a
+1 MHz slice of a 6 MHz TV channel or an LTE block buys nothing. With ~25 FM
+channels and ~45 others a pass (a pass takes ~25 minutes), that comes to about
+1.1 GB a pass, ~2.7 GB an hour, or **~27 GB a 10-hour night**; the number of
+FM stations in range moves it most, since each one is a 30 MB clip. A 128 GB
+stick holds 4–5 nights, a 256 GB one about 9. Below 512 MB free it stops
+cleanly, like the mic.
 
 **Sessions** sit beside the mic's, with their own counter
 (`.sdr-session-counter`):
@@ -276,26 +279,40 @@ Below 512 MB free it stops cleanly, like the mic.
 ```
 /data/usb/recordings/
   umik1-sdr_000003_20261010T230000Z/
-    session.json                       unit, clock trust, dongle, every scan and capture setting
-    scan-p0001-main.csv.gz             pass 1's raw rtl_power sweep, gzipped (also -fm, -uhf)
-    scan-p0001.json                    pass 1: every detection, and the channel plan
-    clip-20261010-231502-104100k.cu8   ~15 s of raw IQ at 104.1 MHz
-    clips.jsonl                        one line per clip: frequency, rate, SNR, kind, band
+    session.json                              unit, clock trust, dongle, every scan and capture setting
+    scan-p0001-main.csv.gz                    pass 1's raw rtl_power sweep, gzipped (also -fm, -uhf)
+    scan-p0001.json                           pass 1: every detection, and the channel plan
+    clip-20261010-231502-104100k.sigmf-data   ~15 s of raw IQ at 104.1 MHz
+    clip-20261010-231502-104100k.sigmf-meta   what that IQ is (SigMF metadata, JSON)
+    clips.jsonl                               one line per clip: frequency, rate, SNR, kind, band
 ```
 
-Everything is flat in the session directory, because `umik download` seals
-top-level files only. Each clip is written as `.part` and renamed once it is
-complete, so pulling the plug costs at most the clip in flight. That leftover
-`.part` is not a recording: it is never sealed, `umik download` says how many
-it left on the stick, and `umik-sdr` deletes it the next time it starts.
+Each clip is a [SigMF](https://sigmf.org) recording, two files with one name.
+The `.sigmf-data` is the IQ exactly as `rtl_sdr` wrote it; the `.sigmf-meta`
+says what it is: sample rate, tuned frequency, start and end times, clock
+trust, the scan's evidence for the channel, and a SHA-512 of the data.
 
-**Reading a clip.** `.cu8` is `rtl_sdr`'s native format, with no header:
-unsigned 8-bit I, then Q, and sample = (byte − 127.5) / 127.5. The dongle is
+Everything is flat in the session directory, because `umik download` seals
+top-level files only. Each clip's data is written as `.part` and renamed once
+it is complete, then its meta the same way, so pulling the plug costs at most
+the clip in flight. That leftover `.part` is not a recording: it is never
+sealed, `umik download` says how many it left on the stick, and `umik-sdr`
+deletes it the next time it starts, along with any `.sigmf-data` whose
+`.sigmf-meta` never landed (the plug pulled in the moment between the two
+renames; without its meta the IQ is unreadable).
+
+**Reading a clip.** A clip is a standard SigMF recording, so any SigMF-aware
+tool opens it as it is; the `.sigmf-meta` carries everything needed to read
+it. The data is `rtl_sdr`'s native `cu8`, untouched: unsigned 8-bit I, then
+Q, and sample = (byte − 127.5) / 127.5. The meta has the sample rate, the
+tuned centre (`core:frequency`), the start time to the millisecond, and a
+SHA-512 of the data, and under `umik:` the target, the offset, the clock
+trust, the scan's evidence, and `started_mono` (seconds since boot), which
+spaces clips exactly even when the wall clock is not trusted. The dongle is
 tuned a quarter of the IQ rate above the target to keep its DC spike off it,
-so the target sits at −`offset_hz` in the clip. `clips.jsonl` carries
-`freq_hz`, `center_hz`, `offset_hz` and `iq_rate` for every clip, plus
-`started_mono` (seconds since boot), which spaces clips exactly even when the
-wall clock is not trusted.
+so the target sits at −`umik:offset_hz` in the clip, where an annotation
+marks the channel's measured width. `clips.jsonl` indexes the same clips, one
+line each.
 
 **Two recorders, one box.** Both are installed on every card, and each waits
 for its own device (the mic for 60 s, the dongle for 30 s):
@@ -360,7 +377,7 @@ is idle, not trouble.
 | `UMIK_SDR_DWELL` / `UMIK_SDR_JITTER` | `15` s / `0.3`: each clip is dwell × U(0.7, 1.3) |
 | `UMIK_SDR_GAP_MAX` / `UMIK_SDR_PASS_PAUSE_MAX` | `5` / `180` s of random idle, between channels / between passes |
 | `UMIK_SDR_REMEMBER_PASSES` / `UMIK_SDR_REMEMBER_ONCE` | `8` / `2` passes a channel stays after it was last seen (seen in ≥2 scans / in one) |
-| `UMIK_SDR_IQ_RATE` / `UMIK_SDR_IQ_RATE_WIDE` | `250000` / `1024000` samples/s (narrow / FM and wide channels) |
+| `UMIK_SDR_IQ_RATE` / `UMIK_SDR_IQ_RATE_WIDE` | `250000` / `1024000` samples/s (every channel outside the FM band / FM-band channels) |
 | `UMIK_SDR_MAX_CHANNELS` | `120` per pass, strongest kept |
 | `UMIK_SDR_CROP` | `0` (rtl_power `-c` percent, discarding each hop's rolled-off edges). Off by default: the recorder measures the hop-edge roll-off in every sweep and removes it instead; set 20 if a real spectrum proves that wrong |
 | `UMIK_SDR_WAIT_SECONDS` | `30`, the wait for the dongle to enumerate |

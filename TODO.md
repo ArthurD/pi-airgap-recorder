@@ -86,6 +86,9 @@ inject, and boot with the NESDR SMArt v5 attached; the answers are in
       FM-band clips for clipping (cu8 bytes piling up at 0 and 255) and the
       main scan for that station's images elsewhere in the band. If either
       shows, lower `UMIK_SDR_GAIN` and write down the value.
+- [ ] **A real clip is valid SigMF.** Confirm a real clip's `.sigmf-meta`
+      validates against the SigMF schema (python sigmf package on the Mac:
+      `pip install sigmf`, `sigmf.sigmffile.fromfile(...)`).
 - [ ] **Green LED with the SDR alone.** Solid through the first scan, then
       blipping; confirm it does not drop back to solid between passes (the
       6-minute freshness window vs a real pass pause plus scan on the Pi).

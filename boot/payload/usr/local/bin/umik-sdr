@@ -17,15 +17,24 @@
 #   * IQ, not audio. Demodulating in the field means guessing what the
 #     transmitter is (AM? NBFM? data?) and throwing every other answer away.
 #     Raw IQ keeps them all, at 2 bytes per sample ("cu8", rtl_sdr's own
-#     format). The price is disk: ~31 MB per 15 s clip at the wide rate.
+#     format). The price is disk: ~31 MB per 15 s clip at the wide rate,
+#     which only the FM band gets (iq_rate_for).
+#   * Every clip is a SigMF recording (sigmf.org, v1.0.0): the bytes exactly
+#     as rtl_sdr wrote them in <base>.sigmf-data, and <base>.sigmf-meta
+#     beside them saying what they are - rate, tuned centre, target, times,
+#     clock trust, the scan's evidence, a SHA-512 of the data. Any
+#     SigMF-aware tool opens a clip with no help from us.
 #   * Offset tuning. An RTL dongle has a spur at the exact centre of whatever
 #     it is tuned to, so we tune iq_rate/4 above the target; the target sits
 #     at baseband -iq_rate/4, well clear of it.
 #   * Everything in the session directory is flat and either complete or a
-#     *.part. A clip is written as .part, its length checked against what we
-#     asked for, fsynced, renamed, and only then logged in clips.jsonl
-#     (appended and fsynced). Pull the power at any moment and the most you
-#     lose is the clip in flight; ingest ignores *.part.
+#     *.part. A clip's data is written as .part, its length checked against
+#     what we asked for, fsynced and renamed; then its meta, hashed from the
+#     data on disk, goes the same way (.part, fsync, rename); only then is
+#     the clip logged in clips.jsonl (appended and fsynced). Pull the power
+#     at any moment and the most you lose is the clip in flight: ingest
+#     ignores *.part, and a .sigmf-data whose .sigmf-meta never landed is
+#     deleted at the next start, like the .part files.
 #   * One rtl_power run per sweep. rtl_power averages every sweep that fits
 #     into an integration interval into one row per hop, and we need the
 #     sweeps apart to tell an always-on carrier from a burst (occupancy).
@@ -61,6 +70,7 @@ import bisect
 import errno
 import glob
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -119,6 +129,9 @@ HELP_NOTES = {
                "12/17, 13 and 5 (phones transmitting)",
     "gain": "tuner gain in dB, or auto",
     "crop": "rtl_power -c, percent of each hop's edges discarded",
+    "iq-rate": "IQ samples/s for every channel outside the FM band",
+    "iq-rate-wide": "IQ samples/s for channels in the FM band (87.5-108 MHz) only; every "
+                    "other channel, however wide, gets --iq-rate",
     "mic-vid": "USB vendor IDs that count as umik-record's microphone (exit 79)",
 }
 
@@ -209,7 +222,6 @@ MEMORY_KHZ = 75.0         # rotation-memory radius outside the FM band (1.5 x 50
 KIND_CLUSTER_KHZ = {"cellular": 5000.0, "wifi": 11000.0}
 TV_CLUSTER_KHZ = 3000.0   # 'broadcast' above 400 MHz = UHF TV
 CONTINUOUS = 0.95         # occupancy that counts as always on
-WIDE_KHZ = 100.0          # wider than this -> UMIK_SDR_IQ_RATE_WIDE
 WIDTH_DB = 6.0            # a signal's width is measured this far below its peak
 DC_MASK_HZ = 10000.0      # masked either side of every hop centre (at least 1 bin)
 # Local floor = rolling median over ~2 MHz, but never more than 3 dB above the
@@ -226,6 +238,9 @@ MEMORY_MAX = 5000         # rotation memory entries kept; the stalest go first
 TICK = 0.5                # seconds between stop/heartbeat checks while waiting
 POWER_RETRIES = 3         # an rtl_power sweep is tried 1 + this many times
 SDR_FAIL_LIMIT = 5        # consecutive failed captures before systemd gets us
+# A clip is a SigMF recording: two files sharing one base name (clip_base).
+DATA_EXT, META_EXT = ".sigmf-data", ".sigmf-meta"
+SIGMF_VERSION = "1.0.0"
 
 STOP = 0                  # the signal that asked us to stop, once one has
 LOG_FILE = None           # <medium>/logs/umik.log, once the data dir is known
@@ -265,6 +280,15 @@ def mono():
 
 def utc_stamp(t=None):
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(t))
+
+
+def iso_ms(t):
+    """ISO 8601 UTC to the millisecond, SigMF's core:datetime. Always on the
+    same second as utc_stamp(t) and the clip's name: a fraction that would
+    round up into the next second stops at .999 instead."""
+    s = math.floor(t)
+    return "%s.%03dZ" % (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(s)),
+                         min(999, int(round((t - s) * 1000))))
 
 
 def log(msg):
@@ -341,6 +365,15 @@ def append_jsonl(path, obj):
         os.fsync(fh.fileno())
 
 
+def sha512_file(path):
+    """SigMF's core:sha512, streamed: a 30 MB clip never sits in memory."""
+    h = hashlib.sha512()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1048576), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def free_mb(path):
     """Available MB as `df -Pm` reports them (MiB), like umik-record."""
     st = os.statvfs(path)
@@ -362,7 +395,8 @@ def build_parser():
     ap = argparse.ArgumentParser(
         prog="umik-sdr",
         description="RTL-SDR scan-and-capture recorder for pi-airgap-recorder. "
-                    "Scans with rtl_power, captures raw IQ (cu8) with rtl_sdr, forever. "
+                    "Scans with rtl_power, captures raw IQ with rtl_sdr as SigMF recordings "
+                    "(cu8), forever. "
                     "Every tunable is an environment variable (for systemd) and a flag "
                     "(for a terminal); a flag beats the variable.",
         epilog="On a Mac: umik-sdr --data-dir /tmp/sdr --unit dev --trust-clock --passes 1 "
@@ -771,20 +805,33 @@ def clock_ladder(trust_host):
     return trusted, source, {"gps": gps, "net": net, "rtc": rtc, "time_seed": seed}
 
 
-def remove_stale_parts(data_dir):
+def remove_leftovers(data_dir):
     """Pulling the power is how this box normally stops, so nearly every
-    earlier session ends with a clip-*.cu8.part. Nothing downstream seals or
-    prunes them (ingest skips *.part); the recorder owns its scratch, so it
-    clears it before the next session starts. SDR sessions only - the mic's
-    directories are not ours to touch."""
-    n = 0
-    for path in glob.glob(os.path.join(glob.escape(data_dir), "*-sdr_*", "*.part")):
+    earlier session ends with a clip-*.sigmf-data.part, and now and then
+    with a .sigmf-data whose .sigmf-meta never landed (the cut fell between
+    the two renames). Neither is a recording: nothing downstream seals or
+    prunes a .part (ingest skips them), and data without its meta has no
+    rate and no tuned centre - the Mac finds clips by their .sigmf-meta.
+    The recorder owns its scratch, so it clears both before the next
+    session starts; the .part files first, so a meta still in its .part
+    orphans its data too. SDR sessions only - the mic's directories are not
+    ours to touch. -> (.part files, orphaned .sigmf-data files)"""
+    parts = orphans = 0
+    top = os.path.join(glob.escape(data_dir), "*-sdr_*")
+    for path in glob.glob(os.path.join(top, "*.part")):
         try:
             os.remove(path)
-            n += 1
+            parts += 1
         except OSError:
             pass
-    return n
+    for path in glob.glob(os.path.join(top, "*" + DATA_EXT)):
+        if not os.path.exists(path[:-len(DATA_EXT)] + META_EXT):
+            try:
+                os.remove(path)
+                orphans += 1
+            except OSError:
+                pass
+    return parts, orphans
 
 
 def next_session(data_dir):
@@ -1241,7 +1288,26 @@ class Rotation:
 
 
 def iq_rate_for(ch, rate, rate_wide):
-    return rate_wide if in_fm(ch["freq_hz"]) or ch["width_khz"] > WIDE_KHZ else rate
+    """UMIK_SDR_IQ_RATE_WIDE is for the FM band and nothing else: a station
+    spreads over +-100 kHz around its carrier, more than the narrow rate's
+    clean +-62.5 kHz around the target. TV, LTE and every other channel get
+    UMIK_SDR_IQ_RATE however wide they measured: a 1 MHz slice of a 6 MHz
+    TV channel buys nothing, and a carrier parked at a block's edge is
+    within +-62.5 kHz of the detected peak anyway."""
+    return rate_wide if in_fm(ch["freq_hz"]) else rate
+
+
+def pass_plan(rotation, kept, p, cfg, rng):
+    """One pass's listen plan: the rotation memory updated with what this
+    pass's scans kept, capped (strongest first), shuffled, and each channel
+    given its IQ rate and its place in the order."""
+    rotation.update(kept, p)
+    plan = rotation.plan(p, cfg.max_channels)
+    rng.shuffle(plan)
+    for i, ch in enumerate(plan, 1):
+        ch["iq_rate"] = iq_rate_for(ch, cfg.iq_rate, cfg.iq_rate_wide)
+        ch["index"] = i
+    return plan
 
 
 def capture_samples(dwell_s, rate):
@@ -1255,9 +1321,90 @@ def capture_samples(dwell_s, rate):
     return n
 
 
-def clip_name(t, freq_hz):
-    return "clip-%s-%dk.cu8" % (time.strftime("%Y%m%d-%H%M%S", time.gmtime(t)),
-                                int(round(freq_hz / 1000.0)))
+def clip_base(t, freq_hz):
+    """The name both files of a clip share: UTC at the start, to the second,
+    and the target in whole kHz. clip-20261010-231502-104100k, then
+    .sigmf-data and .sigmf-meta."""
+    return "clip-%s-%dk" % (time.strftime("%Y%m%d-%H%M%S", time.gmtime(t)),
+                            int(round(freq_hz / 1000.0)))
+
+
+def hw_text(device, fake=False):
+    """core:hw: the dongle as session.json's device names it."""
+    d = device
+    s = "%s %s %s %s serial %s" % (d["sdr"], d["usb_id"], d["manufacturer"], d["product"], d["serial"])
+    if d.get("tuner"):
+        s += ", tuner " + d["tuner"]
+    return "FAKE (umik-sdr --fake, no hardware): " + s if fake else s
+
+
+def sigmf_meta(clip, t, sha512, sess):
+    """One clip's .sigmf-meta (SigMF 1.0.0), keys in the contract's order.
+    clip is its clips.jsonl line; t the time.time() it started, taken just
+    before rtl_sdr runs (the first sample lands once rtl_sdr has opened and
+    tuned the dongle); sha512 the data file's; sess what the session knows:
+    unit, session, boot_id, time_source, ppm, hw, software, fake.
+    core:frequency is the TUNED centre, as SigMF defines it; the target is
+    umik:target_hz, offset_hz below it, at baseband -offset_hz. The ends are
+    start + samples / rate. The annotation spans the channel's width as the
+    scan measured it, so for a wide one it reaches past the capture."""
+    rate, n = clip["iq_rate"], clip["samples"]
+    f, center = clip["freq_hz"], clip["center_hz"]
+    t_end = t + n / float(rate)
+    started_iso = iso_ms(t)
+    g = {
+        "core:datatype": "cu8",
+        "core:sample_rate": float(rate),
+        "core:version": SIGMF_VERSION,
+        "core:num_channels": 1,
+        "core:sha512": sha512,
+        # No core:dataset: SigMF reserves it for non-conforming datasets, and a
+        # pair is found by its shared base name. With it, the sigmf package
+        # warns on every load and refuses a renamed pair.
+        "core:recorder": "umik-sdr %s (pi-airgap-recorder), rtl_sdr %s" % (
+            sess["software"]["umik_sdr"], sess["software"]["rtl_sdr"]),
+        "core:hw": sess["hw"],
+        "core:description": "%.1f s of raw IQ around %.4f MHz (%s), captured %s by unit %s, "
+                            "clock %s (%s)" % (
+                                clip["duration_s"], f / 1e6, clip["band"],
+                                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)), sess["unit"],
+                                "trusted" if clip["clock_trusted"] else "not trusted",
+                                sess["time_source"]),
+        "core:extensions": [{"name": "umik", "version": "1.0.0", "optional": True}],
+        "umik:unit": sess["unit"], "umik:session": sess["session"], "umik:recorder": "sdr",
+        "umik:boot_id": sess["boot_id"],
+        "umik:clock_trusted": clip["clock_trusted"], "umik:time_source": sess["time_source"],
+        "umik:started_utc": utc_stamp(t), "umik:ended_utc": utc_stamp(t_end),
+        "umik:started_iso": started_iso, "umik:ended_iso": iso_ms(t_end),
+        "umik:started_mono": clip["started_mono"], "umik:duration_s": clip["duration_s"],
+        "umik:samples": n, "umik:bytes": clip["bytes"],
+        "umik:target_hz": f, "umik:center_hz": center, "umik:offset_hz": clip["offset_hz"],
+        "umik:captured_lower_hz": fmt_num(center - rate / 2.0),
+        "umik:captured_upper_hz": fmt_num(center + rate / 2.0),
+        "umik:gain_db": clip["gain_db"], "umik:ppm": sess["ppm"],
+        "umik:pass": clip["pass"], "umik:index": clip["index"],
+    }
+    for key in ("snr_db", "peak_db", "floor_db", "width_khz", "occupancy", "kind", "band",
+                "seen_scans", "last_seen_pass", "scan", "source"):
+        g["umik:" + key] = clip[key]
+    g["umik:software"] = dict(sess["software"])
+    if sess.get("fake"):
+        g["umik:fake"] = True
+    half_hz = clip["width_khz"] * 500.0
+    return {
+        "global": g,
+        "captures": [{"core:sample_start": 0, "core:frequency": float(center),
+                      "core:datetime": started_iso}],
+        "annotations": [{
+            "core:sample_start": 0, "core:sample_count": n,
+            "core:freq_lower_edge": float(round(f - half_hz)),
+            "core:freq_upper_edge": float(round(f + half_hz)),
+            "core:label": "%.4f MHz %s" % (f / 1e6, clip["band"]),
+            "core:generator": "umik-sdr %s" % sess["software"]["umik_sdr"],
+            "core:comment": "target channel: scan snr %.1f dB, width %.1f kHz, occupancy %s" % (
+                clip["snr_db"], clip["width_khz"], clip["occupancy"]),
+        }],
+    }
 
 
 # --- --fake: no hardware ----------------------------------------------------------------
@@ -1349,6 +1496,7 @@ class Recorder:
         self.device = None
         self.sdir = None
         self.session = None
+        self.sess_meta = None       # what every clip's .sigmf-meta takes from the session
         self.parts = set()          # in-flight files to discard if we are stopped
         self.fails = 0              # consecutive failed captures
         self.clips_ok = self.clips_failed = 0
@@ -1514,9 +1662,10 @@ class Recorder:
             os.makedirs(self.data_dir, exist_ok=True)
         except OSError as e:
             raise Exit(1, "FATAL: cannot create %s: %s" % (self.data_dir, e))
-        stale = remove_stale_parts(self.data_dir)
-        if stale:
-            applog("removed %d stale .part file(s) from earlier sessions" % stale)
+        parts, orphans = remove_leftovers(self.data_dir)
+        if parts or orphans:
+            applog("removed %d stale .part file(s) and %d .sigmf-data file(s) with no .sigmf-meta "
+                   "from earlier sessions" % (parts, orphans))
         self.ensure_space()
         unit = unit_name(args.unit)
         trusted, source, states = clock_ladder(args.trust_clock)
@@ -1527,6 +1676,10 @@ class Recorder:
         self.sdir = os.path.join(self.data_dir, "%s-sdr_%s_%s" % (unit, self.session, wall))
         os.makedirs(self.sdir, exist_ok=True)
         self.clips_path = os.path.join(self.sdir, "clips.jsonl")
+        self.sess_meta = {"unit": unit, "session": os.path.basename(self.sdir), "boot_id": BOOT_ID,
+                          "time_source": source, "ppm": cfg.ppm, "hw": hw_text(self.device, self.fake),
+                          "software": {"umik_sdr": VERSION, "rtl_sdr": self.rtl_ver},
+                          "fake": self.fake}
         device = {k: v for k, v in self.device.items() if not k.startswith("_")}
         doc = {
             "session": self.session, "unit": unit, "recorder": "sdr",
@@ -1587,12 +1740,7 @@ class Recorder:
         self.ensure_space()
         meta, signals = self.scan_pass(p)
         kept = select_signals(signals, cfg.thr_burst, cfg.exclude)
-        self.rotation.update(kept, p)
-        plan = self.rotation.plan(p, cfg.max_channels)
-        self.rng.shuffle(plan)
-        for i, ch in enumerate(plan, 1):
-            ch["iq_rate"] = iq_rate_for(ch, cfg.iq_rate, cfg.iq_rate_wide)
-            ch["index"] = i
+        plan = pass_plan(self.rotation, kept, p, cfg, self.rng)
         write_json(os.path.join(self.sdir, "scan-p%04d.json" % p), {
             "pass": p, "started_utc": started_utc, "started_mono": round(started_mono, 1),
             "scans": meta, "signals": sorted(signals, key=lambda x: x["freq_hz"]),
@@ -1757,14 +1905,16 @@ class Recorder:
         # backwards mid-session must not overwrite an earlier clip.
         for _ in range(5):
             t = time.time()
-            name = clip_name(t, f)
-            final = os.path.join(self.sdir, name)
-            if not os.path.exists(final) and not os.path.exists(final + ".part"):
+            base = clip_base(t, f)
+            data = os.path.join(self.sdir, base + DATA_EXT)
+            meta = os.path.join(self.sdir, base + META_EXT)
+            if not any(os.path.exists(x) for x in (data, data + ".part", meta, meta + ".part")):
                 break
             self.idle(1.01 - t % 1.0)
-        part = final + ".part"
+        part = data + ".part"
         self.phase = "pass %d: clip %d/%d, %.4f MHz for %.1fs" % (p, ch["index"], n_plan, f / 1e6, n / float(rate))
-        line = {"file": name, "freq_hz": f, "center_hz": center, "offset_hz": offset, "iq_rate": rate,
+        line = {"file": base + DATA_EXT, "meta": base + META_EXT,
+                "freq_hz": f, "center_hz": center, "offset_hz": offset, "iq_rate": rate,
                 "format": "cu8", "gain_db": fmt_num(cfg.gain), "started_utc": utc_stamp(t),
                 "started_mono": round(mono(), 3), "clock_trusted": self.trusted,
                 "duration_s": round(n / float(rate), 3), "samples": n, "bytes": nbytes,
@@ -1795,7 +1945,7 @@ class Recorder:
             except OSError:
                 pass
             self.parts.discard(part)
-            line.update(file=None, bytes=size, ok=False, error=problem)
+            line.update(file=None, meta=None, bytes=size, ok=False, error=problem)
             append_jsonl(self.clips_path, line)
             self.fails += 1
             self.clips_failed += 1
@@ -1806,12 +1956,18 @@ class Recorder:
                     self.fails, problem, rtl_hint(problem)))
             return
         fsync_path(part)
-        os.replace(part, final)
+        os.replace(part, data)
         self.parts.discard(part)
+        # Until its meta lands the data is still in flight: if anything fails
+        # before then it goes now, with the meta's .part, rather than wait for
+        # the next start to find it orphaned.
+        self.parts.update((data, meta + ".part"))
         fsync_path(self.sdir)
+        write_json(meta, sigmf_meta(line, t, sha512_file(data), self.sess_meta))
+        self.parts.difference_update((data, meta + ".part"))
         line["ok"] = True
         append_jsonl(self.clips_path, line)
-        self.bytes += size
+        self.bytes += size + os.path.getsize(meta)
         self.fails = 0
         self.clips_ok += 1
 
@@ -1836,7 +1992,7 @@ class Recorder:
         return ""
 
     def stopped(self):
-        had = [x for x in self.parts if x.endswith(".cu8.part")]
+        had = [x for x in self.parts if os.path.basename(x).startswith("clip-")]
         self.discard_parts()
         if had:
             applog("stopping - discarded the clip in flight")

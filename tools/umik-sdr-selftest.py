@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 umik-sdr-selftest.py - offline checks for the RTL-SDR recorder's scan parser,
-detector and channel picker (boot/payload/usr/local/bin/umik-sdr).
+detector, channel picker and SigMF clip files (boot/payload/usr/local/bin/umik-sdr).
 
     python3 tools/umik-sdr-selftest.py        # add -v for each test's name
 
@@ -11,10 +11,12 @@ uses the same generator), so rows, bins, duplicated last values, the DC fix
 and shifted sweeps look like the real tool's output.
 """
 import calendar
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -30,6 +32,39 @@ U = importlib.util.module_from_spec(importlib.util.spec_from_loader("umik_sdr", 
 _loader.exec_module(U)
 
 NO_EXCLUDE = []
+
+# The contract's .sigmf-meta global keys, in its order; --fake adds umik:fake after them.
+META_GLOBAL_KEYS = [
+    "core:datatype", "core:sample_rate", "core:version", "core:num_channels", "core:sha512",
+    "core:recorder", "core:hw", "core:description", "core:extensions",
+    "umik:unit", "umik:session", "umik:recorder", "umik:boot_id", "umik:clock_trusted",
+    "umik:time_source", "umik:started_utc", "umik:ended_utc", "umik:started_iso", "umik:ended_iso",
+    "umik:started_mono", "umik:duration_s", "umik:samples", "umik:bytes", "umik:target_hz",
+    "umik:center_hz", "umik:offset_hz", "umik:captured_lower_hz", "umik:captured_upper_hz",
+    "umik:gain_db", "umik:ppm", "umik:pass", "umik:index", "umik:snr_db", "umik:peak_db",
+    "umik:floor_db", "umik:width_khz", "umik:occupancy", "umik:kind", "umik:band",
+    "umik:seen_scans", "umik:last_seen_pass", "umik:scan", "umik:source", "umik:software"]
+
+
+def config(argv=(), env=None):
+    """umik-sdr's typed settings from flags and environment, as main() builds them."""
+    args = U.build_parser().parse_args(list(argv))
+    return U.make_config(U.raw_settings(args, env or {}), args)
+
+
+def read_json(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def read_jsonl(path):
+    with open(path) as fh:
+        return [json.loads(l) for l in fh]
+
+
+def iso_seconds(s):
+    """'2026-10-10T23:15:02.417Z' -> seconds since the epoch."""
+    return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) + int(s[20:23]) / 1000.0
 
 
 def scan(emitters, start, stop, bin_khz, sweeps=3, alternate=True, mask_hz=None,
@@ -184,7 +219,7 @@ class Detection(unittest.TestCase):
         self.assertTrue(739e6 <= c["freq_hz"] <= 749e6, c)
         self.assertEqual(c["kind"], "cellular")
         self.assertGreater(c["width_khz"], 5000)
-        self.assertEqual(U.iq_rate_for(c, 250000, 1024000), 1024000)
+        self.assertEqual(U.iq_rate_for(c, 250000, 1024000), 250000)      # wide, but not FM
 
     def test_uhf_tv_channel_is_one_channel(self):
         sigs = scan([(506.0, 6000.0, 22.0, None, None), (503.31, 3.0, 30.0, None, None)], 490, 520, 50)
@@ -248,6 +283,30 @@ class Rotation(unittest.TestCase):
         self.assertEqual(sorted(c["snr_db"] for c in r.plan(1, 2)), [16.0, 17.0])
 
 
+class Pass(unittest.TestCase):
+    def test_wide_rate_goes_to_the_fm_channel_only(self):
+        # One pass's scans find an FM station and a flat 6 MHz UHF TV channel (no pilot to
+        # narrow its measured width). The TV channel measures ~6 MHz wide - under the old
+        # "wider than 100 kHz" rule it took the wide rate too; now only the FM one does.
+        station = [(104.1 + d, 30.0, db, None, None) for d, db in ((-0.06, 26.0), (0.0, 38.0), (0.07, 29.0))]
+        tv = [(539.0, 6000.0, 20.0, None, None)]
+        cfg = config()
+        sigs = scan(station, 87.5, 108, 10) + scan(tv, 520, 560, 50)
+        kept = U.select_signals(sigs, cfg.thr_burst, cfg.exclude)
+        plan = U.pass_plan(U.Rotation(cfg.remember_passes, cfg.remember_once), kept, 1, cfg,
+                           random.Random(1))
+        self.assertEqual(len(plan), 2, plan)
+        fm = [c for c in plan if U.in_fm(c["freq_hz"])]
+        other = [c for c in plan if not U.in_fm(c["freq_hz"])]
+        self.assertEqual((len(fm), len(other)), (1, 1), plan)
+        tv = other[0]
+        self.assertEqual((tv["kind"], tv["band"]), ("broadcast", "UHF TV (ch 14-36) / wireless mics"))
+        self.assertGreater(tv["width_khz"], 5000)
+        self.assertEqual((fm[0]["iq_rate"], tv["iq_rate"]), (cfg.iq_rate_wide, cfg.iq_rate))
+        self.assertEqual((cfg.iq_rate_wide, cfg.iq_rate), (1024000, 250000))
+        self.assertEqual(sorted(c["index"] for c in plan), [1, 2])
+
+
 class Capture(unittest.TestCase):
     def test_rtl_sdr_block_boundary_is_avoided(self):
         n = U.capture_samples(131072 / 250000.0, 250000)       # exactly one 262144-byte block
@@ -267,14 +326,21 @@ class Capture(unittest.TestCase):
         self.assertTrue(U.judge_sdr(0, True, ""))
 
     def test_rate_rule(self):
-        self.assertEqual(U.iq_rate_for(sig(104.1, width=40.0), 250000, 1024000), 1024000)   # FM band
-        self.assertEqual(U.iq_rate_for(sig(915.0, width=150.0), 250000, 1024000), 1024000)  # wide
-        self.assertEqual(U.iq_rate_for(sig(162.55, width=12.0), 250000, 1024000), 250000)
+        # the wide rate is for the FM band, edges included, and nothing else - however wide
+        for mhz, width in ((87.5, 40.0), (104.1, 40.0), (108.0, 200.0)):
+            self.assertEqual(U.iq_rate_for(sig(mhz, width=width), 250000, 1024000), 1024000, mhz)
+        for mhz, width in ((87.4, 40.0), (108.1, 200.0), (162.55, 12.0), (915.0, 150.0),
+                           (539.0, 6000.0), (744.0, 10000.0)):
+            self.assertEqual(U.iq_rate_for(sig(mhz, width=width), 250000, 1024000), 250000, mhz)
 
-    def test_clip_name(self):
-        t = calendar.timegm((2026, 10, 10, 23, 15, 2))
-        self.assertEqual(U.clip_name(t, 104100000), "clip-20261010-231502-104100k.cu8")
+    def test_clip_base(self):
+        t = calendar.timegm((2026, 10, 10, 23, 15, 2)) + 0.417
+        self.assertEqual(U.clip_base(t, 104100000), "clip-20261010-231502-104100k")
+        self.assertEqual((U.DATA_EXT, U.META_EXT), (".sigmf-data", ".sigmf-meta"))
         self.assertEqual(U.utc_stamp(t), "20261010T231502Z")
+        self.assertEqual(U.iso_ms(t), "2026-10-10T23:15:02.417Z")
+        # a fraction that rounds up into the next second stays on this one, like the name
+        self.assertEqual(U.iso_ms(t - 0.417 + 0.9997), "2026-10-10T23:15:02.999Z")
 
     def test_fake_iq_carrier_sits_at_minus_a_quarter_rate(self):
         b = U.fake_iq_block()
@@ -284,10 +350,118 @@ class Capture(unittest.TestCase):
         self.assertGreater(abs(dc), 30)
 
 
+class SigMF(unittest.TestCase):
+    # The addendum's worked example, field for field.
+    CLIP = {"file": "clip-20261010-231502-104100k.sigmf-data",
+            "meta": "clip-20261010-231502-104100k.sigmf-meta",
+            "freq_hz": 104100000, "center_hz": 104356000, "offset_hz": 256000, "iq_rate": 1024000,
+            "format": "cu8", "gain_db": 25.4, "started_utc": "20261010T231502Z", "started_mono": 1234.5,
+            "clock_trusted": True, "duration_s": 15.3, "samples": 15667200, "bytes": 31334400,
+            "pass": 1, "index": 7, "snr_db": 31.2, "peak_db": -20.1, "floor_db": -51.3,
+            "width_khz": 150.0, "occupancy": 1.0, "kind": "broadcast", "band": "FM broadcast",
+            "seen_scans": 3, "last_seen_pass": 1, "scan": "main", "source": "scan"}
+    DEVICE = {"usb_id": "0bda:2838", "vendor_id": "0bda", "product_id": "2838", "sdr": "RTL2832U",
+              "product": "RTL2838UHIDIR", "manufacturer": "Realtek", "serial": "00000001",
+              "tuner": "R820T"}
+    T0 = calendar.timegm((2026, 10, 10, 23, 15, 2)) + 0.417
+
+    def sess(self, **kw):
+        s = {"unit": "umik1", "session": "umik1-sdr_000003_20261010T230000Z", "boot_id": "1a2b3c4d",
+             "time_source": "rtc", "ppm": 0, "hw": U.hw_text(self.DEVICE),
+             "software": {"umik_sdr": "1.0", "rtl_sdr": "2.0.2"}, "fake": False}
+        s.update(kw)
+        return s
+
+    def test_contract_example(self):
+        sha = hashlib.sha512(b"the data").hexdigest()
+        m = U.sigmf_meta(dict(self.CLIP), self.T0, sha, self.sess())
+        want = {
+            "global": {
+                "core:datatype": "cu8",
+                "core:sample_rate": 1024000.0,
+                "core:version": "1.0.0",
+                "core:num_channels": 1,
+                "core:sha512": sha,
+                "core:recorder": "umik-sdr 1.0 (pi-airgap-recorder), rtl_sdr 2.0.2",
+                "core:hw": "RTL2832U 0bda:2838 Realtek RTL2838UHIDIR serial 00000001, tuner R820T",
+                "core:description": "15.3 s of raw IQ around 104.1000 MHz (FM broadcast), captured "
+                                    "2026-10-10T23:15:02Z by unit umik1, clock trusted (rtc)",
+                "core:extensions": [{"name": "umik", "version": "1.0.0", "optional": True}],
+                "umik:unit": "umik1", "umik:session": "umik1-sdr_000003_20261010T230000Z",
+                "umik:recorder": "sdr", "umik:boot_id": "1a2b3c4d",
+                "umik:clock_trusted": True, "umik:time_source": "rtc",
+                "umik:started_utc": "20261010T231502Z", "umik:ended_utc": "20261010T231517Z",
+                "umik:started_iso": "2026-10-10T23:15:02.417Z", "umik:ended_iso": "2026-10-10T23:15:17.717Z",
+                "umik:started_mono": 1234.5, "umik:duration_s": 15.3, "umik:samples": 15667200,
+                "umik:bytes": 31334400,
+                "umik:target_hz": 104100000, "umik:center_hz": 104356000, "umik:offset_hz": 256000,
+                "umik:captured_lower_hz": 103844000, "umik:captured_upper_hz": 104868000,
+                "umik:gain_db": 25.4, "umik:ppm": 0,
+                "umik:pass": 1, "umik:index": 7,
+                "umik:snr_db": 31.2, "umik:peak_db": -20.1, "umik:floor_db": -51.3, "umik:width_khz": 150.0,
+                "umik:occupancy": 1.0, "umik:kind": "broadcast", "umik:band": "FM broadcast",
+                "umik:seen_scans": 3, "umik:last_seen_pass": 1, "umik:scan": "main", "umik:source": "scan",
+                "umik:software": {"umik_sdr": "1.0", "rtl_sdr": "2.0.2"}},
+            "captures": [
+                {"core:sample_start": 0, "core:frequency": 104356000.0,
+                 "core:datetime": "2026-10-10T23:15:02.417Z"}],
+            "annotations": [
+                {"core:sample_start": 0, "core:sample_count": 15667200,
+                 "core:freq_lower_edge": 104025000.0, "core:freq_upper_edge": 104175000.0,
+                 "core:label": "104.1000 MHz FM broadcast", "core:generator": "umik-sdr 1.0",
+                 "core:comment": "target channel: scan snr 31.2 dB, width 150.0 kHz, occupancy 1.0"}]}
+        self.assertEqual(m, want)
+        # ... and in the contract's order, which dict equality does not see
+        self.assertEqual(list(m), ["global", "captures", "annotations"])
+        self.assertEqual(list(m["global"]), META_GLOBAL_KEYS)
+        self.assertEqual(list(m["captures"][0]), list(want["captures"][0]))
+        self.assertEqual(list(m["annotations"][0]), list(want["annotations"][0]))
+        self.assertEqual(json.loads(json.dumps(m)), want)       # plain JSON all the way down
+
+    def test_auto_gain_untrusted_clock_and_fake(self):
+        clip = dict(self.CLIP, gain_db="auto", clock_trusted=False)
+        m = U.sigmf_meta(clip, self.T0, "0" * 128,
+                         self.sess(time_source="none", fake=True, hw=U.hw_text(self.DEVICE, fake=True)))
+        g = m["global"]
+        self.assertEqual(g["umik:gain_db"], "auto")
+        self.assertEqual((g["umik:clock_trusted"], g["umik:time_source"]), (False, "none"))
+        self.assertTrue(g["core:description"].endswith("clock not trusted (none)"), g["core:description"])
+        self.assertEqual(list(g), META_GLOBAL_KEYS + ["umik:fake"])
+        self.assertIs(g["umik:fake"], True)
+        self.assertTrue(g["core:hw"].startswith("FAKE"), g["core:hw"])
+        self.assertNotIn("umik:fake", U.sigmf_meta(dict(self.CLIP), self.T0, "0" * 128, self.sess())["global"])
+
+
+class Leftovers(unittest.TestCase):
+    def test_parts_and_orphaned_data_go_pairs_and_the_mic_stay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sdr = os.path.join(tmp, "u1-sdr_000002_20261010T230000Z")
+            mic = os.path.join(tmp, "u1_000007_20261010T230000Z")
+            os.makedirs(sdr)
+            os.makedirs(mic)
+            stays = [os.path.join(sdr, n) for n in (
+                "clip-a.sigmf-data", "clip-a.sigmf-meta",   # a complete pair
+                "clip-f.sigmf-meta",                        # meta alone: not the recorder's call
+                "._clip-e.sigmf-data",                      # a Mac's AppleDouble: not a clip
+                "clips.jsonl", "session.json")] + \
+                [os.path.join(mic, n) for n in ("seg-1.wav.part", "x.sigmf-data")]   # the mic's
+            goes = [os.path.join(sdr, n) for n in (
+                "clip-b.sigmf-data",                        # cut between the two renames
+                "clip-c.sigmf-data", "clip-c.sigmf-meta.part",   # cut while the meta was written
+                "clip-d.sigmf-data.part",                   # cut mid-capture
+                "scan-p0002-main.csv.gz.part")]
+            for p in stays + goes:
+                open(p, "wb").close()
+            self.assertEqual(U.remove_leftovers(tmp), (3, 2))
+            self.assertEqual([p for p in stays if not os.path.exists(p)], [])
+            self.assertEqual([p for p in goes if os.path.exists(p)], [])
+            self.assertEqual(U.remove_leftovers(tmp), (0, 0))
+            self.assertEqual(U.remove_leftovers(os.path.join(tmp, "nowhere")), (0, 0))
+
+
 class Config(unittest.TestCase):
     def cfg(self, argv, env):
-        args = U.build_parser().parse_args(argv)
-        return U.make_config(U.raw_settings(args, env), args)
+        return config(argv, env)
 
     def test_flag_beats_env_beats_default(self):
         self.assertEqual(self.cfg([], {}).dwell, 15.0)
@@ -349,7 +523,7 @@ class EndToEnd(unittest.TestCase):
             for p in (1, 2):
                 for sc in ("main", "fm", "uhf"):
                     self.assertIn("scan-p%04d-%s.csv.gz" % (p, sc), names)
-                doc = json.load(open(os.path.join(sdir, "scan-p%04d.json" % p)))
+                doc = read_json(os.path.join(sdir, "scan-p%04d.json" % p))
                 self.assertEqual(list(doc)[:3], ["pass", "started_utc", "started_mono"])
                 self.assertEqual(len(doc["channels"]), 3)
             with open(os.path.join(sdir, "session.json")) as fh:
@@ -363,11 +537,14 @@ class EndToEnd(unittest.TestCase):
             # tools/umik-lib.sh json_str reads these line by line
             for line in ('  "unit": "test",', '  "clock_trusted": false,', '  "time_source": "none",'):
                 self.assertIn(line, text.splitlines())
-            clips = [json.loads(l) for l in open(os.path.join(sdir, "clips.jsonl"))]
+            clips = read_jsonl(os.path.join(sdir, "clips.jsonl"))
             self.assertEqual(len(clips), 6)
-            self.assertEqual(sorted(c["file"] for c in clips), [n for n in names if n.endswith(".cu8")])
+            self.assertEqual(sorted(c["file"] for c in clips), [n for n in names if n.endswith(".sigmf-data")])
+            self.assertEqual(sorted(c["meta"] for c in clips), [n for n in names if n.endswith(".sigmf-meta")])
+            self.assertEqual([n for n in names if n.endswith(".cu8")], [])
             for c in clips:
                 self.assertTrue(c["ok"])
+                self.assertEqual(c["meta"], c["file"][:-len(".sigmf-data")] + ".sigmf-meta")
                 self.assertEqual(os.path.getsize(os.path.join(sdir, c["file"])), 2 * c["samples"])
                 self.assertEqual(c["center_hz"] - c["freq_hz"], c["iq_rate"] // 4)
             with open(os.path.join(tmp, "logs", "umik.log")) as fh:
@@ -375,7 +552,81 @@ class EndToEnd(unittest.TestCase):
             self.assertRegex(log, r"(?m)^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ boot=\S+ up= *\d+s "
                                   r"umik-sdr: session 000001 finished after 2 passes")
 
-    def test_sigterm_mid_clip_then_stale_part_sweep(self):
+    def test_every_clip_is_a_sigmf_pair(self):
+        """One whole pass, every channel: the pairs, their meta against their
+        data and their clips.jsonl line, and the rate rule through run_pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self.run_fake(tmp, "--passes", "1", "--max-channels", "120",
+                                    "--dwell", "0.1", "--jitter", "0")
+            self.assertEqual(rc, 0, err)
+            sdir, _ = self.session_dir(tmp)
+            names = sorted(os.listdir(sdir))
+            plan = read_json(os.path.join(sdir, "scan-p0001.json"))["channels"]
+            clips = read_jsonl(os.path.join(sdir, "clips.jsonl"))
+            self.assertGreater(len(plan), 10)
+            self.assertEqual(len(clips), len(plan))
+            # the wide rate went to the FM band and nowhere else, however wide the rest measured
+            for ch in plan:
+                self.assertEqual(ch["iq_rate"], 1024000 if U.in_fm(ch["freq_hz"]) else 250000, ch)
+            self.assertTrue(any(U.in_fm(ch["freq_hz"]) for ch in plan))
+            self.assertTrue(any(not U.in_fm(ch["freq_hz"]) and ch["width_khz"] > 1000 for ch in plan))
+            # two files per clip, and nothing else clip-shaped
+            self.assertEqual(sorted(c["file"] for c in clips), [n for n in names if n.endswith(".sigmf-data")])
+            self.assertEqual(sorted(c["meta"] for c in clips), [n for n in names if n.endswith(".sigmf-meta")])
+            self.assertEqual([n for n in names if n.startswith("clip-")
+                              and not n.endswith((".sigmf-data", ".sigmf-meta"))], [])
+            for c in clips:
+                self.assertTrue(c["ok"])
+                m = read_json(os.path.join(sdir, c["meta"]))
+                with open(os.path.join(sdir, c["file"]), "rb") as fh:
+                    data = fh.read()
+                g, caps, anns = m["global"], m["captures"], m["annotations"]
+                self.assertEqual(list(m), ["global", "captures", "annotations"])
+                self.assertEqual(list(g), META_GLOBAL_KEYS + ["umik:fake"])
+                self.assertEqual((g["core:datatype"], g["core:version"], g["core:num_channels"]),
+                                 ("cu8", "1.0.0", 1))
+                self.assertEqual(len(data), c["bytes"])
+                self.assertEqual(g["core:sha512"], hashlib.sha512(data).hexdigest())
+                self.assertNotIn("core:dataset", g)
+                self.assertEqual(g["core:sample_rate"], float(c["iq_rate"]))
+                # core:frequency is the tuned centre; the target sits offset_hz below it
+                self.assertEqual(caps, [{"core:sample_start": 0, "core:frequency": float(c["center_hz"]),
+                                         "core:datetime": g["umik:started_iso"]}])
+                self.assertEqual(g["umik:target_hz"], c["center_hz"] - c["offset_hz"])
+                self.assertEqual((g["umik:captured_lower_hz"], g["umik:captured_upper_hz"]),
+                                 (c["center_hz"] - c["iq_rate"] // 2, c["center_hz"] + c["iq_rate"] // 2))
+                # ended = started + samples / rate; the second-stamps match the ISO ones and the name
+                started, ended = iso_seconds(g["umik:started_iso"]), iso_seconds(g["umik:ended_iso"])
+                self.assertAlmostEqual(ended - started, c["samples"] / float(c["iq_rate"]), delta=0.0015)
+                self.assertAlmostEqual(ended - started, c["duration_s"], delta=0.0015)
+                self.assertEqual(g["umik:started_utc"], U.utc_stamp(int(started)))
+                self.assertEqual(g["umik:ended_utc"], U.utc_stamp(int(ended)))
+                self.assertEqual(g["umik:started_utc"], c["started_utc"])
+                self.assertTrue(c["file"].startswith("clip-%s-%s-" % (c["started_utc"][:8], c["started_utc"][9:15])))
+                # the annotation: the whole clip, the channel's measured width around the target
+                self.assertEqual(len(anns), 1)
+                a = anns[0]
+                self.assertEqual((a["core:sample_start"], a["core:sample_count"]), (0, c["samples"]))
+                self.assertAlmostEqual(a["core:freq_lower_edge"], c["freq_hz"] - c["width_khz"] * 500.0, delta=0.5)
+                self.assertAlmostEqual(a["core:freq_upper_edge"], c["freq_hz"] + c["width_khz"] * 500.0, delta=0.5)
+                # every namespace in use is core or declared in core:extensions
+                declared = {e["name"] for e in g["core:extensions"]}
+                self.assertEqual(declared, {"umik"})
+                self.assertTrue(all(e["optional"] is True for e in g["core:extensions"]))
+                for obj in [g] + caps + anns:
+                    for key in obj:
+                        self.assertIn(key.split(":")[0], declared | {"core"}, key)
+                # --fake says so
+                self.assertIs(g["umik:fake"], True)
+                self.assertTrue(g["core:hw"].startswith("FAKE"), g["core:hw"])
+                # the line and the meta agree on everything they share
+                for key in ("pass", "index", "snr_db", "peak_db", "floor_db", "width_khz", "occupancy",
+                            "kind", "band", "seen_scans", "last_seen_pass", "scan", "source", "samples",
+                            "bytes", "duration_s", "started_mono", "clock_trusted", "gain_db",
+                            "center_hz", "offset_hz"):
+                    self.assertEqual(g["umik:" + key], c[key], key)
+
+    def test_sigterm_mid_clip_then_leftovers_swept(self):
         with tempfile.TemporaryDirectory() as tmp:
             rc, err = self.run_fake(tmp, "--dwell", "30", stop_after=3)
             self.assertEqual(rc, 0, err)
@@ -383,12 +634,22 @@ class EndToEnd(unittest.TestCase):
             self.assertIn("stopped cleanly", err)
             sdir, _ = self.session_dir(tmp)
             self.assertEqual([n for n in os.listdir(sdir) if n.endswith(".part")], [])
-            # a power cut leaves one behind; the next start clears it
-            open(os.path.join(sdir, "clip-20261010-000000-100000k.cu8.part"), "wb").close()
+            self.assertEqual([n for n in os.listdir(sdir) if n.startswith("clip-")], [])
+            # A power cut leaves the clip in flight behind, or - cut between the two
+            # renames - a data file whose meta never landed. The next start clears both,
+            # and leaves a complete pair alone.
+            part = os.path.join(sdir, "clip-20261010-000000-100000k.sigmf-data.part")
+            orphan = os.path.join(sdir, "clip-20261010-000001-100000k.sigmf-data")
+            pair = [os.path.join(sdir, "clip-20261010-000002-100000k" + ext) for ext in (".sigmf-data", ".sigmf-meta")]
+            for p in [part, orphan] + pair:
+                open(p, "wb").close()
             rc, err = self.run_fake(tmp, "--passes", "1", "--max-channels", "0")
             self.assertEqual(rc, 0, err)
-            self.assertIn("removed 1 stale .part file(s) from earlier sessions", err)
-            self.assertFalse(os.path.exists(os.path.join(sdir, "clip-20261010-000000-100000k.cu8.part")))
+            self.assertIn("removed 1 stale .part file(s) and 1 .sigmf-data file(s) with no .sigmf-meta "
+                          "from earlier sessions", err)
+            self.assertFalse(os.path.exists(part))
+            self.assertFalse(os.path.exists(orphan))
+            self.assertTrue(all(os.path.exists(p) for p in pair))
 
 
 if __name__ == "__main__":

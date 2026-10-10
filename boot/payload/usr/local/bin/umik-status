@@ -117,7 +117,7 @@ while :; do
                    -maxdepth 2 -name 'seg-*.wav' -mmin -1 -print 2>/dev/null \
                    | head -1)" ] \
            || [ -n "$(find /data/usb/recordings/*-sdr_* /data/recordings/*-sdr_* \
-                      -maxdepth 1 \( -name 'clip-*.cu8' -o -name 'scan-*' \) \
+                      -maxdepth 1 \( -name 'clip-*.sigmf-data' -o -name 'scan-*' \) \
                       -mmin -6 -print 2>/dev/null | head -1)" ]; then
             WANT_GREEN=blip
         else
