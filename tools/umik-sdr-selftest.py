@@ -333,6 +333,10 @@ class Capture(unittest.TestCase):
         kd = "Kernel driver is active, or device is claimed by second instance of librtlsdr.\n"
         self.assertEqual(U.judge_sdr(0, False, kd + pll + ok), "")
         self.assertIn("exit 1", U.judge_sdr(1, False, kd + "usb_claim_interface error -6\n"))
+        # a bad exit after only the benign lines names the last line, not the PLL chatter
+        # (seen 2026-10-10: "rtl_sdr exit 5: [R82XX] PLL not locked!" for a one-off USB error)
+        self.assertEqual(U.judge_sdr(5, False, kd + pll + "Tuned to 442424117 Hz.\n"),
+                         "rtl_sdr exit 5: Tuned to 442424117 Hz.")
         self.assertIn("sample rate", U.judge_sdr(0, False, "WARNING: Failed to set sample rate.\n"))
         self.assertTrue(U.judge_sdr(1, False, "usb_claim_interface error -6\n"))
         self.assertTrue(U.judge_sdr(0, True, ""))

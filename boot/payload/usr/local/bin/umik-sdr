@@ -2091,10 +2091,11 @@ def judge_sdr(rc, timed_out, err):
     if rc is None:
         return "could not start rtl_sdr: " + err
     bad = [l.strip() for l in err.splitlines() if any(s in l for s in SDR_FAULTS)]
-    if rc != 0:
-        return "rtl_sdr exit %d: %s" % (rc, bad[-1] if bad else last_line(err))
     pll = [l for l in bad if PLL_NOT_LOCKED in l]
     real = [l for l in bad if KERNEL_DRIVER not in l and (PLL_NOT_LOCKED not in l or len(pll) > 1)]
+    if rc != 0:
+        # name a real fault line if there is one; the benign chatter is never the reason
+        return "rtl_sdr exit %d: %s" % (rc, real[-1] if real else last_line(err))
     return real[0] if real else ""
 
 
