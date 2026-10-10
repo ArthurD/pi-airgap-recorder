@@ -56,6 +56,7 @@ cd pi-airgap-recorder
 
 ./build/00-fetch-verify.sh                     # download Pi OS + verify SHA-256
 ./build/01-decompress.sh                       # no `xz` binary needed
+./build/05-fetch-sdr-debs.sh                   # the SDR recorder's 3 pinned .debs (every card)
 diskutil list external physical                # find your card, e.g. /dev/disk4
 ./build/02-flash.sh /dev/disk4                 # DESTRUCTIVE; verifies readback
 ./build/04-add-data-partition.sh /dev/disk4    # 8GiB root + Mac-readable exFAT
@@ -344,9 +345,11 @@ the OS image: `rtl-sdr`, `librtlsdr0`, and `libusb-1.0-0` (already on the
 image; a spare). Each one is checked against a SHA-256 pinned in the script,
 and the script writes `cache/debs/SHA256SUMS` for the Pi. `03-inject` copies
 them onto the card (about 140 KB), and firstrun re-checks them with
-`sha256sum -c`, then installs with `dpkg` only what is missing or older. Skip
-the step and the card builds exactly as before: `03-inject` says SDR support
-will not be provisioned, and `umik-sdr` stays disabled.
+`sha256sum -c`, then installs with `dpkg` only what is missing or older.
+Every card carries the SDR role: all units are functionally identical, and
+what a box does is decided by what is plugged into it at boot. `03-inject`
+therefore refuses to run without the cache; `--no-sdr` builds a mic-only
+card on purpose, with `umik-sdr` left disabled.
 
 **The DVB driver.** The RTL2832U started life as a DVB-T TV stick, and the
 kernel's TV driver (`dvb_usb_rtl28xxu`) claims the dongle the moment it
@@ -510,7 +513,7 @@ tools/     host-side utilities  umik · umik-ingest.sh · umik-upload.sh ·
 
 ```sh
 ./build/00-fetch-verify.sh              # download + SHA-256 verify
-./build/05-fetch-sdr-debs.sh            # optional: RTL-SDR tools, 3 pinned .debs
+./build/05-fetch-sdr-debs.sh            # RTL-SDR tools, 3 pinned .debs (every card gets them)
 ./build/01-decompress.sh                # python3 lzma; no xz needed
 diskutil list external physical         # find your card
 ./build/02-flash.sh /dev/diskN          # DESTRUCTIVE; verifies readback

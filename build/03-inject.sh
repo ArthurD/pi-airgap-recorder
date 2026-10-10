@@ -15,6 +15,7 @@ cd "$(dirname "$0")/.."
 # existing account and keeps the current credentials. NEVER use this on a
 # freshly flashed card - there would be no account and no way to log in.
 REUSE=0
+NO_SDR=0
 UNIT=""
 WANT_UNIT=0
 ARGS=()
@@ -22,6 +23,7 @@ for a in "$@"; do
     if [ "$WANT_UNIT" -eq 1 ]; then UNIT="$a"; WANT_UNIT=0; continue; fi
     case "$a" in
         --reuse-credentials) REUSE=1 ;;
+        --no-sdr) NO_SDR=1 ;;
         --unit) WANT_UNIT=1 ;;
         --unit=*) UNIT="${a#--unit=}" ;;
         *) ARGS+=("$a") ;;
@@ -39,18 +41,27 @@ fi
 
 say "boot partition: $BOOT"
 
-# --- SDR packages (optional) -------------------------------------------------
+# --- SDR packages ------------------------------------------------------------
 # umik-sdr needs rtl-sdr, which Pi OS Lite does not ship and the Pi cannot
 # fetch. build/05-fetch-sdr-debs.sh pins the .debs into cache/debs/; they ride
 # along in the payload and firstrun re-checks and installs them, offline.
 # Checked HERE, before anything on the card changes, so a bad cache stops the
 # run while the card is still exactly as it was.
+#
+# Every card gets them. The design is that all units are functionally
+# identical and what a box does is decided by what is plugged into it at
+# boot - a card built without the SDR role would quietly break that the day
+# a dongle is moved to it. So a missing cache is a refusal, not a note;
+# --no-sdr is the explicit way to build a mic-only card on purpose.
 SDR_DEBS="${CACHE}/debs"
 SDR=0
 if [ -f "${SDR_DEBS}/SHA256SUMS" ]; then
     (cd "$SDR_DEBS" && shasum -a 256 -c SHA256SUMS >/dev/null) \
         || die "cache/debs no longer matches its SHA256SUMS - re-run ./build/05-fetch-sdr-debs.sh"
     SDR=1
+elif [ "$NO_SDR" -eq 0 ]; then
+    die "no cache/debs/SHA256SUMS: run ./build/05-fetch-sdr-debs.sh first (every card carries the
+SDR role, so it behaves by what is attached at boot), or pass --no-sdr to build a mic-only card on purpose"
 fi
 
 # --- unit identity ---------------------------------------------------------
@@ -124,8 +135,8 @@ if [ "$SDR" -eq 1 ]; then
     done < "${SDR_DEBS}/SHA256SUMS"
     say "SDR packages copied ($(wc -l < "${SDR_DEBS}/SHA256SUMS" | tr -d ' ') .debs, verified); firstrun installs them"
 else
-    say "NOTE: no cache/debs/SHA256SUMS - SDR support (umik-sdr) will NOT be provisioned."
-    say "      To add it: ./build/05-fetch-sdr-debs.sh, then run this inject again."
+    say "--no-sdr: SDR support (umik-sdr) will NOT be provisioned on this card."
+    say "      To add it later: ./build/05-fetch-sdr-debs.sh, then inject again."
 fi
 
 # Time-seed: the Pi steps its clock forward to this at boot (a floor, not
