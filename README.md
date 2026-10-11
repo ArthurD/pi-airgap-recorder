@@ -612,7 +612,15 @@ upload+verify and the NAS copy+re-hash (`UMIK_NAS_DIR`, see
 is re-checked before every write, so an unmounted mount point can never pass
 local disk off as the NAS) run alongside it. Local audio is deleted only once
 **both** off-box copies verified against the seals (`--keep-local` to never
-delete). Sealing itself runs `UMIK_INGEST_JOBS` files at a time (default 4),
+delete). With several sticks in a row, `--defer-verify` on each run does the
+seal, clear, upload, and NAS copy but leaves the verification for one
+`umik process --finish` afterwards, which checks the bucket once and re-hashes
+every pending session on the NAS before deleting their local audio (the
+pending set lives in `~/UMIK-Archive/process/pending-verify`). The second
+run can start as soon as its stick is in: its seal overlaps the first run's
+upload, and its own upload waits on `process/upload.lock`, since two
+uploaders at once would race the same keys into locked duplicate versions.
+Sealing itself runs `UMIK_INGEST_JOBS` files at a time (default 4),
 hashing with the system `openssl` — about 5× faster than `shasum` on Apple
 silicon — and the copy-and-compare it used to do per file to detect a
 power-cut header is now a header check, so the ingest is bound by how fast

@@ -7,7 +7,13 @@
 #                   (UMIK_NAS_DIR); local audio is deleted only once BOTH
 #                   off-box copies verified. `--keep-local` never deletes;
 #                   `--nas <dir>` overrides the NAS folder. This is what
-#                   "process the stick" means.
+#                   "process the stick" means. Several sticks in a row:
+#                   `--defer-verify` on each (seal, clear, upload, copy;
+#                   the off-box verification waits), then one
+#                   `umik process --finish` verifies S3 and the NAS for
+#                   all of them at once and deletes their local audio.
+#                   A second run may start while the first still uploads:
+#                   its upload queues behind the first (upload.lock).
 #   umik download   for every mounted UMIK medium (USB stick or card):
 #                   seal all new recordings + logs into ~/UMIK-Archive,
 #                   verify the seals, then CLEAR the verified recordings
