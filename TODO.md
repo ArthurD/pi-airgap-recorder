@@ -101,6 +101,15 @@ inject, and boot with the NESDR SMArt v5 attached; the answers are in
       (`sigmf.sigmffile.fromfile(...).validate()`), 0 warnings; FM clips show
       the 19 kHz stereo pilot after demodulation, so the offset tuning and the
       sample layout are right.
+- [ ] **The USB reset works on the Pi.** When the dongle wedges (it opens and
+      tunes, but no samples ever arrive, so every capture times out; the Mac
+      did this after 13 h and ~2,500 opens on 2026-10-11) umik-sdr now resets
+      it through libusb (`USB reset of the dongle (...): reset 0bda:2838: ok`
+      in `umik.log`) and carries on, instead of failing five times and leaving
+      it to systemd, which cannot re-plug it either. Verified on the Mac. On
+      the Pi it needs the plugdev rule above (libusb_open as `recorder`) and
+      `libusb-1.0.so.0`, which librtlsdr0 depends on - so look for that line
+      after any run of `did not finish in time` warnings.
 - [ ] **Green LED with the SDR alone.** Solid through the first scan, then
       blipping; confirm it does not drop back to solid between passes (the
       6-minute freshness window vs a real pass pause plus scan on the Pi).

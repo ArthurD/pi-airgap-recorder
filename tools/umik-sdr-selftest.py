@@ -229,6 +229,30 @@ class Detection(unittest.TestCase):
         self.assertEqual(chans[0]["kind"], "broadcast")
         self.assertLessEqual(abs(chans[0]["freq_hz"] - 503.31e6), 25e3)    # at the pilot
 
+    def test_narrow_carrier_beside_a_tv_channel_is_its_own_channel(self):
+        # the ATSC channel 503-509 with its pilot at the lower edge, and a steady narrow carrier 1.5 MHz
+        # below the pilot (a wireless mic, a bug, a clock harmonic): neither the TV radius nor the width
+        # the pilot inherits from its channel may swallow it. Night of 2026-10-10: six such carriers at
+        # 479-519 MHz were detected in all 21 passes and captured in none.
+        sigs = scan([(506.0, 6000.0, 22.0, None, None), (503.31, 3.0, 30.0, None, None),
+                     (501.79, 3.0, 20.0, None, None)], 490, 520, 50)
+        chans = U.select_signals(sigs, 15.0, NO_EXCLUDE)
+        self.assertEqual(len(chans), 2, chans)                                # was 1: the TV radius ate it
+        self.assertLessEqual(abs(chans[0]["freq_hz"] - 501.79e6), 30e3)
+        self.assertLessEqual(abs(chans[1]["freq_hz"] - 503.31e6), 30e3)
+        self.assertEqual([U.kind_radius_khz(c) for c in chans], [0.0, 0.0])
+        # with the channel's plateau detected too (as detections; the fake scan does not draw one):
+        # the pilot absorbs the plateau and inherits its extent, 503-509 MHz - not +-6 MHz around itself
+        plateau, pilot, below, inside = (sig(506.0, snr=22, width=6000.0), sig(503.31, snr=30),
+                                         sig(501.79, snr=20), sig(507.2, snr=20))
+        chans = U.select_signals([plateau, pilot, below], 15.0, NO_EXCLUDE)
+        self.assertEqual([c["freq_hz"] for c in chans], [501790000, 503310000], chans)
+        self.assertGreater(chans[1]["width_khz"], 5000)
+        self.assertEqual(U.kind_radius_khz(chans[1]), U.TV_CLUSTER_KHZ)      # the pilot still owns its channel
+        # ... and the same carrier INSIDE the channel is under the TV signal: one channel, as before
+        self.assertEqual([c["freq_hz"] for c in U.select_signals([plateau, pilot, inside], 15.0, NO_EXCLUDE)],
+                         [503310000])
+
     def test_exclusions_apply(self):
         sigs = [sig(710.0, snr=30), sig(720.0, snr=20)]
         kept = U.select_signals(sigs, 15.0, [(698.0, 716.0), (777.0, 787.0), (824.0, 849.0)])
@@ -334,6 +358,10 @@ class Capture(unittest.TestCase):
         self.assertEqual(n, 131073)
         self.assertNotEqual((2 * n) % U.RTL_SDR_BLOCK, 0)
         self.assertEqual(U.capture_samples(15.3, 1024000), 15667200)
+
+    def test_usb_reset_code_is_valid_python(self):
+        compile(U.USB_RESET_CODE, "usb-reset", "exec")
+        self.assertEqual(U.RTL_IDS, ("0bda:2838", "0bda:2832"))
 
     def test_benign_librtlsdr_chatter_is_not_a_failure(self):
         ok = ("Found 1 device(s):\n  0:  Realtek, RTL2838UHIDIR, SN: 00000001\n"

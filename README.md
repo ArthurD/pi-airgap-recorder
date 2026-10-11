@@ -250,8 +250,9 @@ and UHF voice bands (136–174 and 400–520 MHz), three sweeps each. A signal i
 anything 10 dB over the local noise floor in every sweep, or 14 dB if it comes
 and goes. An FM station becomes one channel, and so does a wide transmitter (an
 LTE carrier, a Wi-Fi channel, a UHF TV channel) rather than the dozens of bins
-it covers; the phone uplink bands, your own phone's included, are never
-listened to. A channel seen in two or more scans stays in the rotation for 8
+it covers - but a narrow carrier in the TV band (a wireless mic, a bug, a clock
+harmonic) is its own channel, never folded into the TV channel beside it; the
+phone uplink bands, your own phone's included, are never listened to. A channel seen in two or more scans stays in the rotation for 8
 passes after it was last seen (2 if it was seen once), so an intermittent
 transmitter keeps getting visits. Up to 120 channels (the strongest, when there
 are more) are then recorded in shuffled order, ~15 s each, with random gaps
@@ -343,6 +344,13 @@ success and never restarts it, so it ends *inactive*, not failed. A mic-only
 unit therefore runs exactly as before, plus one line in `umik.log` per boot. A
 recorder that bowed out stays out until the next boot: plug the other device
 in, then power-cycle.
+
+**A wedged dongle.** After hours of opens and closes the stick can stop
+delivering samples while still opening and tuning: every capture then times
+out (`did not finish in time (dongle wedged?)`). umik-sdr answers the first
+timeout with a USB reset through libusb - a soft re-plug, logged as `USB reset
+of the dongle (...): reset 0bda:2838: ok` - and carries on; only if captures
+keep failing five in a row does it exit for systemd to restart it.
 
 **Build step.** Pi OS Lite has no `rtl-sdr`, and provisioning never touches a
 network, so the packages ride along in the payload. Run this once, any time
