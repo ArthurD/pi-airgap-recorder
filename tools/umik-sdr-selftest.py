@@ -312,6 +312,23 @@ class Pass(unittest.TestCase):
 
 
 class Capture(unittest.TestCase):
+    def test_sweep_segments_land_on_the_same_hops(self):
+        for lo, hi, bin_hz, n, want in ((108000000, 1750000000, 50000, 4, 4), (400000000, 520000000, 10000, 4, 4),
+                                        (136000000, 174000000, 10000, 4, 1), (87500000, 108000000, 10000, 4, 1),
+                                        (108000000, 1750000000, 50000, 1, 1)):
+            plan = U.power_plan(lo, hi, bin_hz)
+            parts = U.sweep_segments(lo, hi, plan, n)
+            self.assertEqual(len(parts), want, (lo, hi, n))
+            self.assertEqual((parts[0][0], parts[-1][1]), (lo, hi))
+            for (a, b), (c, _d) in zip(parts, parts[1:]):
+                self.assertEqual(b, c)                                   # contiguous
+            sub = [U.power_plan(a, b, bin_hz) for a, b in parts]
+            self.assertEqual(sum(q["hops"] for q in sub), plan["hops"])   # the same hop count in all
+            centres = [c for q in sub for c in q["centres"]]
+            for mine, whole in zip(centres, plan["centres"]):
+                self.assertLess(abs(mine - whole), plan["step"] / 4)      # ... on the whole sweep's bins
+            self.assertEqual({q["length"] for q in sub}, {plan["length"]})
+
     def test_rtl_sdr_block_boundary_is_avoided(self):
         n = U.capture_samples(131072 / 250000.0, 250000)       # exactly one 262144-byte block
         self.assertEqual(n, 131073)

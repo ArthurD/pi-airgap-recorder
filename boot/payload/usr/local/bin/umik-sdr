@@ -112,6 +112,10 @@ TUNABLES = (
     ("scan",            "UMIK_SDR_SCAN",            "108-1750:50"),
     ("fine",            "UMIK_SDR_FINE",            "87.5-108:10 136-174:10 400-520:10"),
     ("sweeps",          "UMIK_SDR_SWEEPS",          "3"),
+    # rtl_power always climbs from the bottom of the range it is given. A sweep
+    # is run as this many rtl_power runs over contiguous parts of the range, in
+    # random order, so where in the band a sweep begins is never the same twice.
+    ("scan-segments",   "UMIK_SDR_SCAN_SEGMENTS",   "4"),
     # rtl_power averages dozens to hundreds of FFTs into every bin, so 10 dB
     # over the floor is never noise. A lower threshold only costs more real
     # but dull channels, and UMIK_SDR_MAX_CHANNELS caps those.
@@ -151,6 +155,9 @@ HELP_NOTES = {
             "not wholly inside it",
     "gain-wide": "tuner gain in dB, or auto, for the FM band (87.5-108 MHz): its scans and its "
                  "captures",
+    "scan-segments": "rtl_power runs per sweep of a scan, over contiguous parts of its range in "
+                     "random order, so a sweep does not always start at the bottom; a scan with "
+                     "fewer than 8 hops a part runs whole",
     "crop": "rtl_power -c, percent of each hop's edges discarded",
     "iq-rate": "IQ samples/s for every channel outside the FM band",
     "iq-rate-wide": "IQ samples/s for channels in the FM band (87.5-108 MHz) only; every "
@@ -524,6 +531,7 @@ def make_config(raw, args):
         setattr(c, flag.replace("-", "_"), g)
     c.ppm = number("ppm", int, -500, 500)            # rtl_* take whole ppm only (atoi)
     c.sweeps = number("sweeps", int, 1, 50)
+    c.scan_segments = number("scan-segments", int, 1, 64)
     c.thr = number("thr", float, 1.0, 100.0)
     c.thr_burst = number("thr-burst", float, 1.0, 100.0)
     c.dwell = number("dwell", float, 0.1, 3600.0)
@@ -942,6 +950,20 @@ def prepare_scan(sc, crop_pct):
                             sc["bin_hz"], sc["crop"])
     sc["grid"] = scan_grid(sc["plan"])
     return sc
+
+
+def sweep_segments(lo, hi, plan, n):
+    """Split a sweep of lo-hi into n contiguous parts along whole hops. A part
+    of k hops of width bw re-plans, in rtl_power's own arithmetic, to k hops
+    of the same width and the same FFT length (power_plan picks the fewest
+    hops of at most 2.8 MHz; k*bw/(k-1) is over that whenever the scan's own
+    hops nearly fill it), so the parts land on the very bins the whole sweep
+    would. A scan with fewer than 8 hops a part is swept whole."""
+    hops, bw = plan["hops"], plan["bw"]
+    if n <= 1 or hops < 8 * n:
+        return [(lo, hi)]
+    edges = [lo] + [lo + (hops * k // n) * bw for k in range(1, n)] + [hi]
+    return list(zip(edges[:-1], edges[1:]))
 
 
 def sweep_shifted(pass_no, sweep):
@@ -1678,8 +1700,10 @@ class Recorder:
             "%s %g-%g MHz in %d hops of %d x %.1f kHz bins, gain %s" % (
                 sc["name"], sc["start_mhz"], sc["stop_mhz"], sc["plan"]["hops"], sc["plan"]["bins"],
                 sc["plan"]["step"] / 1e3, gain_text(sc["gain"])) for sc in cfg.scans)
-            + "; %d sweeps each, every other one a quarter hop off%s"
-            % (cfg.sweeps, ", crop %g%%" % cfg.crop if cfg.crop else ""))
+            + "; %d sweeps each, every other one a quarter hop off%s%s"
+            % (cfg.sweeps, ", crop %g%%" % cfg.crop if cfg.crop else "",
+               "; the scans, and the %d parts of each long one, in a fresh random order every sweep"
+               % cfg.scan_segments if cfg.scan_segments > 1 else ""))
         applog("captures: gain %s (FM band %s), ppm %d, %d/%d S/s, dwell %gs +-%d%%, gaps 0-%gs, "
                "pauses 0-%gs, up to %d channels a pass; exclude %s" % (
                    gain_text(cfg.gain), gain_text(cfg.gain_wide), cfg.ppm, cfg.iq_rate,
@@ -1752,6 +1776,7 @@ class Recorder:
                 "ppm": cfg.ppm, "iq_rate": cfg.iq_rate, "iq_rate_wide": cfg.iq_rate_wide,
                 "dwell_s": fmt_num(cfg.dwell), "jitter": fmt_num(cfg.jitter),
                 "gap_max_s": fmt_num(cfg.gap_max), "pass_pause_max_s": fmt_num(cfg.pass_pause_max),
+                "scan_segments": cfg.scan_segments,
                 "scans": [{"name": sc["name"], "start_mhz": fmt_num(sc["start_mhz"]),
                            "stop_mhz": fmt_num(sc["stop_mhz"]), "bin_khz": fmt_num(sc["bin_khz"]),
                            "sweeps": sc["sweeps"], "gain_db": fmt_num(sc["gain"])}
@@ -1849,7 +1874,9 @@ class Recorder:
                 states.append({"sc": sc, "path": path, "fh": fh, "gz": gz, "sweeps": [], "seconds": 0.0})
             for s in range(cfg.sweeps):
                 shifted = sweep_shifted(p, s)
-                for st in states:
+                order = list(states)
+                self.rng.shuffle(order)             # which scan goes first varies too
+                for st in order:
                     sc = st["sc"]
                     self.phase = "pass %d: scanning %s, sweep %d/%d" % (p, sc["name"], s + 1, cfg.sweeps)
                     text, rows, secs = self.power_sweep(sc, s, shifted, p)
@@ -1889,10 +1916,28 @@ class Recorder:
         return meta, signals
 
     def power_sweep(self, sc, s, shifted, p):
-        """One rtl_power sweep, retried POWER_RETRIES times. -> (csv text,
-        parsed rows, seconds). Judged by its output, never its exit status."""
-        cfg = self.cfg
+        """One sweep of a scan -> (csv text, parsed rows, seconds): rtl_power
+        runs over UMIK_SDR_SCAN_SEGMENTS contiguous parts of the range in a
+        random order, their rows pooled (rows_to_grid places rows by
+        frequency, so order is nothing to it)."""
         lo, hi = sweep_range(sc, shifted)
+        plan = power_plan(lo, hi, sc["bin_hz"], sc["crop"])
+        parts = sweep_segments(lo, hi, plan, self.cfg.scan_segments)
+        self.rng.shuffle(parts)
+        text, rows, secs = "", [], 0.0
+        for k, (a, b) in enumerate(parts):
+            t, r, dt = self.power_run(sc, s, p, a, b, k, len(parts))
+            text += t
+            rows += r
+            secs += dt
+        return text, rows, secs
+
+    def power_run(self, sc, s, p, lo, hi, k, n_parts):
+        """One rtl_power run over lo-hi (a part of a sweep, or all of it),
+        retried POWER_RETRIES times. -> (csv text, parsed rows, seconds).
+        Judged by its output, never its exit status."""
+        cfg = self.cfg
+        part = " part %d/%d" % (k + 1, n_parts) if n_parts > 1 else ""
         plan = power_plan(lo, hi, sc["bin_hz"], sc["crop"])
         argv = [self.tools.get("rtl_power", "rtl_power"), "-f", "%d:%d:%d" % (lo, hi, sc["bin_hz"]),
                 "-i", "1", "-1"]
@@ -1911,7 +1956,7 @@ class Recorder:
             if self.fake:
                 rc, err, timed_out = 0, "", False
                 text = fake_power_csv(plan, FAKE_EMITTERS, sweep=s, pass_no=p,
-                                      seed=p * 1000 + s * 10 + cfg.scans.index(sc))
+                                      seed=p * 1000 + s * 10 + cfg.scans.index(sc) + 100 * k)
             else:
                 rc, out, err, timed_out = self.run_child(argv, timeout=30 + 0.12 * plan["hops"])
                 text = out.decode("ascii", "replace")
@@ -1925,8 +1970,8 @@ class Recorder:
                             sc["name"], m.group(1), gain_text(gain)))
                     self.gain_logged.add(sc["name"])
                 return text, rows, mono() - t0
-            applog("WARNING: rtl_power %s sweep %d/%d failed: %s%s" % (
-                sc["name"], s + 1, cfg.sweeps, problem,
+            applog("WARNING: rtl_power %s sweep %d/%d%s failed: %s%s" % (
+                sc["name"], s + 1, cfg.sweeps, part, problem,
                 " - retrying" if attempt < POWER_RETRIES else ""))
         raise Exit(1, "FATAL: rtl_power failed %d times running on the %s scan (%s)%s" % (
             1 + POWER_RETRIES, sc["name"], problem, rtl_hint(err)))

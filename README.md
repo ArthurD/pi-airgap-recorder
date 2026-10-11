@@ -256,7 +256,10 @@ passes after it was last seen (2 if it was seen once), so an intermittent
 transmitter keeps getting visits. Up to 120 channels (the strongest, when there
 are more) are then recorded in shuffled order, ~15 s each, with random gaps
 between channels and a random pause of up to 3 minutes between passes. The
-timing is randomised so the schedule can't be learned.
+timing is randomised so the schedule can't be learned, and so is the scanning:
+rtl_power always climbs from the bottom of a range, so each long scan is swept
+as four contiguous parts in a fresh random order every sweep, and the order of
+the scans themselves is shuffled every sweep too (`UMIK_SDR_SCAN_SEGMENTS`).
 
 **Two gains.** Measured with the SMArt v5 (2026-10-10): in the FM band a strong
 local station compresses the tuner above ~20 dB and its skirts read as signals,
@@ -384,6 +387,7 @@ is idle, not trouble.
 | `UMIK_SDR_SCAN` | `108-1750:50`, the main scan: MHz range, then bin width in kHz. It starts at 108 MHz, so the FM band is scanned only by its fine scan, at `UMIK_SDR_GAIN_WIDE` |
 | `UMIK_SDR_FINE` | `87.5-108:10 136-174:10 400-520:10`, the finer scans (space-separated): the FM band, and the VHF and UHF voice bands, where a 12.5 kHz voice channel loses ~5 dB in the main scan's 44 kHz bins |
 | `UMIK_SDR_SWEEPS` | `3` per scan |
+| `UMIK_SDR_SCAN_SEGMENTS` | `4` rtl_power runs per sweep of a scan, over contiguous parts of its range in random order, so a sweep never has to start at the bottom; a scan with fewer than 8 hops a part (the FM and VHF fine scans) runs whole. `1` sweeps every scan in one run |
 | `UMIK_SDR_THR` / `UMIK_SDR_THR_BURST` | `10` / `14` dB over the local floor, for a continuous / an intermittent signal. rtl_power averages many FFTs into every bin, so 10 dB is never noise; lower only adds real but dull channels, which `UMIK_SDR_MAX_CHANNELS` caps |
 | `UMIK_SDR_EXCLUDE` | `698-716 777-787 824-849 960-1215` MHz, never listened to: the LTE uplink bands 12/17, 13 and 5, where phones (yours too) transmit, and the aviation DME/TACAN band, strong pulses that are never voice, with the SMArt v5's own strongest spur block (1004–1013 MHz) inside it |
 | `UMIK_SDR_DWELL` / `UMIK_SDR_JITTER` | `15` s / `0.3`: each clip is dwell × U(0.7, 1.3) |
