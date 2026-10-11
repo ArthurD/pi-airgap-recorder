@@ -337,6 +337,10 @@ class Capture(unittest.TestCase):
         # (seen 2026-10-10: "rtl_sdr exit 5: [R82XX] PLL not locked!" for a one-off USB error)
         self.assertEqual(U.judge_sdr(5, False, kd + pll + "Tuned to 442424117 Hz.\n"),
                          "rtl_sdr exit 5: Tuned to 442424117 Hz.")
+        # ... but exit 5 AFTER the normal "User cancel" completion line is librtlsdr's
+        # cancel race on a finished capture: not a fault, the byte count decides
+        self.assertEqual(U.judge_sdr(5, False, kd + pll + ok), "")
+        self.assertIn("exit 5", U.judge_sdr(5, False, kd + pll + "Failed to set center freq.\n" + ok))
         self.assertIn("sample rate", U.judge_sdr(0, False, "WARNING: Failed to set sample rate.\n"))
         self.assertTrue(U.judge_sdr(1, False, "usb_claim_interface error -6\n"))
         self.assertTrue(U.judge_sdr(0, True, ""))

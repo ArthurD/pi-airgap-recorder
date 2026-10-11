@@ -2094,6 +2094,13 @@ def judge_sdr(rc, timed_out, err):
     pll = [l for l in bad if PLL_NOT_LOCKED in l]
     real = [l for l in bad if KERNEL_DRIVER not in l and (PLL_NOT_LOCKED not in l or len(pll) > 1)]
     if rc != 0:
+        if not real and "User cancel, exiting" in err:
+            # librtlsdr's end-of-capture race: once the last byte is written,
+            # rtl_sdr cancels its USB transfers, libusb_cancel_transfer finds
+            # one already finished and returns -5, and rtl_sdr exits 5 having
+            # written every byte (2 clips in 56 on the Mac, 2026-10-10). The
+            # byte count, checked by the caller, is what decides.
+            return ""
         # name a real fault line if there is one; the benign chatter is never the reason
         return "rtl_sdr exit %d: %s" % (rc, real[-1] if real else last_line(err))
     return real[0] if real else ""
