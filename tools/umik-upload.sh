@@ -39,9 +39,11 @@
 #   umik upload --dry-run   show what would upload, touch nothing
 #
 # Config: UMIK_S3_BUCKET (required - no default), UMIK_AWS_PROFILE (default
-# umik), UMIK_ARCHIVE (default ~/UMIK-Archive), UMIK_JOBS (default 5). Set them
-# in the environment or in tools/umik.local.conf (untracked; see
-# umik.local.conf.example).
+# umik), UMIK_ARCHIVE (default ~/UMIK-Archive), UMIK_JOBS (default 10: PUTs and
+# the HeadObject skip-checks in flight at once; each is one short aws CLI
+# call, so this is latency-bound, not bandwidth-bound - 10 was ~4x faster
+# than 5 end to end). Set them in the environment or in tools/umik.local.conf
+# (untracked; see umik.local.conf.example).
 
 set -uo pipefail
 
@@ -52,13 +54,14 @@ TOOLS_DIR=$(cd "$(dirname "$0")" && pwd)
 # let a fresh clone try to upload into a stranger's. Precedence is environment,
 # then the untracked local config, then nothing (which is an error).
 _ENV_ARCHIVE=${UMIK_ARCHIVE-}; _ENV_BUCKET=${UMIK_S3_BUCKET-}; _ENV_PROFILE=${UMIK_AWS_PROFILE-}
+_ENV_JOBS=${UMIK_JOBS-}
 CONF="${UMIK_CONF:-$TOOLS_DIR/umik.local.conf}"
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
 ARCHIVE="${_ENV_ARCHIVE:-${UMIK_ARCHIVE:-$HOME/UMIK-Archive}}"
 BUCKET="${_ENV_BUCKET:-${UMIK_S3_BUCKET:-}}"
 PROFILE="${_ENV_PROFILE:-${UMIK_AWS_PROFILE:-umik}}"
-JOBS="${UMIK_JOBS:-5}"
+JOBS="${_ENV_JOBS:-${UMIK_JOBS:-10}}"
 
 # The SDK, not this script, owns transient-failure backoff.
 export AWS_RETRY_MODE=adaptive

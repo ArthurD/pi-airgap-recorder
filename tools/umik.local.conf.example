@@ -24,6 +24,14 @@ UMIK_AWS_PROFILE=umik
 # Where sealed recordings are archived on this Mac.
 #UMIK_ARCHIVE="$HOME/UMIK-Archive"
 
+# How many S3 calls `umik upload` and `umik verify-s3` keep in flight
+# (default 10). Both are latency-bound - one short aws CLI round trip per
+# object, not bandwidth - so this is the single biggest knob on how long a
+# run takes: verifying the same 11.6k-object bucket took 11 min at 10 and
+# 45 min at 5. Raise it before lowering it; the SDK's adaptive retry absorbs
+# any throttling.
+#UMIK_JOBS=10
+
 # How many files umik-ingest.sh seals (and verifies, and prunes) at once
 # (default 4). The ingest itself reads the environment only; `umik process`
 # passes this setting through, `umik download` does not - export it there:

@@ -624,7 +624,12 @@ Sealing itself runs `UMIK_INGEST_JOBS` files at a time (default 4),
 hashing with the system `openssl` — about 5× faster than `shasum` on Apple
 silicon — and the copy-and-compare it used to do per file to detect a
 power-cut header is now a header check, so the ingest is bound by how fast
-the stick reads.
+the stick reads. The S3 legs are bound by something else entirely: every
+object is one short `aws` round trip, so `UMIK_JOBS` (how many are in
+flight, default 10) sets their speed almost by itself. Verifying the same
+11.6k-object bucket took 11 minutes at 10 and 45 at 5, and a 108 GB stick
+went in 47 minutes end to end where a 99 GB one had taken 85. Leave it at 10
+or higher; the SDK's adaptive retry absorbs any throttling.
 
 Without a stick, recordings land on the exFAT `UMIKDATA` partition, which
 mounts straight onto a Mac. Only if both are absent do they fall back to the
@@ -733,6 +738,9 @@ each object's stored whole-object SHA-256 with `HeadObject` and diffs it
 against the `SHA256SUMS` seals. **The data never leaves AWS, so verifying
 hundreds of gigabytes costs API calls instead of egress**, and the run is
 strictly read-only: no writes, no new object versions, nothing to expire.
+It is latency-bound, one `HeadObject` per object, so `UMIK_JOBS` (calls in
+flight, default 10) is what sets its wall time: 11 minutes for 11.6k objects
+at 10, 45 at 5.
 
 ```
 ==> VERIFIED (S3 bytes match the seal) : 2478
