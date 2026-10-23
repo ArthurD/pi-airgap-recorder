@@ -37,3 +37,11 @@ and deletes local audio only once both off-box copies verified. Before it:
 
 Run logs: `~/UMIK-Archive/process/<utc-stamp>/`. A run that reports a leg
 "skipped" or "FAILED" keeps local audio; nothing is lost, fix and re-run.
+
+## Storage and cost questions
+
+Start from `STORAGE-COSTS.md`: it logs every review (bytes per place, growth,
+prices, five-year projection, decisions) and has the exact commands to redo
+the measurement. Answer a new "how much are we using / what will it cost"
+question by appending a dated section there, not by starting over. Keep
+bucket names, hostnames, and folder names that identify people out of it.
