@@ -631,6 +631,32 @@ flight, default 10) sets their speed almost by itself. Verifying the same
 went in 47 minutes end to end where a 99 GB one had taken 85. Leave it at 10
 or higher; the SDK's adaptive retry absorbs any throttling.
 
+`umik scrap /Volumes/<stick>` is for the stick nobody needs archived in full:
+a mic left running for days on nothing, where sealing it all would only
+dilute the evidence archive and fill five years of locked storage. With no
+range it drops every recording on the stick; `--keep <range>` keeps only
+files overlapping a range, `--drop <range>` drops only files wholly inside
+one. Either way a file at an edge is kept, and a file whose name carries no
+time is never destroyed by a ranged run. Ranges are `START..END` (either end
+may be left open), in this Mac's local time unless a zone is given or
+`--utc` is passed; a bare date as END means the end of that day:
+
+```bash
+umik scrap /Volumes/UMIK2 --keep 2026-10-20T08:00..2026-10-20T12:30 --dry-run
+umik scrap /Volumes/UMIK2 --drop 2026-10-18T00:00..2026-10-20 --utc --reason "mic left on"
+```
+
+It prints the whole plan (per session: what is kept, dropped, already
+archived, untimed) and changes nothing until the volume's label is typed
+back. Then every session losing files gets a `scrapped.json` written into it
+on the stick, the dropped files are deleted, and `umik process` takes over:
+the record is sealed beside `session.json` and uploaded under the session's
+own prefix, so the archive still shows that the session existed and what was
+discarded, by whom, why, and when. The dropped files are named, sized, and
+timed in the record but not hashed; the hash of a file that no longer exists
+proves nothing anyone can check. `--no-process` seals and clears without the
+S3 and NAS legs, leaving the records for the next `umik upload`.
+
 Without a stick, recordings land on the exFAT `UMIKDATA` partition, which
 mounts straight onto a Mac. Only if both are absent do they fall back to the
 ext4 root.
@@ -828,8 +854,11 @@ reached the Mac — that would require signing on the Pi itself.
 |---|---|
 | `umik download` | Seal every mounted medium into the archive, verify, clear the medium |
 | `umik download --upload` | ...and mirror to S3 afterwards |
+| `umik process /Volumes/<stick>` | The whole loop, legs overlapped: seal, clear+eject, S3 upload+verify, NAS copy+re-hash, then delete local audio once both verified |
 | `umik upload` | Write the archive into S3 (write-once, add-only, idempotent) |
 | `umik upload --dry-run` | Show what would upload, touch nothing |
+| `umik scrap /Volumes/<stick>` | Destroy the stick's recordings unarchived (all, or `--keep`/`--drop` a range), leaving a sealed `scrapped.json` record; plan + typed label first |
+| `umik scrap <vol> --dry-run` | Print the scrap plan, change nothing |
 | `umik verify` | Re-verify the manifest hash chain (`--deep` re-hashes everything) |
 | `umik verify-s3` | Prove the bucket holds the sealed bytes (read-only, no egress) |
 | `umik inject --unit umik1` | Re-provision a mounted card, keeping its console account |

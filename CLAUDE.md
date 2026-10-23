@@ -28,6 +28,12 @@ and deletes local audio only once both off-box copies verified. Before it:
 - **Look outside `recordings/`.** The ingest walks only `$vol/recordings`;
   compare `du -sh $vol/recordings` with the volume's used space and check
   `.Trashes` before trusting the count.
+- **Scrap, not process, when the stick holds nothing worth keeping** (a mic
+  left running for days): `umik scrap /Volumes/<stick>` drops it all, or
+  `--keep`/`--drop` a time range, and leaves a sealed `scrapped.json`
+  record. Destruction is unrecoverable; the printed plan and typing the
+  volume label back are the safety. Show the user the `--dry-run` plan, and
+  never pass `--yes` unless they explicitly asked to scrap.
 
 Run logs: `~/UMIK-Archive/process/<utc-stamp>/`. A run that reports a leg
 "skipped" or "FAILED" keeps local audio; nothing is lost, fix and re-run.

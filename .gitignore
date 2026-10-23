@@ -9,3 +9,6 @@ tools/umik.local.conf
 
 # macOS Finder droppings
 .DS_Store
+
+# Python bytecode from running the SDR selftest in place
+__pycache__/
